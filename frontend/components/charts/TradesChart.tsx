@@ -5,9 +5,10 @@ import type { Trade } from "@shared/types";
 
 interface TradesChartProps {
   trades: Trade[];
+  height?: number;
 }
 
-export function TradesChart({ trades }: TradesChartProps) {
+export function TradesChart({ trades, height = 320 }: TradesChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -20,7 +21,7 @@ export function TradesChart({ trades }: TradesChartProps) {
 
       const chart = createChart(chartRef.current, {
         width: chartRef.current.clientWidth,
-        height: 320,
+        height,
         layout: {
           background: { color: "#18181b" },
           textColor: "#a1a1aa",
@@ -39,11 +40,24 @@ export function TradesChart({ trades }: TradesChartProps) {
         priceFormat: { type: "custom", formatter: (v: number) => `$${v.toFixed(2)}` },
       });
 
-      const data = trades.map((t, i) => ({
-        time: i,
-        value: t.pnl ?? 0,
-        color: (t.pnl ?? 0) >= 0 ? "rgba(16, 185, 129, 0.8)" : "rgba(239, 68, 68, 0.8)",
-      }));
+      const dateCounts = new Map<string, number>();
+      const data = trades.map((t, i) => {
+        const dateStr = (t.exitDate || t.date || "").slice(0, 10);
+        let time: number;
+        if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+          const d = new Date(dateStr);
+          const count = dateCounts.get(dateStr) ?? 0;
+          dateCounts.set(dateStr, count + 1);
+          time = Math.floor(d.getTime() / 1000) + count;
+        } else {
+          time = Math.floor(Date.now() / 1000) + i;
+        }
+        return {
+          time: time as import("lightweight-charts").UTCTimestamp,
+          value: t.pnl ?? 0,
+          color: (t.pnl ?? 0) >= 0 ? "rgba(16, 185, 129, 0.8)" : "rgba(239, 68, 68, 0.8)",
+        };
+      });
       series.setData(data);
       chart.timeScale().fitContent();
 
@@ -57,11 +71,11 @@ export function TradesChart({ trades }: TradesChartProps) {
 
   if (trades.length === 0) {
     return (
-      <div className="h-[320px] flex items-center justify-center text-zinc-500 text-sm">
+      <div className="flex items-center justify-center text-zinc-500 text-sm" style={{ height }}>
         Žádné obchody
       </div>
     );
   }
 
-  return <div ref={chartRef} className="w-full h-[320px]" />;
+  return <div ref={chartRef} className="w-full" style={{ height }} />;
 }

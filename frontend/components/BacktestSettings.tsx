@@ -5,7 +5,6 @@ import type { DataInstrument } from "@shared/types";
 
 export interface BacktestParams {
   initialCapital: number;
-  commissionPerc: number;
   slippagePerc: number;
 }
 
@@ -93,19 +92,6 @@ export function BacktestSettings({
             onChange={(e) => onParamsChange({ initialCapital: parseFloat(e.target.value) || 100000 })}
             className="w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200"
           />
-        </div>
-        <div>
-          <label className="block text-sm text-zinc-400 mb-1">Komise (%)</label>
-          <input
-            type="number"
-            min={0}
-            max={10}
-            step={0.01}
-            value={params.commissionPerc * 100}
-            onChange={(e) => onParamsChange({ commissionPerc: (parseFloat(e.target.value) || 0) / 100 })}
-            className="w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200"
-          />
-          <span className="text-xs text-zinc-500">např. 0.1 = 0.1%</span>
         </div>
         <div>
           <label className="block text-sm text-zinc-400 mb-1">Slippage (%)</label>

@@ -5,6 +5,7 @@ import { EquityChart } from "@/components/charts/EquityChart";
 import { TradesChart } from "@/components/charts/TradesChart";
 import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { StatBlocks } from "@/components/results/StatBlocks";
+import { TradesTable } from "@/components/results/TradesTable";
 import type { RunResponse } from "@shared/types";
 
 type TabId = "equity" | "trades" | "chart";
@@ -40,8 +41,8 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
   ];
 
   return (
-    <div className="flex flex-col flex-1 min-h-0 p-6">
-      <div className="flex justify-between items-center mb-4 shrink-0">
+    <div className="flex flex-col flex-1 min-h-0 overflow-auto">
+      <div className="flex justify-between items-center p-6 pb-4 shrink-0">
         <button
           onClick={onBack}
           className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm"
@@ -64,7 +65,7 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
         </div>
       </div>
 
-      <div className="flex gap-1 mb-4 shrink-0">
+      <div className="flex gap-1 px-6 shrink-0">
         {tabs.map(({ id, label }) => (
           <button
             key={id}
@@ -80,13 +81,41 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
         ))}
       </div>
 
-      <div className="flex-1 min-h-[280px] rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0">
-        {activeTab === "equity" && <EquityChart equity={results.equity} height={320} />}
-        {activeTab === "trades" && <TradesChart trades={results.trades} />}
-        {activeTab === "chart" && <CandlestickChart ohlc={results.ohlc ?? []} trades={results.trades} />}
+      <div className="flex-1 min-h-[480px] px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0">
+        {activeTab === "equity" && (
+          <EquityChart
+            equityCurve={results.equityCurve}
+            equity={results.equityCurve ? undefined : results.equity}
+            height={480}
+            dates={
+              !results.equityCurve?.length && results.ohlc?.length
+                ? (() => {
+                    const first = results.ohlc![0]?.date?.slice(0, 10);
+                    if (!first) return undefined;
+                    const d = new Date(first);
+                    d.setDate(d.getDate() - 1);
+                    const dayBefore = d.toISOString().slice(0, 10);
+                    return [dayBefore, ...results.ohlc!.map((o) => o.date.slice(0, 10))];
+                  })()
+                : undefined
+            }
+          />
+        )}
+        {activeTab === "trades" && (
+          <div className="flex flex-col gap-4 h-full min-h-0 overflow-auto py-4">
+            <div className="shrink-0">
+              <TradesChart trades={results.trades} height={280} />
+            </div>
+            <div className="shrink-0">
+              <h3 className="text-sm font-medium text-zinc-400 mb-2">Všechny obchody</h3>
+              <TradesTable trades={results.trades} />
+            </div>
+          </div>
+        )}
+        {activeTab === "chart" && <CandlestickChart ohlc={results.ohlc ?? []} trades={results.trades} height={480} />}
       </div>
 
-      <div className="mt-4 overflow-auto max-h-48 shrink-0">
+      <div className="mt-4 p-6 shrink-0">
         <StatBlocks results={results} />
       </div>
     </div>

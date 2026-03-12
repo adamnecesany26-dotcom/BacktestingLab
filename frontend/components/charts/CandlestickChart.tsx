@@ -7,9 +7,10 @@ import type { OhlcBar } from "@shared/types";
 interface CandlestickChartProps {
   ohlc: OhlcBar[];
   trades: Trade[];
+  height?: number;
 }
 
-export function CandlestickChart({ ohlc, trades }: CandlestickChartProps) {
+export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -40,8 +41,8 @@ export function CandlestickChart({ ohlc, trades }: CandlestickChartProps) {
         borderDownColor: "#ef4444",
       });
 
-      const candleData = ohlc.map((bar, i) => ({
-        time: i,
+      const candleData = ohlc.map((bar) => ({
+        time: bar.date.slice(0, 10) as `${number}-${number}-${number}`,
         open: bar.open,
         high: bar.high,
         low: bar.low,
@@ -49,27 +50,26 @@ export function CandlestickChart({ ohlc, trades }: CandlestickChartProps) {
       }));
       candleSeries.setData(candleData);
 
-      const entryMarkers: { time: number; position: "belowBar" | "aboveBar"; color: string; shape: "arrowUp" | "arrowDown"; text: string }[] = [];
-      const exitMarkers: { time: number; position: "belowBar" | "aboveBar"; color: string; shape: "arrowUp" | "arrowDown"; text: string }[] = [];
-
+      type Marker = { time: string; position: "belowBar" | "aboveBar"; color: string; shape: "arrowUp" | "arrowDown"; text: string };
+      const markers: Marker[] = [];
       const toYmd = (s: string) => (s || "").slice(0, 10);
       trades.forEach((t) => {
         const exitYmd = toYmd(t.exitDate || t.date || "");
         const entryYmd = toYmd(t.entryDate || t.date || "");
-        const exitIdx = ohlc.findIndex((b) => toYmd(b.date) === exitYmd);
-        const entryIdx = ohlc.findIndex((b) => toYmd(b.date) === entryYmd);
-        if (entryIdx >= 0) {
-          entryMarkers.push({
-            time: entryIdx,
+        const exitBar = ohlc.find((b) => toYmd(b.date) === exitYmd);
+        const entryBar = ohlc.find((b) => toYmd(b.date) === entryYmd);
+        if (entryBar) {
+          markers.push({
+            time: entryBar.date.slice(0, 10) as `${number}-${number}-${number}`,
             position: t.type === "buy" ? "belowBar" : "aboveBar",
             color: t.type === "buy" ? "#10b981" : "#ef4444",
             shape: t.type === "buy" ? "arrowUp" : "arrowDown",
             text: t.type === "buy" ? "Long" : "Short",
           });
         }
-        if (exitIdx >= 0 && exitIdx !== entryIdx) {
-          exitMarkers.push({
-            time: exitIdx,
+        if (exitBar && exitBar.date !== entryBar?.date) {
+          markers.push({
+            time: exitBar.date.slice(0, 10) as `${number}-${number}-${number}`,
             position: t.type === "buy" ? "aboveBar" : "belowBar",
             color: "#a1a1aa",
             shape: t.type === "buy" ? "arrowDown" : "arrowUp",
@@ -77,8 +77,8 @@ export function CandlestickChart({ ohlc, trades }: CandlestickChartProps) {
           });
         }
       });
-
-      candleSeries.setMarkers([...entryMarkers, ...exitMarkers]);
+      markers.sort((a, b) => a.time.localeCompare(b.time));
+      candleSeries.setMarkers(markers);
       chart.timeScale().fitContent();
 
       return () => chart.remove();
@@ -91,11 +91,11 @@ export function CandlestickChart({ ohlc, trades }: CandlestickChartProps) {
 
   if (ohlc.length === 0) {
     return (
-      <div className="h-[320px] flex items-center justify-center text-zinc-500 text-sm">
+      <div className="flex items-center justify-center text-zinc-500 text-sm" style={{ height }}>
         Žádná OHLC data
       </div>
     );
   }
 
-  return <div ref={chartRef} className="w-full h-[320px]" />;
+  return <div ref={chartRef} className="w-full" style={{ height }} />;
 }

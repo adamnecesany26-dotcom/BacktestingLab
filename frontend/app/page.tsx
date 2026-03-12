@@ -35,7 +35,6 @@ export default function Home() {
   const [years, setYears] = useState(1);
   const [backtestParams, setBacktestParams] = useState({
     initialCapital: 100000,
-    commissionPerc: 0.001,
     slippagePerc: 0.001,
   });
 
@@ -45,6 +44,7 @@ export default function Home() {
   const [runProgress, setRunProgress] = useState(0);
   const [showResults, setShowResults] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
+  const [terminalMinimized, setTerminalMinimized] = useState(false);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -168,7 +168,6 @@ export default function Home() {
           years,
           data_file: selectedInstrument.file,
           initial_capital: backtestParams.initialCapital,
-          commission_perc: backtestParams.commissionPerc,
           slippage_perc: backtestParams.slippagePerc,
         },
         controller.signal,
@@ -207,9 +206,32 @@ export default function Home() {
     abortController?.abort();
   };
 
+  const getExportPayload = () => {
+    if (!results) return null;
+    let equityCurve = results.equityCurve;
+    if (!equityCurve?.length && results.equity?.length && results.ohlc?.length) {
+      const first = results.ohlc[0]?.date?.slice(0, 10);
+      const d = first ? new Date(first) : null;
+      if (d) d.setDate(d.getDate() - 1);
+      const dayBefore = d?.toISOString().slice(0, 10) ?? "0";
+      equityCurve = [
+        { date: dayBefore, value: results.equity[0] ?? 0 },
+        ...results.ohlc.map((o, i) => ({ date: o.date.slice(0, 10), value: results.equity![i + 1] ?? 0 })),
+      ];
+    } else if (!equityCurve?.length && results.equity?.length) {
+      equityCurve = results.equity.map((v, i) => ({ date: String(i), value: v }));
+    }
+    return {
+      equityCurve: equityCurve ?? [],
+      metrics: results.metrics,
+      trades: results.trades,
+    };
+  };
+
   const handleExport = () => {
-    if (!results) return;
-    const blob = new Blob([JSON.stringify(results, null, 2)], {
+    const payload = getExportPayload();
+    if (!payload) return;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
       type: "application/json",
     });
     const url = URL.createObjectURL(blob);
@@ -221,9 +243,10 @@ export default function Home() {
   };
 
   const handleSave = async () => {
-    if (!results || !openItem) return;
+    const payload = getExportPayload();
+    if (!payload || !openItem) return;
     try {
-      await saveBacktestResult(openItem.id, openItem.name, results as unknown as Record<string, unknown>);
+      await saveBacktestResult(openItem.id, openItem.name, payload);
       addLog(`Výsledky uloženy do Results / ${openItem.name}`);
     } catch (e) {
       addLog(`Chyba: ${(e as Error).message}`);
@@ -320,7 +343,11 @@ export default function Home() {
             />
           </div>
         </div>
-        <LogPanel logs={logs} />
+        <LogPanel
+          logs={logs}
+          minimized={terminalMinimized}
+          onToggleMinimize={() => setTerminalMinimized((v) => !v)}
+        />
       </div>
     </div>
   );

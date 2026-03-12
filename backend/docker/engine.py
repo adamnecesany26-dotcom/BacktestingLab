@@ -149,26 +149,46 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
                     self._last_pct = pct
 
     class TradeRecordingStrategy(strategy_cls):
-        """Wraps user strategy to record closed trades."""
+        """Wraps user strategy to record closed trades via notify_trade and notify_order."""
 
         def notify_trade(self, trade):
             super().notify_trade(trade)
-            if trade.isclosed:
-                try:
-                    dt_open = trade.open_datetime() if hasattr(trade, "open_datetime") else None
-                    dt_close = trade.close_datetime() if hasattr(trade, "close_datetime") else None
-                    size = abs(trade.size) or 1
-                    trades_list.append({
-                        "date": dt_close.isoformat() if dt_close else "",
-                        "entryDate": dt_open.isoformat() if dt_open else "",
-                        "exitDate": dt_close.isoformat() if dt_close else "",
-                        "type": "buy" if trade.size > 0 else "sell",
-                        "size": size,
-                        "pnl": round(trade.pnlcomm, 2),
-                        "price": trade.price,
-                    })
-                except Exception:
-                    pass
+            _record_trade(trade)
+
+        def notify_order(self, order):
+            super().notify_order(order)
+            if getattr(order, "trade", None) and order.trade.isclosed:
+                _record_trade(order.trade)
+
+    def _record_trade(trade):
+        """Record a closed trade to trades_list."""
+        if not trade.isclosed:
+            return
+        try:
+            dt_open = trade.open_datetime() if hasattr(trade, "open_datetime") else None
+            dt_close = trade.close_datetime() if hasattr(trade, "close_datetime") else None
+            size, is_long = 1, True
+            entry_price = trade.price
+            exit_price = trade.price
+            if hasattr(trade, "history") and trade.history:
+                op = trade.history[0]
+                size = abs(getattr(op, "size", 1)) or 1
+                is_long = getattr(op, "size", 1) > 0
+                entry_price = float(getattr(op, "price", trade.price))
+                exit_price = float(getattr(trade.history[-1], "price", trade.price))
+            trades_list.append({
+                "date": dt_close.isoformat() if dt_close else "",
+                "entryDate": dt_open.isoformat() if dt_open else "",
+                "exitDate": dt_close.isoformat() if dt_close else "",
+                "type": "buy" if is_long else "sell",
+                "size": size,
+                "pnl": round(trade.pnlcomm, 2),
+                "price": exit_price,
+                "entryPrice": round(entry_price, 2),
+                "exitPrice": round(exit_price, 2),
+            })
+        except Exception:
+            pass
 
     cerebro = bt.Cerebro()
 
@@ -195,11 +215,10 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
     cerebro.addstrategy(TradeRecordingStrategy)
 
     initial_capital = float(os.environ.get("INITIAL_CAPITAL", "100000"))
-    commission_perc = float(os.environ.get("COMMISSION_PERC", "0.001"))
     slippage_perc = float(os.environ.get("SLIPPAGE_PERC", "0.001"))
 
     cerebro.broker.setcash(initial_capital)
-    cerebro.broker.setcommission(commission=commission_perc)
+    cerebro.broker.setcommission(commission=0)
     cerebro.broker.set_slippage_perc(slippage_perc)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe")
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
@@ -208,10 +227,31 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
     results = cerebro.run()
     strat = results[1]  # User strategy (0=EquityRecorder)
 
+    # Fallback: if notify_trade/notify_order didn't capture trades, try strategy's _trades
+    if not trades_list and hasattr(strat, "_trades"):
+        for data, trades in strat._trades.items():
+            for t in trades:
+                if getattr(t, "isclosed", False):
+                    _record_trade(t)
+
     print("PROGRESS:100", file=sys.stderr, flush=True)
 
     # Equity curve - include initial value
     equity_curve = [initial_capital] + equity_list
+
+    # Equity curve with dates (for export/save)
+    equity_curve_with_dates = []
+    if isinstance(data.index, pd.DatetimeIndex) and len(data.index) > 0:
+        first_ts = data.index[0]
+        day_before = (first_ts - pd.Timedelta(days=1)).strftime("%Y-%m-%d") if hasattr(first_ts, "strftime") else ""
+        equity_curve_with_dates.append({"date": day_before, "value": round(equity_curve[0], 2)})
+        for i, ts in enumerate(data.index):
+            if i + 1 < len(equity_curve):
+                date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+                equity_curve_with_dates.append({"date": date_str, "value": round(equity_curve[i + 1], 2)})
+    else:
+        for i, v in enumerate(equity_curve):
+            equity_curve_with_dates.append({"date": str(i), "value": round(v, 2)})
 
     # Metrics
     sharpe = strat.analyzers.sharpe.get_analysis()
@@ -225,29 +265,30 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
     total_return_usd = final_equity - initial_capital
     total_return_pct = round((total_return_usd / initial_capital) * 100, 2)
 
+    losing = [t for t in trades_list if t["pnl"] < 0]
     gross_profit = sum(t["pnl"] for t in trades_list if t["pnl"] > 0)
-    gross_loss = abs(sum(t["pnl"] for t in trades_list if t["pnl"] < 0))
+    gross_loss = abs(sum(t["pnl"] for t in losing))
     profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
     expectancy_usd = round(sum(t["pnl"] for t in trades_list) / len(trades_list), 2) if trades_list else 0.0
-    avg_loss = abs(sum(t["pnl"] for t in trades_list if t["pnl"] < 0) / len([t for t in trades_list if t["pnl"] < 0])) if any(t["pnl"] < 0 for t in trades_list) else 1.0
+    avg_loss = abs(sum(t["pnl"] for t in losing) / len(losing)) if losing else 1.0
     expectancy_r = round(expectancy_usd / avg_loss, 2) if avg_loss else 0.0
     long_count = sum(1 for t in trades_list if t["type"] == "buy")
     short_count = sum(1 for t in trades_list if t["type"] == "sell")
 
     metrics = {
-        "finalEquity": final_equity,
-        "sharpeRatio": sharpe.get("sharperatio", 0) or 0,
-        "maxDrawdown": dd.get("max", {}).get("drawdown", 0) or 0,
-        "tradeCount": total_trades,
-        "longCount": long_count,
-        "shortCount": short_count,
-        "winRate": round(win_rate, 2),
-        "totalReturn": total_return_pct,
-        "totalReturnUsd": round(total_return_usd, 2),
-        "profitFactor": profit_factor,
-        "expectancyUsd": expectancy_usd,
-        "expectancyR": expectancy_r,
-        "rMultiple": 0.0,
+        "finalEquity": float(final_equity),
+        "sharpeRatio": float(sharpe.get("sharperatio", 0) or 0),
+        "maxDrawdown": float(dd.get("max", {}).get("drawdown", 0) or 0),
+        "tradeCount": int(total_trades),
+        "longCount": int(long_count),
+        "shortCount": int(short_count),
+        "winRate": float(round(win_rate, 2)),
+        "totalReturn": float(total_return_pct),
+        "totalReturnUsd": float(round(total_return_usd, 2)),
+        "profitFactor": float(profit_factor),
+        "expectancyUsd": float(expectancy_usd),
+        "expectancyR": float(expectancy_r),
+        "rMultiple": float(0.0),
     }
 
     # OHLC for chart (date, open, high, low, close)
@@ -266,6 +307,7 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
 
     return {
         "equity": equity_curve,
+        "equityCurve": equity_curve_with_dates,
         "metrics": metrics,
         "trades": trades_list,
         "ohlc": ohlc,

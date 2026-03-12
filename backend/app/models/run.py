@@ -15,7 +15,6 @@ class RunRequest(BaseModel):
     years: float = 1.0
     data_file: str = ""
     initial_capital: float = 100000.0
-    commission_perc: float = 0.001  # 0.1%
     slippage_perc: float = 0.001  # 0.1%
 
 
@@ -28,6 +27,14 @@ class Trade(BaseModel):
     price: float
     size: float
     pnl: Optional[float] = None
+    entryPrice: Optional[float] = None
+    exitPrice: Optional[float] = None
+
+
+class EquityPoint(BaseModel):
+    """Equity point with date."""
+    date: str
+    value: float
 
 
 class OhlcBar(BaseModel):
@@ -59,6 +66,7 @@ class BacktestMetrics(BaseModel):
 class RunResponse(BaseModel):
     """Response payload from POST /run."""
     equity: List[float]
+    equityCurve: Optional[List[EquityPoint]] = None
     metrics: BacktestMetrics
     trades: List[Trade]
     ohlc: Optional[List[OhlcBar]] = None

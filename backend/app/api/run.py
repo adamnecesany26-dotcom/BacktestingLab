@@ -43,7 +43,6 @@ async def run_backtest(request: RunRequest, req: Request):
                     years=request.years,
                     data_file=request.data_file or "",
                     initial_capital=request.initial_capital,
-                    commission_perc=request.commission_perc,
                     slippage_perc=request.slippage_perc,
                     is_client_connected=is_connected,
                 ):
@@ -74,7 +73,6 @@ async def run_backtest(request: RunRequest, req: Request):
             years=request.years,
             data_file=request.data_file or "",
             initial_capital=request.initial_capital,
-            commission_perc=request.commission_perc,
             slippage_perc=request.slippage_perc,
         )
         return result

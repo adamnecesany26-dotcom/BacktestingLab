@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Union
 
-from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar
+from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 
 RUN_TIMEOUT = 180  # 3 minutes
 
@@ -90,7 +90,6 @@ async def run_strategy_streaming(
     years: float = 1.0,
     data_file: str = "",
     initial_capital: float = 100000.0,
-    commission_perc: float = 0.001,
     slippage_perc: float = 0.001,
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
@@ -126,7 +125,6 @@ async def run_strategy_streaming(
             "-e", f"YEARS={years}",
             "-e", f"DATA_FILE={data_file}",
             "-e", f"INITIAL_CAPITAL={initial_capital}",
-            "-e", f"COMMISSION_PERC={commission_perc}",
             "-e", f"SLIPPAGE_PERC={slippage_perc}",
             "backtest-engine",
         ]
@@ -214,14 +212,13 @@ async def run_strategy(
     years: float = 1.0,
     data_file: str = "",
     initial_capital: float = 100000.0,
-    commission_perc: float = 0.001,
     slippage_perc: float = 0.001,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
     async for ev in run_strategy_streaming(
         code, instrument, timeframe, years, data_file,
-        initial_capital, commission_perc, slippage_perc,
+        initial_capital, commission_per_contract, slippage_perc,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")
@@ -233,8 +230,10 @@ async def run_strategy(
         raise RuntimeError("No result from engine")
 
     ohlc_raw = result_data.get("ohlc", [])
+    equity_curve_raw = result_data.get("equityCurve", [])
     return RunResponse(
         equity=result_data.get("equity", []),
+        equityCurve=[EquityPoint(**p) for p in equity_curve_raw] if equity_curve_raw else None,
         metrics=BacktestMetrics(**result_data.get("metrics", {})),
         trades=[Trade(**t) for t in result_data.get("trades", [])],
         ohlc=[OhlcBar(**b) for b in ohlc_raw] if ohlc_raw else None,

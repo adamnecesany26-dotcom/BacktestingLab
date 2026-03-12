@@ -12,7 +12,6 @@ export interface RunRequest {
   data_file?: string;
   /** Realistic simulation params */
   initial_capital?: number;
-  commission_perc?: number;
   slippage_perc?: number;
 }
 
@@ -46,6 +45,14 @@ export interface Trade {
   price: number;
   size: number;
   pnl?: number;
+  entryPrice?: number;
+  exitPrice?: number;
+}
+
+/** Equity point with date */
+export interface EquityPoint {
+  date: string;
+  value: number;
 }
 
 /** Backtest metrics */
@@ -77,6 +84,7 @@ export interface OhlcBar {
 /** Run response payload */
 export interface RunResponse {
   equity: number[];
+  equityCurve?: EquityPoint[];
   metrics: BacktestMetrics;
   trades: Trade[];
   ohlc?: OhlcBar[];

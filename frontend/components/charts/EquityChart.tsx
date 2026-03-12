@@ -3,12 +3,29 @@
 import { useEffect, useRef } from "react";
 
 /** TradingView Lightweight Charts - equity curve */
-export function EquityChart({ equity, height = 200 }: { equity: number[]; height?: number }) {
+export function EquityChart({
+  equity,
+  height = 200,
+  dates,
+  equityCurve,
+}: {
+  equity?: number[];
+  height?: number;
+  dates?: string[];
+  equityCurve?: { date: string; value: number }[];
+}) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstanceRef = useRef<ReturnType<typeof import("lightweight-charts").createChart> | null>(null);
 
+  const data: { time: string; value: number }[] =
+    equityCurve?.map((p) => ({ time: p.date.slice(0, 10), value: p.value })) ??
+    (equity ?? []).map((v, i) => ({
+      time: dates?.[i]?.slice(0, 10) ?? new Date(2020, 0, 1 + i).toISOString().slice(0, 10),
+      value: v,
+    }));
+
   useEffect(() => {
-    if (!chartRef.current || equity.length === 0) return;
+    if (!chartRef.current || data.length === 0) return;
 
     let mounted = true;
 
@@ -39,11 +56,7 @@ export function EquityChart({ equity, height = 200 }: { equity: number[]; height
         bottomColor: "rgba(16, 185, 129, 0)",
       });
 
-      const data = equity.map((v, i) => ({
-        time: i,
-        value: v,
-      }));
-      series.setData(data);
+      series.setData(data.map((d) => ({ time: d.time as `${number}-${number}-${number}`, value: d.value })));
       chart.timeScale().fitContent();
     });
 
@@ -54,9 +67,9 @@ export function EquityChart({ equity, height = 200 }: { equity: number[]; height
         chartInstanceRef.current = null;
       }
     };
-  }, [equity]);
+  }, [equityCurve, equity, dates, height]);
 
-  if (equity.length === 0) {
+  if (data.length === 0) {
     return (
       <div className="h-[200px] rounded-lg bg-zinc-900 flex items-center justify-center text-zinc-500 text-sm">
         No equity data
