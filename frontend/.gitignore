@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+.next/
+out/
+build/
+
+# Env (copy .env.example to .env.local)
+.env*.local
+
+# Debug
+npm-debug.log*
