@@ -1,0 +1,21 @@
+{
+  "NQ": {
+    "tick_size": 0.25,
+    "tick_value": 20,
+    "mult": 80,
+    "margin": 20000,
+    "commission_per_contract": 2.5
+  },
+  "ES": {
+    "tick_size": 0.25,
+    "tick_value": 12.5,
+    "mult": 50,
+    "margin": 15000,
+    "commission_per_contract": 2.5
+  },
+  "default": {
+    "stocklike": true,
+    "commission_perc": 0.001,
+    "slippage_perc": 0.001
+  }
+}

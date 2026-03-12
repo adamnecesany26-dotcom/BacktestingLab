@@ -37,45 +37,138 @@ def load_strategy(strategy_path: str):
     raise ValueError("No bt.Strategy subclass found in strategy file")
 
 
-def load_data(data_path: str, instrument: str, timeframe: str) -> pd.DataFrame:
-    """Load OHLCV data from parquet. Falls back to sample data if missing."""
+def load_data(
+    data_path: str,
+    instrument: str,
+    timeframe: str,
+    years: float = 1.0,
+    data_file: str = "",
+) -> pd.DataFrame:
+    """Load OHLCV data from CSV or parquet."""
     base = Path(data_path)
-    # Try common naming: {instrument}_{timeframe}.parquet
+
+    # Explicit file path (e.g. mock/NQ_5Y.csv)
+    if data_file:
+        p = base / data_file
+        if p.exists():
+            return _load_file(p, years)
+
+    # Try common naming
     candidates = [
+        base / "mock" / f"{instrument}_5Y.csv",
+        base / "mock" / f"{instrument}.csv",
         base / f"{instrument}_{timeframe}.parquet",
         base / f"{instrument}.parquet",
-        base / "sample.parquet",
     ]
     for p in candidates:
         if p.exists():
-            df = pd.read_parquet(p)
-            return df
+            return _load_file(p, years)
 
-    # Generate minimal sample data for demo
-    import numpy as np
-    dates = pd.date_range(start="2020-01-01", periods=252, freq="B")
-    np.random.seed(42)
-    close = 100 + np.cumsum(np.random.randn(252) * 0.5)
-    df = pd.DataFrame({
-        "open": close - 0.2,
-        "high": close + 0.5,
-        "low": close - 0.5,
-        "close": close,
-        "volume": np.random.randint(1000, 10000, 252),
-    }, index=dates)
-    df.index.name = "datetime"
+    raise FileNotFoundError(f"No data found for {instrument} in {base}")
+
+
+def _load_file(path: Path, years: float) -> pd.DataFrame:
+    """Load and normalize OHLCV from CSV or parquet."""
+    if path.suffix.lower() == ".csv":
+        df = pd.read_csv(path)
+        # Normalize columns (e.g. Close/Last -> close)
+        col_map = {}
+        for c in df.columns:
+            l = c.lower()
+            if "close" in l or "last" in l:
+                col_map[c] = "close"
+            elif "open" in l:
+                col_map[c] = "open"
+            elif "high" in l:
+                col_map[c] = "high"
+            elif "low" in l:
+                col_map[c] = "low"
+            elif "date" in l:
+                col_map[c] = "datetime"
+            elif "volume" in l:
+                col_map[c] = "volume"
+        df = df.rename(columns=col_map)
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"])
+            df = df.set_index("datetime").sort_index()
+        else:
+            for dc in ["Date", "date"]:
+                if dc in df.columns:
+                    df["datetime"] = pd.to_datetime(df[dc])
+                    df = df.set_index("datetime").sort_index()
+                    break
+        if "volume" not in df.columns:
+            df["volume"] = 1000
+        # Filter by years (most recent)
+        if years > 0 and len(df) > 0:
+            cutoff = df.index.max() - pd.Timedelta(days=years * 365.25)
+            df = df[df.index >= cutoff]
+    else:
+        df = pd.read_parquet(path)
+        if years > 0 and len(df) > 0:
+            if hasattr(df.index, "max"):
+                cutoff = df.index.max() - pd.Timedelta(days=years * 365.25)
+                df = df[df.index >= cutoff]
+
     return df
 
 
-def run_backtest(strategy_cls, data: pd.DataFrame) -> dict:
+def _load_broker_config(data_path: str, instrument: str) -> dict | None:
+    """Load broker config for instrument from data/broker_config.json."""
+    config_path = Path(data_path) / "broker_config.json"
+    if not config_path.exists():
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        return config.get(instrument)
+    except Exception:
+        return None
+
+
+def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrument: str = "") -> dict:
     """Run Backtrader backtest and return results dict."""
     equity_list = []
+    trades_list = []
+    total_bars = len(data)
 
     class EquityRecorder(bt.Strategy):
-        """Records broker value at each bar."""
+        """Records broker value at each bar, reports progress to stderr."""
+
+        params = (("total_bars", 0),)
+
+        def __init__(self):
+            self._last_pct = -1
 
         def next(self):
             equity_list.append(self.broker.getvalue())
+            if self.params.total_bars > 0:
+                pct = min(99, int((len(self) / self.params.total_bars) * 100))
+                if pct != self._last_pct and pct % 10 == 0:
+                    print(f"PROGRESS:{pct}", file=sys.stderr, flush=True)
+                    self._last_pct = pct
+
+    class TradeRecordingStrategy(strategy_cls):
+        """Wraps user strategy to record closed trades."""
+
+        def notify_trade(self, trade):
+            super().notify_trade(trade)
+            if trade.isclosed:
+                try:
+                    dt_open = trade.open_datetime() if hasattr(trade, "open_datetime") else None
+                    dt_close = trade.close_datetime() if hasattr(trade, "close_datetime") else None
+                    size = abs(trade.size) or 1
+                    trades_list.append({
+                        "date": dt_close.isoformat() if dt_close else "",
+                        "entryDate": dt_open.isoformat() if dt_open else "",
+                        "exitDate": dt_close.isoformat() if dt_close else "",
+                        "type": "buy" if trade.size > 0 else "sell",
+                        "size": size,
+                        "pnl": round(trade.pnlcomm, 2),
+                        "price": trade.price,
+                    })
+                except Exception:
+                    pass
 
     cerebro = bt.Cerebro()
 
@@ -98,9 +191,16 @@ def run_backtest(strategy_cls, data: pd.DataFrame) -> dict:
         openinterest=-1,
     )
     cerebro.adddata(data_bt)
-    cerebro.addstrategy(EquityRecorder)
-    cerebro.addstrategy(strategy_cls)
-    cerebro.broker.setcash(100000.0)
+    cerebro.addstrategy(EquityRecorder, total_bars=total_bars)
+    cerebro.addstrategy(TradeRecordingStrategy)
+
+    initial_capital = float(os.environ.get("INITIAL_CAPITAL", "100000"))
+    commission_perc = float(os.environ.get("COMMISSION_PERC", "0.001"))
+    slippage_perc = float(os.environ.get("SLIPPAGE_PERC", "0.001"))
+
+    cerebro.broker.setcash(initial_capital)
+    cerebro.broker.setcommission(commission=commission_perc)
+    cerebro.broker.set_slippage_perc(slippage_perc)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe")
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
@@ -108,8 +208,10 @@ def run_backtest(strategy_cls, data: pd.DataFrame) -> dict:
     results = cerebro.run()
     strat = results[1]  # User strategy (0=EquityRecorder)
 
+    print("PROGRESS:100", file=sys.stderr, flush=True)
+
     # Equity curve - include initial value
-    equity_curve = [100000.0] + equity_list
+    equity_curve = [initial_capital] + equity_list
 
     # Metrics
     sharpe = strat.analyzers.sharpe.get_analysis()
@@ -119,39 +221,79 @@ def run_backtest(strategy_cls, data: pd.DataFrame) -> dict:
     total_trades = ta.get("total", {}).get("closed", 0) or 0
     won = ta.get("won", {}).get("total", 0) or 0
     win_rate = (won / total_trades * 100) if total_trades else 0
+    final_equity = cerebro.broker.getvalue()
+    total_return_usd = final_equity - initial_capital
+    total_return_pct = round((total_return_usd / initial_capital) * 100, 2)
+
+    gross_profit = sum(t["pnl"] for t in trades_list if t["pnl"] > 0)
+    gross_loss = abs(sum(t["pnl"] for t in trades_list if t["pnl"] < 0))
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+    expectancy_usd = round(sum(t["pnl"] for t in trades_list) / len(trades_list), 2) if trades_list else 0.0
+    avg_loss = abs(sum(t["pnl"] for t in trades_list if t["pnl"] < 0) / len([t for t in trades_list if t["pnl"] < 0])) if any(t["pnl"] < 0 for t in trades_list) else 1.0
+    expectancy_r = round(expectancy_usd / avg_loss, 2) if avg_loss else 0.0
+    long_count = sum(1 for t in trades_list if t["type"] == "buy")
+    short_count = sum(1 for t in trades_list if t["type"] == "sell")
 
     metrics = {
-        "finalEquity": cerebro.broker.getvalue(),
+        "finalEquity": final_equity,
         "sharpeRatio": sharpe.get("sharperatio", 0) or 0,
         "maxDrawdown": dd.get("max", {}).get("drawdown", 0) or 0,
         "tradeCount": total_trades,
+        "longCount": long_count,
+        "shortCount": short_count,
         "winRate": round(win_rate, 2),
-        "totalReturn": round((cerebro.broker.getvalue() - 100000) / 100000 * 100, 2),
+        "totalReturn": total_return_pct,
+        "totalReturnUsd": round(total_return_usd, 2),
+        "profitFactor": profit_factor,
+        "expectancyUsd": expectancy_usd,
+        "expectancyR": expectancy_r,
+        "rMultiple": 0.0,
     }
 
-    # Trades (simplified - Backtrader trade list is complex)
-    trades = []
+    # OHLC for chart (date, open, high, low, close)
+    ohlc = []
+    if isinstance(data.index, pd.DatetimeIndex):
+        for i, ts in enumerate(data.index):
+            if i < len(data):
+                row = data.iloc[i]
+                ohlc.append({
+                    "date": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+                    "open": float(row.get("open", row.get("Open", 0))),
+                    "high": float(row.get("high", row.get("High", 0))),
+                    "low": float(row.get("low", row.get("Low", 0))),
+                    "close": float(row.get("close", row.get("Close", 0))),
+                })
 
     return {
         "equity": equity_curve,
         "metrics": metrics,
-        "trades": trades,
+        "trades": trades_list,
+        "ohlc": ohlc,
     }
 
 
 def main():
     strategy_path = os.environ.get("STRATEGY_PATH", "/app/strategy/strategy.py")
     data_path = os.environ.get("DATA_PATH", "/app/data")
-    instrument = os.environ.get("INSTRUMENT", "BTCUSD")
+    instrument = os.environ.get("INSTRUMENT", "NQ")
     timeframe = os.environ.get("TIMEFRAME", "1d")
+    years = float(os.environ.get("YEARS", "1"))
+    data_file = os.environ.get("DATA_FILE", "")
 
     try:
+        print("[engine] Loading strategy...", file=sys.stderr, flush=True)
         strategy_cls = load_strategy(strategy_path)
-        data = load_data(data_path, instrument, timeframe)
-        result = run_backtest(strategy_cls, data)
+        print("[engine] Loading data...", file=sys.stderr, flush=True)
+        data = load_data(data_path, instrument, timeframe, years, data_file)
+        print(f"[engine] Running backtest ({len(data)} bars)...", file=sys.stderr, flush=True)
+        result = run_backtest(strategy_cls, data, data_path=str(data_path), instrument=instrument)
         print(json.dumps(result))
     except Exception as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        import traceback
+        tb = traceback.format_exc()
+        msg = str(e) or f"{type(e).__name__}"
+        full = f"{msg}\n\n{tb}"
+        print(json.dumps({"error": full}), file=sys.stderr, flush=True)
         sys.exit(1)
 
 

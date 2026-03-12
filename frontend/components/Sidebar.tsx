@@ -1,26 +1,151 @@
 "use client";
 
-import { FileTree } from "./FileTree";
+import type { ItemType } from "@/lib/firestore";
+import type { FirestoreFile, FirestoreItem } from "@/lib/firestore";
+
+const LABELS: Record<ItemType, string> = {
+  strategies: "Strategie",
+  indicators: "Indikátory",
+  modules: "Moduly",
+};
+
+const CREATE_LABELS: Record<ItemType, string> = {
+  strategies: "Vytvořit strategii",
+  indicators: "Vytvořit indikátor",
+  modules: "Vytvořit modul",
+};
 
 interface SidebarProps {
-  onSelectFile?: (path: string) => void;
+  openItem: { type: ItemType; id: string; name: string } | null;
+  selectedType: ItemType | null;
+  items: FirestoreItem[];
+  files: FirestoreFile[];
+  onSelectType?: (type: ItemType) => void;
+  onSelectItem?: (type: ItemType, item: FirestoreItem) => void;
+  onCreateClick?: () => void;
+  onBack?: () => void;
+  onSelectFile?: (fileName: string) => void;
+  selectedFile?: string | null;
 }
 
-/** Sidebar with project list and file tree */
-export function Sidebar({ onSelectFile }: SidebarProps) {
+/** Sidebar - 3 buttons, or expanded list + create, or item files */
+export function Sidebar({
+  openItem,
+  selectedType,
+  items,
+  files,
+  onSelectType,
+  onSelectItem,
+  onCreateClick,
+  onBack,
+  onSelectFile,
+  selectedFile,
+}: SidebarProps) {
+  if (openItem) {
+    return (
+      <aside className="w-64 flex flex-col border-r border-zinc-800 bg-zinc-900/30">
+        <div className="px-4 py-3 border-b border-zinc-800">
+          <button
+            onClick={onBack}
+            className="text-sm text-zinc-400 hover:text-zinc-200 flex items-center gap-2"
+          >
+            ← Zpět
+          </button>
+          <h2 className="font-semibold text-sm mt-2 truncate">{openItem.name}</h2>
+        </div>
+        <div className="flex-1 overflow-auto p-2">
+          <h3 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">
+            Soubory
+          </h3>
+          <div className="space-y-0.5">
+            {files.map((f) => (
+              <div
+                key={f.fileName}
+                onClick={() => onSelectFile?.(f.fileName)}
+                className={`flex items-center gap-2 py-2 px-2 rounded text-sm cursor-pointer ${
+                  selectedFile === f.fileName
+                    ? "bg-zinc-700 text-zinc-100"
+                    : "hover:bg-zinc-800 text-zinc-400"
+                }`}
+              >
+                <span>📄</span>
+                <span>{f.fileName}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </aside>
+    );
+  }
+
+  if (selectedType) {
+    const label = LABELS[selectedType];
+    const createLabel = CREATE_LABELS[selectedType];
+    return (
+      <aside className="w-64 flex flex-col border-r border-zinc-800 bg-zinc-900/30">
+        <div className="px-4 py-3 border-b border-zinc-800">
+          <button
+            onClick={() => onBack?.()}
+            className="text-sm text-zinc-400 hover:text-zinc-200 flex items-center gap-2"
+          >
+            ← Zpět
+          </button>
+          <h2 className="font-semibold text-sm mt-2 text-zinc-300">{label}</h2>
+        </div>
+        <div className="flex-1 overflow-auto p-2">
+          <div className="space-y-0.5">
+            {items.length === 0 ? (
+              <p className="text-zinc-500 text-sm py-2">Žádné položky</p>
+            ) : (
+              items.map((item) => (
+                <div
+                  key={item.id}
+                  onClick={() => onSelectItem?.(selectedType, item)}
+                  className="flex items-center gap-2 py-2 px-2 rounded text-sm cursor-pointer hover:bg-zinc-800 text-zinc-400"
+                >
+                  <span>📁</span>
+                  <span className="truncate">{item.name}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+        <div className="p-3 border-t border-zinc-800">
+          <button
+            onClick={onCreateClick}
+            className="w-full px-4 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm"
+          >
+            {createLabel}
+          </button>
+        </div>
+      </aside>
+    );
+  }
+
   return (
     <aside className="w-64 flex flex-col border-r border-zinc-800 bg-zinc-900/30">
       <div className="px-4 py-3 border-b border-zinc-800">
-        <h2 className="font-semibold text-sm">Projects</h2>
-        <ul className="mt-2 text-sm text-zinc-400">
-          <li className="py-1 cursor-pointer hover:text-zinc-200">Default Project</li>
-        </ul>
+        <h2 className="font-semibold text-sm text-zinc-300">Projekt</h2>
       </div>
-      <div className="flex-1 overflow-auto p-2">
-        <h3 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">
-          Files
-        </h3>
-        <FileTree onSelect={onSelectFile} />
+      <div className="flex-1 overflow-auto p-3 space-y-2">
+        <button
+          onClick={() => onSelectType?.("strategies")}
+          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
+        >
+          Strategie
+        </button>
+        <button
+          onClick={() => onSelectType?.("indicators")}
+          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
+        >
+          Indikátory
+        </button>
+        <button
+          onClick={() => onSelectType?.("modules")}
+          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
+        >
+          Moduly
+        </button>
       </div>
     </aside>
   );

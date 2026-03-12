@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react";
 
 /** TradingView Lightweight Charts - equity curve */
-export function EquityChart({ equity }: { equity: number[] }) {
+export function EquityChart({ equity, height = 200 }: { equity: number[]; height?: number }) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstanceRef = useRef<ReturnType<typeof import("lightweight-charts").createChart> | null>(null);
 
@@ -21,7 +21,7 @@ export function EquityChart({ equity }: { equity: number[] }) {
 
       const chart = createChart(chartRef.current, {
         width: chartRef.current.clientWidth,
-        height: 200,
+        height,
         layout: {
           background: { color: "#18181b" },
           textColor: "#a1a1aa",
@@ -65,11 +65,8 @@ export function EquityChart({ equity }: { equity: number[] }) {
   }
 
   return (
-    <div>
-      <h4 className="text-xs font-medium text-zinc-500 uppercase tracking-wider mb-2">
-        Equity Curve
-      </h4>
-      <div ref={chartRef} className="rounded-lg overflow-hidden" />
+    <div className="w-full h-full">
+      <div ref={chartRef} className="w-full h-full rounded-lg overflow-hidden" />
     </div>
   );
 }
