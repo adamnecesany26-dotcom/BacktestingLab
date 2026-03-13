@@ -83,14 +83,46 @@ def _read_stream_sync(
     threading.Thread(target=run, daemon=True).start()
 
 
+def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, str] | None) -> str:
+    """
+    Write strategy files to run_dir. Returns the entry point filename (main.py or strategy.py).
+    Creates indicators/__init__.py when indicators/ subdir is used (for "from indicators.X import Y").
+    """
+    if files and len(files) > 0:
+        for subdir in ("indicators", "modules"):
+            if any(fp.startswith(f"{subdir}/") for fp in files):
+                pkg_dir = run_dir / subdir
+                pkg_dir.mkdir(parents=True, exist_ok=True)
+                (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+        for file_path, content in files.items():
+            full_path = run_dir / file_path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content, encoding="utf-8")
+        if "main.py" in files:
+            return "main.py"
+        return next(iter(files.keys()))
+    if code:
+        (run_dir / "strategy.py").write_text(code, encoding="utf-8")
+        return "strategy.py"
+    raise ValueError("Either code or files must be provided")
+
+
 async def run_strategy_streaming(
-    code: str,
-    instrument: str,
-    timeframe: str,
+    code: str | None = None,
+    files: dict[str, str] | None = None,
+    instrument: str = "",
+    timeframe: str = "",
     years: float = 1.0,
     data_file: str = "",
     initial_capital: float = 100000.0,
     slippage_perc: float = 0.001,
+    instrument_type: str = "futures",
+    tick_size: float | None = None,
+    value_per_tick: float | None = None,
+    share_size: int | None = None,
+    lot_size: float | None = None,
+    pip_size: float | None = None,
+    pip_value: float | None = None,
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -102,8 +134,9 @@ async def run_strategy_streaming(
     data_dir = project_root / "data"
     run_dir = project_root / ".backtest_run"
     run_dir.mkdir(parents=True, exist_ok=True)
-    strategy_path = run_dir / "strategy.py"
-    strategy_path.write_text(code, encoding="utf-8")
+
+    entry_file = _prepare_strategy_files(run_dir, code, files)
+    strategy_path = run_dir / entry_file
 
     try:
         if not data_dir.exists():
@@ -120,12 +153,20 @@ async def run_strategy_streaming(
             "--network", "none",
             "-v", f"{run_path}:/app/strategy:rw",
             "-v", f"{data_path}:/app/data:ro",
+            "-e", f"STRATEGY_PATH=/app/strategy/{entry_file}",
             "-e", f"INSTRUMENT={instrument}",
             "-e", f"TIMEFRAME={timeframe}",
             "-e", f"YEARS={years}",
             "-e", f"DATA_FILE={data_file}",
             "-e", f"INITIAL_CAPITAL={initial_capital}",
             "-e", f"SLIPPAGE_PERC={slippage_perc}",
+            "-e", f"INSTRUMENT_TYPE={instrument_type}",
+            "-e", f"TICK_SIZE={tick_size if tick_size is not None else ''}",
+            "-e", f"VALUE_PER_TICK={value_per_tick if value_per_tick is not None else ''}",
+            "-e", f"SHARE_SIZE={share_size if share_size is not None else ''}",
+            "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
+            "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
+            "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
             "backtest-engine",
         ]
 
@@ -174,7 +215,8 @@ async def run_strategy_streaming(
                 preview = (error_msg or "")[:800]
                 print(f"[runner] ERROR from engine:\n{preview}", flush=True)
                 debug_path = run_dir / "last_error_strategy.py"
-                debug_path.write_text(code[:5000], encoding="utf-8")
+                err_content = (code or "")[:5000] if code else str(files or {})[:5000]
+                debug_path.write_text(err_content, encoding="utf-8")
                 print(f"[runner] Strategy saved to {debug_path} for debug", flush=True)
             yield ev
             if ev.get("type") in ("result", "error"):
@@ -196,29 +238,60 @@ async def run_strategy_streaming(
             err = "\n".join(stderr_buffer) or "Unknown error"
             msg = f"Docker failed (exit {proc.returncode}): {err}"
             print(f"[runner] DOCKER FAILED:\n{msg[:1500]}", flush=True)
-            (run_dir / "last_error_strategy.py").write_text(code[:5000], encoding="utf-8")
+            (run_dir / "last_error_strategy.py").write_text(
+                (code or "")[:5000] if code else str(files or {})[:5000], encoding="utf-8"
+            )
             yield {"type": "error", "message": msg}
     finally:
-        try:
-            strategy_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        for f in run_dir.glob("*.py"):
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+        for d in run_dir.iterdir():
+            if d.is_dir():
+                for f in d.rglob("*.py"):
+                    try:
+                        f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
 
 async def run_strategy(
-    code: str,
-    instrument: str,
-    timeframe: str,
+    code: str | None = None,
+    files: dict[str, str] | None = None,
+    instrument: str = "",
+    timeframe: str = "",
     years: float = 1.0,
     data_file: str = "",
     initial_capital: float = 100000.0,
     slippage_perc: float = 0.001,
+    instrument_type: str = "futures",
+    tick_size: float | None = None,
+    value_per_tick: float | None = None,
+    share_size: int | None = None,
+    lot_size: float | None = None,
+    pip_size: float | None = None,
+    pip_value: float | None = None,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
     async for ev in run_strategy_streaming(
-        code, instrument, timeframe, years, data_file,
-        initial_capital, commission_per_contract, slippage_perc,
+        code=code,
+        files=files,
+        instrument=instrument,
+        timeframe=timeframe,
+        years=years,
+        data_file=data_file,
+        initial_capital=initial_capital,
+        slippage_perc=slippage_perc,
+        instrument_type=instrument_type,
+        tick_size=tick_size,
+        value_per_tick=value_per_tick,
+        share_size=share_size,
+        lot_size=lot_size,
+        pip_size=pip_size,
+        pip_value=pip_value,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")

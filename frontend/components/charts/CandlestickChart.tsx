@@ -23,7 +23,7 @@ export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChar
 
       const chart = createChart(chartRef.current, {
         width: chartRef.current.clientWidth,
-        height: 320,
+        height: height,
         layout: {
           background: { color: "#18181b" },
           textColor: "#a1a1aa",
@@ -87,7 +87,7 @@ export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChar
     return () => {
       mounted = false;
     };
-  }, [ohlc, trades]);
+  }, [ohlc, trades, height]);
 
   if (ohlc.length === 0) {
     return (

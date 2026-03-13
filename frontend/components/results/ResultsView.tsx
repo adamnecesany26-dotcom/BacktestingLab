@@ -4,11 +4,12 @@ import { useState } from "react";
 import { EquityChart } from "@/components/charts/EquityChart";
 import { TradesChart } from "@/components/charts/TradesChart";
 import { CandlestickChart } from "@/components/charts/CandlestickChart";
+import { DetailedChart } from "@/components/charts/DetailedChart";
 import { StatBlocks } from "@/components/results/StatBlocks";
 import { TradesTable } from "@/components/results/TradesTable";
 import type { RunResponse } from "@shared/types";
 
-type TabId = "equity" | "trades" | "chart";
+type TabId = "equity" | "trades" | "chart" | "detailed";
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -38,6 +39,7 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
     { id: "equity", label: "Equity" },
     { id: "trades", label: "Trades" },
     { id: "chart", label: "Chart" },
+    { id: "detailed", label: "Detailed" },
   ];
 
   return (
@@ -81,7 +83,11 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
         ))}
       </div>
 
-      <div className="flex-1 min-h-[480px] px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0">
+      <div
+        className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
+          activeTab === "chart" || activeTab === "detailed" ? "min-h-[560px]" : "min-h-[480px]"
+        }`}
+      >
         {activeTab === "equity" && (
           <EquityChart
             equityCurve={results.equityCurve}
@@ -112,7 +118,14 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
             </div>
           </div>
         )}
-        {activeTab === "chart" && <CandlestickChart ohlc={results.ohlc ?? []} trades={results.trades} height={480} />}
+        {activeTab === "chart" && (
+          <CandlestickChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
+        )}
+        {activeTab === "detailed" && (
+          <div className="py-4 h-full overflow-auto">
+            <DetailedChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
+          </div>
+        )}
       </div>
 
       <div className="mt-4 p-6 shrink-0">

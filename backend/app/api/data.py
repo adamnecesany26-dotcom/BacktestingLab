@@ -29,47 +29,103 @@ def _load_broker_config() -> dict:
 def _get_data_dir() -> Path:
     # data.py is in backend/app/api/ -> parent.parent.parent = backend
     backend_root = Path(__file__).resolve().parent.parent.parent
-    return backend_root.parent / "data"  # project root / data
+    primary = backend_root.parent / "data"  # project root / data
+    if (primary / "mock").exists():
+        return primary
+    # Fallback when backend runs from different cwd (e.g. project root)
+    for candidate in [Path.cwd() / "data", Path.cwd().parent / "data"]:
+        if (candidate / "mock").exists():
+            return candidate
+    return primary
+
+
+def _process_csv_to_instrument(
+    f: Path,
+    file_prefix: str,
+    instrument_type: str,
+    broker_config: dict,
+) -> dict | None:
+    """Parse CSV and return instrument item with instrumentType."""
+    try:
+        df = pd.read_csv(f, nrows=1)
+        if "Date" not in df.columns and "date" not in df.columns:
+            return None
+        full = pd.read_csv(f)
+        date_col = "Date" if "Date" in full.columns else "date"
+        full[date_col] = pd.to_datetime(full[date_col])
+        min_d = full[date_col].min()
+        max_d = full[date_col].max()
+        years = (max_d - min_d).days / 365.25
+        name = f.stem  # e.g. NQ_5Y
+        parts = name.split("_")
+        instrument = parts[0] if parts else name
+        item = {
+            "instrument": instrument,
+            "timeframe": "1d",
+            "file": f"{file_prefix}{f.name}",
+            "minDate": min_d.strftime("%Y-%m-%d"),
+            "maxDate": max_d.strftime("%Y-%m-%d"),
+            "yearsAvailable": round(years, 1),
+            "instrumentType": instrument_type,
+        }
+        if instrument in broker_config and "mult" in broker_config[instrument]:
+            item["brokerConfig"] = broker_config[instrument]
+        return item
+    except Exception:
+        return None
+
+
+@router.get("/data/debug")
+async def get_data_debug():
+    """Diagnostic: returns data path and whether mock dir exists."""
+    data_dir = _get_data_dir()
+    mock_dir = data_dir / "mock"
+    csv_files = list(mock_dir.glob("*.csv")) if mock_dir.exists() else []
+    return {
+        "data_dir": str(data_dir.absolute()),
+        "mock_exists": mock_dir.exists(),
+        "csv_count": len(csv_files),
+        "csv_files": [f.name for f in csv_files[:20]],
+    }
 
 
 @router.get("/data")
 async def get_available_data():
     """
     Scan data folder for available instruments.
-    Returns list of { instrument, timeframe, minDate, maxDate, yearsAvailable, brokerConfig }.
+    Returns list of { instrument, timeframe, minDate, maxDate, yearsAvailable, instrumentType, brokerConfig }.
+    instrumentType from folder: mock/*.csv → futures, mock/futures/ → futures, mock/stocks/ → stocks, mock/forex/ → forex.
     brokerConfig: { tick_size, tick_value, mult, margin, commission_per_contract } for futures.
     """
     data_dir = _get_data_dir()
     broker_config = _load_broker_config()
     results = []
+    seen_files: set[str] = set()
 
     mock_dir = data_dir / "mock"
-    if mock_dir.exists():
-        for f in mock_dir.glob("*.csv"):
-            try:
-                df = pd.read_csv(f, nrows=1)
-                if "Date" in df.columns or "date" in df.columns:
-                    full = pd.read_csv(f)
-                    date_col = "Date" if "Date" in full.columns else "date"
-                    full[date_col] = pd.to_datetime(full[date_col])
-                    min_d = full[date_col].min()
-                    max_d = full[date_col].max()
-                    years = (max_d - min_d).days / 365.25
-                    name = f.stem  # e.g. NQ_5Y
-                    parts = name.split("_")
-                    instrument = parts[0] if parts else name
-                    item = {
-                        "instrument": instrument,
-                        "timeframe": "1d",
-                        "file": f"mock/{f.name}",
-                        "minDate": min_d.strftime("%Y-%m-%d"),
-                        "maxDate": max_d.strftime("%Y-%m-%d"),
-                        "yearsAvailable": round(years, 1),
-                    }
-                    if instrument in broker_config and "mult" in broker_config[instrument]:
-                        item["brokerConfig"] = broker_config[instrument]
+    if not mock_dir.exists():
+        return {"instruments": results}
+
+    # Scan subfolders by type: mock/futures/, mock/stocks/, mock/forex/
+    for subdir, inst_type in [("futures", "futures"), ("stocks", "stocks"), ("forex", "forex")]:
+        sub_path = mock_dir / subdir
+        if sub_path.exists():
+            for f in sub_path.glob("*.csv"):
+                key = f"{subdir}/{f.name}"
+                if key in seen_files:
+                    continue
+                item = _process_csv_to_instrument(f, f"mock/{subdir}/", inst_type, broker_config)
+                if item:
+                    seen_files.add(key)
                     results.append(item)
-            except Exception:
-                pass
+
+    # Root mock/*.csv → futures (backward compatibility)
+    for f in mock_dir.glob("*.csv"):
+        if f.name in seen_files:
+            continue
+        item = _process_csv_to_instrument(f, "mock/", "futures", broker_config)
+        if item:
+            seen_files.add(f.name)
+            results.append(item)
 
     return {"instruments": results}

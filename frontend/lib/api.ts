@@ -2,7 +2,7 @@
  * API client for backend communication.
  */
 
-import type { RunRequest, RunResponse } from "@shared/types";
+import type { RunRequest, RunResponse, OhlcBar, Trade } from "@shared/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -79,4 +79,18 @@ export async function getAvailableData(): Promise<{
   const res = await fetch(`${API_BASE}/api/data`);
   if (!res.ok) throw new Error(await res.text());
   return res.json();
+}
+
+/** Fetch mplfinance chart PNG from backend. */
+export async function getChartImage(ohlc: OhlcBar[], trades: Trade[]): Promise<Blob> {
+  const res = await fetch(`${API_BASE}/api/chart`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ohlc, trades }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.blob();
 }

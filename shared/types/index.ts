@@ -3,9 +3,23 @@
  * Used by both Next.js frontend and FastAPI backend (via OpenAPI).
  */
 
+/** Instrument type for backtest configuration */
+export type InstrumentType = "futures" | "stocks" | "forex";
+
+/** Filter instruments by type. Instruments without instrumentType default to "futures". */
+export function filterInstrumentsByType(
+  instruments: DataInstrument[],
+  type: InstrumentType
+): DataInstrument[] {
+  return instruments.filter((i) => (i.instrumentType ?? "futures") === type);
+}
+
 /** Run request payload */
 export interface RunRequest {
-  code: string;
+  /** Single-file mode: strategy code (main.py content) */
+  code?: string;
+  /** Multi-file mode: { "main.py": "...", "utils.py": "..." } - all files in strategy */
+  files?: Record<string, string>;
   instrument: string;
   timeframe: string;
   years?: number;
@@ -13,6 +27,17 @@ export interface RunRequest {
   /** Realistic simulation params */
   initial_capital?: number;
   slippage_perc?: number;
+  /** Instrument type and type-specific params */
+  instrument_type?: InstrumentType;
+  /** Futures: tick size, value per tick */
+  tick_size?: number;
+  value_per_tick?: number;
+  /** Stocks: position size (shares) */
+  share_size?: number;
+  /** Forex: lot size, pip size, pip value */
+  lot_size?: number;
+  pip_size?: number;
+  pip_value?: number;
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -32,6 +57,8 @@ export interface DataInstrument {
   minDate: string;
   maxDate: string;
   yearsAvailable: number;
+  /** Instrument type - used to filter by Instrument Type in UI */
+  instrumentType?: InstrumentType;
   /** Futures broker params - used when present */
   brokerConfig?: BrokerConfig;
 }

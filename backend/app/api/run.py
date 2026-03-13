@@ -38,12 +38,20 @@ async def run_backtest(request: RunRequest, req: Request):
             try:
                 async for ev in run_strategy_streaming(
                     code=request.code,
+                    files=request.files,
                     instrument=request.instrument,
                     timeframe=request.timeframe,
                     years=request.years,
                     data_file=request.data_file or "",
                     initial_capital=request.initial_capital,
                     slippage_perc=request.slippage_perc,
+                    instrument_type=request.instrument_type,
+                    tick_size=request.tick_size,
+                    value_per_tick=request.value_per_tick,
+                    share_size=request.share_size,
+                    lot_size=request.lot_size,
+                    pip_size=request.pip_size,
+                    pip_value=request.pip_value,
                     is_client_connected=is_connected,
                 ):
                     _debug_log.append(f"{ev.get('type')}: {str(ev)[:300]}")
@@ -65,15 +73,26 @@ async def run_backtest(request: RunRequest, req: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
+    if not request.code and not request.files:
+        raise HTTPException(status_code=400, detail="Either code or files must be provided")
+
     try:
         result = await run_strategy(
             code=request.code,
+            files=request.files,
             instrument=request.instrument,
             timeframe=request.timeframe,
             years=request.years,
             data_file=request.data_file or "",
             initial_capital=request.initial_capital,
             slippage_perc=request.slippage_perc,
+            instrument_type=request.instrument_type,
+            tick_size=request.tick_size,
+            value_per_tick=request.value_per_tick,
+            share_size=request.share_size,
+            lot_size=request.lot_size,
+            pip_size=request.pip_size,
+            pip_value=request.pip_value,
         )
         return result
     except Exception as e:

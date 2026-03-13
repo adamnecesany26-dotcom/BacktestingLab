@@ -11,6 +11,7 @@ import {
   getDoc,
   addDoc,
   setDoc,
+  deleteDoc,
   serverTimestamp,
   type CollectionReference,
 } from "firebase/firestore";
@@ -150,6 +151,27 @@ export async function saveFile(
 ): Promise<void> {
   const fileRef = doc(getDb(), type, itemId, "files", fileName);
   await setDoc(fileRef, { fileName, content });
+}
+
+/** Create a new file in an item (strategy, indicator, module). */
+export async function createFile(
+  type: ItemType,
+  itemId: string,
+  fileName: string,
+  initialContent: string = ""
+): Promise<void> {
+  const fileRef = doc(getDb(), type, itemId, "files", fileName);
+  await setDoc(fileRef, { fileName, content: initialContent });
+}
+
+/** Delete a file from an item. */
+export async function deleteFile(
+  type: ItemType,
+  itemId: string,
+  fileName: string
+): Promise<void> {
+  const fileRef = doc(getDb(), type, itemId, "files", fileName);
+  await deleteDoc(fileRef);
 }
 
 export async function getMainStrategyCode(type: ItemType, itemId: string): Promise<string | null> {

@@ -1,228 +1,488 @@
-# Backtesting Platform
+# Backtesting Platform – Kompletní dokumentace
 
-Webová aplikace pro testování obchodních strategií na historických datech. Píšeš strategii v Pythonu, spustíš backtest a vidíš výsledky – grafy a statistiky.
+Webová aplikace pro testování obchodních strategií na historických datech. Uživatel píše strategie v Pythonu (Backtrader), spouští backtest v izolovaném Docker kontejneru a vidí výsledky – grafy, statistiky a obchody.
 
----
-
-## Co aplikace dělá?
-
-Představ si to takto:
-
-1. **Máš obchodní strategii** – napsanou v Pythonu (např. „když cena stoupne, kup“).
-2. **Máš historická data** – ceny akcií/futures z minulosti (např. 5 let denních dat).
-3. **Backtest** = „spusť strategii na historii“ – program projde data po dni a simuluje, co by se stalo, kdybys strategii používal.
-4. **Výsledky** – kolik bys vydělal, ztratil, jaké riziko atd.
-
-Aplikace ti umožní:
-- **Vytvářet** strategie, indikátory a moduly (složky s Python soubory)
-- **Ukládat** je do Firebase (cloud)
-- **Přepisovat** kód v editoru (jako ve VS Code)
-- **Spouštět** backtest jedním kliknutím
-- **Zobrazovat** výsledky – graf equity a statistiky
+**Účel dokumentu:** Tento soubor slouží jako kompletní technická dokumentace pro hodnocení workflow aplikace (např. ChatGPT, code review).
 
 ---
 
-## Jak to celé funguje? (Velmi jednoduše)
+## 1. Přehled aplikace
+
+### 1.1 Co aplikace dělá
+
+1. **Strategie** – uživatel vytváří a upravuje obchodní strategie v Pythonu (Backtrader API)
+2. **Indikátory a moduly** – znovupoužitelné komponenty (indikátory jako `bt.Indicator`, moduly jako utility funkce)
+3. **Backtest** – spuštění strategie na historických OHLCV datech v izolovaném prostředí
+4. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, win rate), seznam obchodů, candlestick graf s entry/exit
+
+### 1.2 Architektura (vysokoúrovňově)
 
 ```
-Ty (uživatel)
-    ↓ klikneš na Run
-Prohlížeč (frontend)
-    ↓ pošle kód strategie + nastavení na server
-Backend (Python server)
-    ↓ vytvoří dočasnou složku, zapíše tam strategii
-    ↓ spustí Docker kontejner
-Docker (izolovaný „krabička“)
-    ↓ načte strategii, načte data
-    ↓ spustí Backtrader (knihovna pro backtest)
-    ↓ vyhodí výsledky
-Backend
-    ↓ předá výsledky
-Prohlížeč
-    ↓ zobrazí graf a statistiky
-Ty vidíš výsledky
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  FRONTEND (Next.js, React)                                                   │
+│  - page.tsx: hlavní stav, orchestrace                                         │
+│  - BacktestSettings: konfigurace, instrument, indikátory, moduly, Run        │
+│  - StrategyEditor: Monaco editor (kód)                                        │
+│  - ResultsView: grafy, statistiky, tabulka obchodů                            │
+│  - Firebase Firestore: strategie, indikátory, moduly (cloud storage)         │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        │ HTTP (fetch)
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  BACKEND (FastAPI, Python)                                                  │
+│  - GET /api/data: seznam dostupných instrumentů                            │
+│  - POST /api/run: spuštění backtestu (stream=1 → SSE)                       │
+│  - POST /api/chart: generace PNG grafu (mplfinance)                         │
+│  - services/runner.py: orchestrace Dockeru, streamování výstupu              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                        │
+                                        │ docker run
+                                        ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  DOCKER KONTEJNER (backtest-engine)                                         │
+│  - engine.py: načte strategii, data, spustí Backtrader                      │
+│  - Mount: /app/strategy (strategie), /app/data (OHLCV CSV/parquet)           │
+│  - Výstup: JSON na stdout, PROGRESS:X na stderr                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Proč Docker?**  
-Strategie je cizí Python kód. Spouštíme ji v izolovaném prostředí (kontejner), aby nemohla poškodit tvůj počítač – nemá přístup k síti, má omezenou paměť.
+### 1.3 Proč Docker
+
+Strategie je cizí Python kód. Spouští se v izolovaném kontejneru:
+- Bez síťového přístupu (`--network none`)
+- Omezená paměť (1 GB), CPU (1 core)
+- Timeout 3 minuty
+- Nemůže poškodit hostitelský systém
 
 ---
 
-## Struktura projektu
+## 2. Struktura projektu
 
 ```
 Backtesting_app/
-│
-├── frontend/                 ← Co vidíš v prohlížeči
+├── frontend/                    # Next.js aplikace
 │   ├── app/
-│   │   ├── page.tsx         ← Hlavní stránka (logika, stav)
-│   │   ├── layout.tsx       ← Vzhled celé aplikace
-│   │   └── globals.css      ← Styly
-│   ├── components/          ← Skládací kostičky UI
-│   │   ├── Sidebar.tsx      ← Levý panel (soubory, Zpět)
-│   │   ├── MainView.tsx     ← Klikací tlačítka Strategie/Indikátory/Moduly
-│   │   ├── BacktestSettings.tsx  ← Pravý panel (instrument, délka, Run)
-│   │   ├── BacktestResults.tsx  ← Statistiky (equity, Sharpe, trades)
-│   │   ├── EquityChart.tsx      ← Graf vývoje účtu
-│   │   ├── LogPanel.tsx         ← Logy (jako terminál)
-│   │   ├── LoadingOverlay.tsx   ← Zobrazení při běhu
-│   │   ├── ExportButton.tsx     ← Export výsledků
-│   │   └── editor/
-│   │       └── StrategyEditor.tsx  ← Monaco editor (kód)
-│   ├── lib/
-│   │   ├── api.ts           ← Volání backendu (fetch)
-│   │   ├── firestore.ts     ← Čtení/zápis do Firebase
-│   │   └── firebase.ts      ← Konfigurace Firebase
-│   └── package.json
+│   │   ├── page.tsx             # Hlavní stránka – stav, logika, orchestrace
+│   │   ├── layout.tsx
+│   │   └── globals.css
+│   ├── components/
+│   │   ├── Sidebar.tsx          # Levý panel – soubory strategie, Zpět
+│   │   ├── MainView.tsx         # Strategie / Indikátory / Moduly – seznam + vytvoření
+│   │   ├── BacktestSettings.tsx # Pravý panel – Instrument Type, Instrument, Years, Run
+│   │   ├── BacktestResults.tsx  # Statistiky (equity, Sharpe, drawdown, trades)
+│   │   ├── editor/
+│   │   │   └── StrategyEditor.tsx # Monaco editor
+│   │   ├── results/
+│   │   │   ├── ResultsView.tsx  # Kontejner výsledků
+│   │   │   ├── StatBlocks.tsx   # Metriky
+│   │   │   ├── TradesTable.tsx # Tabulka obchodů
+│   │   │   └── ...
+│   │   ├── charts/
+│   │   │   ├── DetailedChart.tsx # Candlestick + trades
+│   │   │   ├── EquityChart.tsx
+│   │   │   └── TradesChart.tsx
+│   │   ├── LogPanel.tsx         # Spodní panel – logy z backendu
+│   │   ├── LoadingOverlay.tsx   # Progress bar + Zastavit
+│   │   ├── CreateModal.tsx     # Modal pro vytvoření strategie/indikátoru/modulu
+│   │   └── AddFileModal.tsx    # Modal pro přidání souboru
+│   └── lib/
+│       ├── api.ts               # runBacktestStreaming, getAvailableData, getChartImage
+│       ├── firestore.ts         # listItems, createItem, getFiles, getFileContent, saveFile
+│       └── firebase.ts          # Firebase konfigurace
 │
-├── backend/                  ← Python server
+├── backend/
 │   ├── app/
-│   │   ├── main.py          ← Vstupní bod (FastAPI)
+│   │   ├── main.py              # FastAPI app, CORS, routy
 │   │   ├── api/
-│   │   │   ├── run.py       ← Endpoint POST /api/run
-│   │   │   └── data.py      ← Endpoint GET /api/data
+│   │   │   ├── run.py           # POST /api/run (streaming / non-streaming)
+│   │   │   ├── data.py          # GET /api/data, GET /api/data/debug
+│   │   │   └── chart.py         # POST /api/chart (PNG)
 │   │   ├── services/
-│   │   │   └── runner.py    ← Spouští Docker, streamuje výstup
+│   │   │   ├── runner.py        # Docker orchestrace, streamování
+│   │   │   └── chart.py         # mplfinance generace grafu
 │   │   └── models/
-│   │       └── run.py       ← Struktury request/response
-│   ├── docker/
-│   │   ├── Dockerfile       ← Jak sestavit Docker obraz
-│   │   ├── engine.py        ← Skript, který běží UVNITŘ kontejneru
-│   │   └── requirements.txt
-│   └── requirements.txt
+│   │       └── run.py           # RunRequest, RunResponse, Trade, BacktestMetrics
+│   └── docker/
+│       ├── Dockerfile           # python:3.11-slim + backtrader
+│       ├── engine.py            # Skript běžící UVNITŘ kontejneru
+│       └── requirements.txt
 │
 ├── shared/
 │   └── types/
-│       └── index.ts         ← Sdílené typy (RunRequest, RunResponse)
+│       └── index.ts             # RunRequest, RunResponse, DataInstrument, InstrumentType
 │
 ├── data/
+│   ├── broker_config.json       # tick_size, tick_value, mult, margin pro futures
 │   └── mock/
-│       └── NQ_5Y.csv        ← Historická data (NQ, 5 let)
+│       ├── NQ_5Y.csv            # Futures (root = backward compat)
+│       ├── futures/             # (volitelné) další futures
+│       ├── stocks/              # Akcie (AAPL_5Y.csv, ...)
+│       └── forex/               # Forex páry (EURUSD_5Y.csv, ...)
 │
-├── README.md
-└── SCRIPTS.md
+├── strategies/                  # Lokální příklady (ne v produkci)
+└── README.md
 ```
 
 ---
 
-## Co dělá který soubor?
+## 3. Kompletní workflow – krok za krokem
 
-### Frontend (React)
+### 3.1 Spuštění aplikace
 
-| Soubor | Účel |
-|--------|------|
-| `page.tsx` | Hlavní stránka. Drží stav (kód, výsledky, logy). Spojuje komponenty (Sidebar, Editor, Settings). Volá API a Firestore. |
-| `Sidebar.tsx` | Levý panel. Když je otevřená strategie: seznam souborů + tlačítko Zpět. |
-| `MainView.tsx` | Tři tlačítka (Strategie, Indikátory, Moduly). Po kliknutí seznam položek + „Vytvořit X“. Modal pro vytvoření. |
-| `StrategyEditor.tsx` | Monaco editor – editor kódu (jako VS Code). |
-| `BacktestSettings.tsx` | Výběr instrumentu, délky v letech, tlačítko Run. |
-| `BacktestResults.tsx` | Zobrazí metriky (final equity, Sharpe, drawdown, trades). |
-| `EquityChart.tsx` | Graf vývoje účtu (TradingView Lightweight Charts). |
-| `LogPanel.tsx` | Spodní panel – logy z backendu (stdout/stderr). |
-| `LoadingOverlay.tsx` | Zobrazení při běhu backtestu s progress barem a tlačítkem Zastavit. |
-| `api.ts` | `runBacktestStreaming()` – volá `/api/run?stream=1`, čte SSE stream. `getAvailableData()` – volá `/api/data`. |
-| `firestore.ts` | `listItems`, `createItem`, `getFiles`, `getFileContent`, `saveFile` – práce s Firebase. |
+1. **Backend:** `cd backend && uvicorn app.main:app --reload` → http://localhost:8000
+2. **Frontend:** `cd frontend && npm run dev` → http://localhost:3000
+3. **Docker:** Image `backtest-engine` musí být sestaven: `docker build -t backtest-engine backend/docker`
 
-### Backend (Python)
+### 3.2 Uživatelský flow
 
-| Soubor | Účel |
-|--------|------|
-| `main.py` | FastAPI app. CORS, routy `/api/run`, `/api/data`, `/health`. |
-| `api/run.py` | `POST /api/run` – přijme kód + nastavení. Pokud `?stream=1`, vrací SSE stream. Jinak běžný JSON. |
-| `api/data.py` | `GET /api/data` – projde `data/mock/`, vrátí seznam instrumentů a rozsah dat. |
-| `services/runner.py` | Vytvoří temp složku, zapíše `strategy.py`, spustí `docker run ... backtest-engine`. Čte stdout/stderr, streamuje události (log, progress, result). Timeout 3 min, RAM 1GB. |
-| `models/run.py` | Pydantic modely: `RunRequest`, `RunResponse`, `BacktestMetrics`, `Trade`. |
-| `docker/engine.py` | Běží UVNITŘ Dockeru. Načte strategii, načte data (CSV/parquet), spustí Backtrader, vypíše JSON na stdout. Na stderr posílá `PROGRESS:10`, `PROGRESS:20`, … |
+| Krok | Akce | Technická implementace |
+|------|------|------------------------|
+| 1 | Uživatel otevře http://localhost:3000 | Next.js načte `page.tsx` |
+| 2 | Klikne na **Strategie** | `listItems("strategies")` → Firestore |
+| 3 | Klikne **Vytvořit strategii** | `createItem("strategies", name, tag)` → Firestore + výchozí `main.py` |
+| 4 | Otevře strategii | `loadFiles("strategies", id)` → seznam souborů v Sidebaru |
+| 5 | Klikne na `main.py` | `getFileContent("strategies", id, "main.py")` → obsah do editoru |
+| 6 | Upraví kód | Monaco editor (lokální stav) |
+| 7 | Klikne **Uložit** | `saveFile("strategies", id, "main.py", content)` → Firestore |
+| 8 | (Volitelně) Vybere indikátory/moduly | Checkboxy v BacktestSettings, `onConfirmSelection` |
+| 9 | Vybere **Instrument Type** (Futures/Stocks/Forex) | `backtestParams.instrumentType` |
+| 10 | Vybere **Instrument** | Filtrováno podle `instrumentType` – pouze relevantní instrumenty |
+| 11 | Nastaví **Délku** (roky) | `years` state |
+| 12 | Klikne **Run** | `handleRun()` – viz níže |
 
-### Shared
+### 3.3 Run backtest – detailní tok
 
-| Soubor | Účel |
-|--------|------|
-| `shared/types/index.ts` | Typy pro TypeScript: `RunRequest`, `RunResponse`, `DataInstrument`, `BacktestMetrics`, `Trade`. |
+**Frontend (`handleRun` v `page.tsx`):**
+
+1. Ověří: otevřená strategie, `main.py` existuje, vybraný instrument
+2. Sestaví `allFiles`:
+   - Všechny soubory strategie (main.py, utils.py, …)
+   - Vybrané indikátory → `indicators/{Název}.py`
+   - Vybrané moduly → `modules/{Název}.py`
+3. Vytvoří `AbortController` pro možnost zastavení
+4. Zavolá `runBacktestStreaming(request, signal, onEvent)`
+5. `onEvent`: `log` → přidá do LogPanelu, `progress` → aktualizuje progress bar
+6. Po `result` → `setResults(data)`, `setShowResults(true)`
+
+**Request payload (`RunRequest`):**
+
+```json
+{
+  "files": { "main.py": "...", "indicators/EMA.py": "...", "modules/utils.py": "..." },
+  "instrument": "NQ",
+  "timeframe": "1d",
+  "years": 1,
+  "data_file": "mock/NQ_5Y.csv",
+  "initial_capital": 100000,
+  "slippage_perc": 0.001,
+  "instrument_type": "futures",
+  "tick_size": 0.25,
+  "value_per_tick": 5,
+  "share_size": null,
+  "lot_size": null,
+  "pip_size": null,
+  "pip_value": null
+}
+```
+
+**Backend (`api/run.py`):**
+
+1. Přijme `RunRequest`
+2. Pokud `?stream=1`: vrací `StreamingResponse` s `text/event-stream`
+3. Volá `run_strategy_streaming(...)` z `runner.py`
+
+**Runner (`services/runner.py`):**
+
+1. Vytvoří `.backtest_run/` v project root
+2. `_prepare_strategy_files()`: zapíše soubory do `.backtest_run/`, vytvoří `indicators/__init__.py`, `modules/__init__.py` pokud potřeba
+3. Spustí Docker:
+   ```
+   docker run --rm --memory=1g --cpus=1 --network none
+     -v .backtest_run:/app/strategy:rw
+     -v data:/app/data:ro
+     -e STRATEGY_PATH=/app/strategy/main.py
+     -e INSTRUMENT=NQ
+     -e TIMEFRAME=1d
+     -e YEARS=1
+     -e DATA_FILE=mock/NQ_5Y.csv
+     -e INITIAL_CAPITAL=100000
+     -e SLIPPAGE_PERC=0.001
+     -e INSTRUMENT_TYPE=futures
+     -e TICK_SIZE=0.25
+     -e VALUE_PER_TICK=5
+     ...
+     backtest-engine
+   ```
+4. Čte stdout/stderr v odděleném vlákně
+5. Parsuje JSON z stdout → `{"equity": [...], "metrics": {...}, "trades": [...], "ohlc": [...]}` → event `result`
+6. Parsuje `PROGRESS:10` z stderr → event `progress`
+7. Při chybě: JSON `{"error": "..."}` → event `error`
+8. Streamuje události klientovi přes SSE
+9. Po dokončení smaže `.backtest_run/*.py`
+
+**Engine (`docker/engine.py` – uvnitř kontejneru):**
+
+1. Načte env: `STRATEGY_PATH`, `DATA_PATH`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, …
+2. `load_strategy(path)`: dynamický import, najde první třídu dědící z `bt.Strategy`
+3. `load_data(data_path, instrument, timeframe, years, data_file)`:
+   - Pokud `data_file`: načte přímo `data_path/data_file` (např. `mock/NQ_5Y.csv`)
+   - Jinak hledá `mock/{instrument}_5Y.csv`, `mock/{instrument}.csv`, parquet
+4. Normalizuje CSV sloupce (Date/date, Close/Last→close, Open, High, Low, Volume)
+5. Filtruje data podle `years` (posledních N let)
+6. `run_backtest()`:
+   - Vytvoří Cerebro, přidá data, strategii, analyzéry (Sharpe, DrawDown, TradeAnalyzer)
+   - Nastaví broker: cash, commission=0, slippage
+   - Spustí `cerebro.run()`
+   - Zaznamenává equity na každý bar, obchody přes `notify_trade`/`notify_order`
+   - Vypočítá metriky (Sharpe, max drawdown, win rate, profit factor, …)
+7. Vypíše JSON na stdout, `PROGRESS:100` na stderr
+
+**Response (`RunResponse`):**
+
+```json
+{
+  "equity": [100000, 100500, ...],
+  "equityCurve": [{"date": "2024-01-01", "value": 100000}, ...],
+  "metrics": {
+    "finalEquity": 105000,
+    "sharpeRatio": 1.2,
+    "maxDrawdown": 5.5,
+    "tradeCount": 42,
+    "longCount": 25,
+    "shortCount": 17,
+    "winRate": 60,
+    "totalReturn": 5.0,
+    "totalReturnUsd": 5000,
+    "profitFactor": 1.8,
+    "expectancyUsd": 119,
+    "expectancyR": 0.5
+  },
+  "trades": [
+    {"date": "...", "entryDate": "...", "exitDate": "...", "type": "buy", "size": 1, "pnl": 150, "entryPrice": 20000, "exitPrice": 20150}
+  ],
+  "ohlc": [{"date": "...", "open": 20000, "high": 20100, "low": 19950, "close": 20050}]
+}
+```
+
+### 3.4 Zobrazení výsledků
+
+1. **ResultsView** zobrazí:
+   - **StatBlocks**: final equity, Sharpe, max drawdown, trade count, win rate, profit factor, …
+   - **TradesTable**: tabulka obchodů
+   - **DetailedChart**: candlestick graf (TradingView Lightweight Charts) s OHLC + entry/exit značkami
+2. **Chart PNG**: volitelně `getChartImage(ohlc, trades)` → POST /api/chart → mplfinance PNG
+3. **Export**: JSON výsledků ke stažení
+4. **Uložení do Firestore**: `saveBacktestResult(strategyId, strategyName, result)` → `/strategies/{id}/results/{backtestId}`
 
 ---
 
-## Tok dat (krok za krokem)
+## 4. Typy instrumentů a ukládání dat
 
-### 1. Uživatel otevře aplikaci
+### 4.1 Instrument Type
 
-- Frontend načte stránku.
-- Zobrazí se tlačítka Strategie / Indikátory / Moduly.
+Aplikace podporuje tři typy:
 
-### 2. Uživatel klikne na „Strategie“
+| Typ | Popis | Parametry v UI |
+|-----|-------|----------------|
+| **Futures** | Futures kontrakty (NQ, ES) | Tick Size, Value Per Tick |
+| **Stocks** | Akcie | Position Size (počet akcií) |
+| **Forex** | Forex páry | Lot Size, Pip Size, Pip Value |
 
-- Zavolá se `listItems("strategies")` z Firestore.
-- Zobrazí se seznam strategií + tlačítko „Vytvořit strategii“.
+### 4.2 Struktura složek pro data
 
-### 3. Uživatel vytvoří strategii
+Typ instrumentu se určuje podle **umístění souboru**:
 
-- Klikne „Vytvořit strategii“ → modal (název, tag).
-- `createItem("strategies", name, tag)` → vytvoří dokument ve Firestore + soubor `main.py` s výchozím obsahem.
-- Otevře se nová strategie.
+```
+data/mock/
+├── NQ_5Y.csv              → instrumentType: "futures" (root = backward compat)
+├── ES_5Y.csv              → futures
+├── futures/               → futures
+│   └── *.csv
+├── stocks/                → stocks
+│   ├── AAPL_5Y.csv
+│   └── MSFT_10Y.csv
+└── forex/                 → forex
+    ├── EURUSD_5Y.csv
+    └── GBPUSD_3Y.csv
+```
 
-### 4. Uživatel upraví kód
+### 4.3 Formát CSV
 
-- V editoru se načte obsah `main.py`.
-- Uživatel píše.
-- Klikne „Uložit“ → `saveFile()` → zapíše do Firestore.
+- Povinné sloupce: `Date` nebo `date`, OHLC (Open, High, Low, Close/Last)
+- Volitelné: `Volume` (default 1000)
+- Název souboru: `{INSTRUMENT}_5Y.csv` → instrument = první část před `_`
 
-### 5. Uživatel spustí backtest
+### 4.4 Filtrování instrumentů v UI
 
-- Vybere instrument (např. NQ) a délku (např. 1 rok).
-- Klikne Run.
-- Frontend:
-  - `getFileContent(..., "main.py")` → získá kód
-  - `runBacktestStreaming({ code, instrument, ... }, signal, onEvent)` → volá `POST /api/run?stream=1`
-- Backend:
-  - Vytvoří temp složku, zapíše `strategy.py`
-  - Spustí `docker run ... backtest-engine`
-  - Čte stdout/stderr, streamuje události (log, progress, result)
-- Frontend:
-  - `onEvent` přidává logy do LogPanelu.
-  - `onEvent` s `progress` aktualizuje progress bar.
-  - Po `result` zobrazí výsledky (graf + statistiky).
+- `GET /api/data` vrací všechny instrumenty včetně `instrumentType`
+- Frontend filtruje: `filterInstrumentsByType(instruments, backtestParams.instrumentType)`
+- Při změně Instrument Type (např. Futures → Stocks) se výběr resetuje na první dostupný instrument daného typu
 
-### 6. Uživatel vidí výsledky
+### 4.5 broker_config.json (futures)
 
-- Equity graf se vykreslí.
-- Statistiky (final equity, Sharpe, drawdown, trades) se zobrazí.
-- Může exportovat JSON.
+```json
+{
+  "NQ": {
+    "tick_size": 0.25,
+    "tick_value": 20,
+    "mult": 80,
+    "margin": 20000,
+    "commission_per_contract": 2.5
+  },
+  "ES": { ... }
+}
+```
 
----
-
-## Workflow (jak používat aplikaci)
-
-1. **Otevři** http://localhost:3000
-2. **Klikni** na Strategie / Indikátory / Moduly
-3. **Vytvoř** novou položku (název, volitelně tag)
-4. **Otevři** ji – v levém panelu uvidíš soubory (např. `main.py`)
-5. **Uprav** kód v editoru
-6. **Ulož** (tlačítko Uložit)
-7. **V pravém panelu** vyber instrument a délku
-8. **Klikni** Run
-9. **Počkej** – uvidíš logy a progress bar
-10. **Zobraz** výsledky – graf + statistiky
-11. **Export** – stáhneš JSON výsledků
+Používá se pro futures v engine (zatím primárně pro konfiguraci; výpočet PnL pro Stocks/Forex je v engine zatím neimplementovaný – viz poznámky níže).
 
 ---
 
-## Technologie
+## 5. Firestore struktura
 
-- **Frontend:** Next.js, React, TailwindCSS, Monaco Editor, TradingView Lightweight Charts, Firebase
-- **Backend:** Python, FastAPI, uvicorn
-- **Backtest:** Backtrader (v Dockeru)
-- **Data:** Firebase (Firestore), CSV (data/mock)
+```
+/strategies/{strategyId}
+  - name, tag, createdAt
+  /files/{fileName}  (např. main.py, utils.py)
+    - fileName, content
+
+/indicators/{indicatorId}
+  - name, tag, createdAt
+  /files/main.py
+    - fileName, content
+
+/modules/{moduleId}
+  - name, tag, createdAt
+  /files/main.py
+    - fileName, content
+
+/strategies/{strategyId}/results/{backtestId}
+  - strategyName, savedAt, equity, metrics, trades, ohlc, ...
+```
 
 ---
 
-## Data
+## 6. API reference
 
-- **Firestore:** strategie, indikátory, moduly – každá položka má subkolekci `files` (např. `main.py`)
-- **Historie:** data v `data/mock/` (např. `NQ_5Y.csv` – CSV s Date, Open, High, Low, Close/Last)
-- **Broker:** `data/broker_config.json` – tick, mult, margin, commission per instrument (futures)
+### GET /api/data
+
+Vrací seznam dostupných instrumentů.
+
+**Response:**
+```json
+{
+  "instruments": [
+    {
+      "instrument": "NQ",
+      "timeframe": "1d",
+      "file": "mock/NQ_5Y.csv",
+      "minDate": "2021-03-12",
+      "maxDate": "2026-03-11",
+      "yearsAvailable": 5.0,
+      "instrumentType": "futures",
+      "brokerConfig": { "tick_size": 0.25, "tick_value": 20, "mult": 80, ... }
+    }
+  ]
+}
+```
+
+### GET /api/data/debug
+
+Diagnostika: `data_dir`, `mock_exists`, `csv_count`, `csv_files`.
+
+### POST /api/run
+
+Spustí backtest.
+
+**Query:** `?stream=1` – SSE stream (log, progress, result)
+
+**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`
+
+**Response (non-stream):** RunResponse (equity, equityCurve, metrics, trades, ohlc)
+
+**SSE events (stream=1):**
+- `{"type": "log", "line": "..."}`
+- `{"type": "progress", "value": 0-100}`
+- `{"type": "result", "data": RunResponse}`
+- `{"type": "error", "message": "..."}`
+
+### POST /api/chart
+
+Generuje PNG candlestick grafu s mplfinance.
+
+**Body:** `{ "ohlc": [...], "trades": [...] }`
+
+**Response:** `image/png`
 
 ---
 
-## Další dokumentace
+## 7. Indikátory a moduly
 
-- **SCRIPTS.md** – příkazy, skripty, troubleshooting, edge cases
+### Import v strategii
+
+- Indikátor: `from indicators.{Název} import {Třída}` – soubor je uložen jako `indicators/{Název}.py` (název bez mezer, speciálních znaků)
+- Modul: `from modules.{Název} import {funkce}` – soubor `modules/{Název}.py`
+
+### Sestavení `files` při Run
+
+1. Všechny soubory strategie (main.py, utils.py, …)
+2. Pro každý vybraný indikátor: `indicators/{toModuleName(ind.name)}.py` = obsah `main.py` indikátoru
+3. Pro každý vybraný modul: `modules/{toModuleName(mod.name)}.py` = obsah `main.py` modulu
+
+Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrdit** před Run.
+
+---
+
+## 8. Technologie
+
+| Vrstva | Technologie |
+|--------|-------------|
+| Frontend | Next.js 14, React, TailwindCSS, Monaco Editor, TradingView Lightweight Charts |
+| Backend | Python 3.11+, FastAPI, uvicorn |
+| Backtest | Backtrader (v Dockeru) |
+| Data | Firebase Firestore (strategie, indikátory, moduly), CSV (OHLCV) |
+| Docker | python:3.11-slim, backtrader, pandas |
+| Graf (PNG) | mplfinance |
+
+---
+
+## 9. Konfigurace
+
+### Environment variables
+
+- **Frontend:** `NEXT_PUBLIC_API_URL` – URL backendu (default `http://localhost:8000`)
+- **Backend:** žádné povinné (CORS pro localhost:3000)
+- **Firebase:** konfigurace v `frontend/lib/firebase.ts`
+
+### Runner
+
+- Timeout: 180 s
+- Docker: `--memory=1g`, `--cpus=1`, `--network none`
+
+---
+
+## 10. Známá omezení a TODO
+
+1. **Engine** zatím nečte `INSTRUMENT_TYPE`, `TICK_SIZE`, `VALUE_PER_TICK`, `SHARE_SIZE`, `LOT_SIZE`, `PIP_SIZE`, `PIP_VALUE` – výpočet PnL je stále založen na výchozím brokeru (futures-like).
+2. **Stocks:** cílový výpočet PnL = `(exit_price - entry_price) * share_size`
+3. **Forex:** cílový výpočet PnL podle lot_size, pip_size, pip_value
+4. **Broker config** pro futures (tick_value, mult, margin) je v engine zatím neaplikován – commission a margin jsou zjednodušené.
+
+---
+
+## 11. Troubleshooting
+
+| Problém | Možná příčina | Řešení |
+|---------|---------------|--------|
+| Instrument se nenačítá | Instrument Type ≠ typ dat | Zkontroluj, že máš vybraný správný Instrument Type (Futures pro NQ) |
+| Žádné instrumenty | Data složka prázdná nebo špatná cesta | Zkontroluj `GET /api/data/debug`, strukturu `data/mock/` |
+| Backtest selže | Docker neběží, chyba ve strategii | Zkontroluj `docker ps`, logy v LogPanelu, `.backtest_run/last_error_strategy.py` |
+| CORS chyba | Backend jiný port/origin | Nastav `allow_origins` v main.py nebo `NEXT_PUBLIC_API_URL` |
+| Firebase chyba | Chybějící konfigurace | Zkontroluj `firebase.ts`, service account / API key |
+
+---
+
+## 12. Další dokumentace
+
+- **SCRIPTS.md** – příkazy, skripty, edge cases
+- **strategies/test/readme.py** – tutoriál psaní strategií (Backtrader API, životní cyklus, příklady)

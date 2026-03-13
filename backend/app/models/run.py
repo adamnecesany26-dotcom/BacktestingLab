@@ -9,13 +9,25 @@ from pydantic import BaseModel
 
 class RunRequest(BaseModel):
     """Request payload for POST /run."""
-    code: str
+    code: Optional[str] = None  # Single-file: main.py content
+    files: Optional[dict[str, str]] = None  # Multi-file: {"main.py": "...", "utils.py": "..."}
     instrument: str
     timeframe: str
     years: float = 1.0
     data_file: str = ""
     initial_capital: float = 100000.0
     slippage_perc: float = 0.001  # 0.1%
+    # Instrument type: futures | stocks | forex
+    instrument_type: str = "futures"
+    # Futures
+    tick_size: Optional[float] = None
+    value_per_tick: Optional[float] = None
+    # Stocks
+    share_size: Optional[int] = None
+    # Forex
+    lot_size: Optional[float] = None
+    pip_size: Optional[float] = None
+    pip_value: Optional[float] = None
 
 
 class Trade(BaseModel):
