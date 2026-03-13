@@ -3,23 +3,37 @@
 import { useState } from "react";
 import { EquityChart } from "@/components/charts/EquityChart";
 import { TradesChart } from "@/components/charts/TradesChart";
-import { CandlestickChart } from "@/components/charts/CandlestickChart";
 import { DetailedChart } from "@/components/charts/DetailedChart";
+import { TradeHighlight } from "@/components/results/TradeHighlight";
+import { RunHistory } from "@/components/results/RunHistory";
 import { StatBlocks } from "@/components/results/StatBlocks";
 import { TradesTable } from "@/components/results/TradesTable";
 import type { RunResponse } from "@shared/types";
+import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "trades" | "chart" | "detailed";
+type TabId = "equity" | "trades" | "highlight" | "detailed" | "runHistory";
 
 interface ResultsViewProps {
   results: RunResponse | null;
+  runHistory: SavedBacktestRun[];
+  strategyId: string;
   onBack: () => void;
   onExport: () => void;
-  onSave: () => void;
+  onDeleteRun: (id: string) => void;
+  onDeleteAllRuns: () => void;
   strategyName?: string;
 }
 
-export function ResultsView({ results, onBack, onExport, onSave, strategyName }: ResultsViewProps) {
+export function ResultsView({
+  results,
+  runHistory,
+  strategyId,
+  onBack,
+  onExport,
+  onDeleteRun,
+  onDeleteAllRuns,
+  strategyName,
+}: ResultsViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>("equity");
 
   if (!results) {
@@ -38,8 +52,9 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
   const tabs: { id: TabId; label: string }[] = [
     { id: "equity", label: "Equity" },
     { id: "trades", label: "Trades" },
-    { id: "chart", label: "Chart" },
+    { id: "highlight", label: "Highlight" },
     { id: "detailed", label: "Detailed" },
+    { id: "runHistory", label: "Run history" },
   ];
 
   return (
@@ -51,20 +66,12 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
         >
           ← Zpět na editor
         </button>
-        <div className="flex gap-2">
-          <button
-            onClick={onExport}
-            className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 font-medium text-sm"
-          >
-            Export
-          </button>
-          <button
-            onClick={onSave}
-            className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 font-medium text-sm"
-          >
-            Uložit
-          </button>
-        </div>
+        <button
+          onClick={onExport}
+          className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 font-medium text-sm"
+        >
+          Export
+        </button>
       </div>
 
       <div className="flex gap-1 px-6 shrink-0">
@@ -85,7 +92,9 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
 
       <div
         className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
-          activeTab === "chart" || activeTab === "detailed" ? "min-h-[560px]" : "min-h-[480px]"
+          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory"
+            ? "min-h-[560px]"
+            : "min-h-[480px]"
         }`}
       >
         {activeTab === "equity" && (
@@ -118,12 +127,21 @@ export function ResultsView({ results, onBack, onExport, onSave, strategyName }:
             </div>
           </div>
         )}
-        {activeTab === "chart" && (
-          <CandlestickChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
+        {activeTab === "highlight" && (
+          <TradeHighlight ohlc={results.ohlc ?? []} trades={results.trades} chartHeight={360} />
         )}
         {activeTab === "detailed" && (
           <div className="py-4 h-full overflow-auto">
             <DetailedChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
+          </div>
+        )}
+        {activeTab === "runHistory" && (
+          <div className="py-4 h-full overflow-auto">
+            <RunHistory
+              runs={runHistory}
+              onDeleteRun={onDeleteRun}
+              onDeleteAll={onDeleteAllRuns}
+            />
           </div>
         )}
       </div>

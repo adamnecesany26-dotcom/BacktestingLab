@@ -38,6 +38,8 @@ export interface RunRequest {
   lot_size?: number;
   pip_size?: number;
   pip_value?: number;
+  /** Strategy parameters (from PARAMS dict) - override values without editing code */
+  params?: Record<string, number | boolean | string>;
 }
 
 /** Broker config for futures (tick, mult, margin) */

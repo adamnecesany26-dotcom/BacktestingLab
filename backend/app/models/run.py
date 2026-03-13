@@ -28,6 +28,8 @@ class RunRequest(BaseModel):
     lot_size: Optional[float] = None
     pip_size: Optional[float] = None
     pip_value: Optional[float] = None
+    # Strategy parameters (from PARAMS dict)
+    params: Optional[dict] = None
 
 
 class Trade(BaseModel):

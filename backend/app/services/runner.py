@@ -123,6 +123,7 @@ async def run_strategy_streaming(
     lot_size: float | None = None,
     pip_size: float | None = None,
     pip_value: float | None = None,
+    strategy_params: dict | None = None,
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -167,6 +168,7 @@ async def run_strategy_streaming(
             "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
             "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
             "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
+            "-e", f"STRATEGY_PARAMS={json.dumps(strategy_params or {})}",
             "backtest-engine",
         ]
 
@@ -273,6 +275,7 @@ async def run_strategy(
     lot_size: float | None = None,
     pip_size: float | None = None,
     pip_value: float | None = None,
+    strategy_params: dict | None = None,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -292,6 +295,7 @@ async def run_strategy(
         lot_size=lot_size,
         pip_size=pip_size,
         pip_value=pip_value,
+        strategy_params=strategy_params,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")

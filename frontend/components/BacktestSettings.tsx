@@ -1,8 +1,9 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import type { DataInstrument, InstrumentType } from "@shared/types";
 import type { FirestoreItem } from "@/lib/firestore";
+import type { StrategyParams } from "@/lib/strategyParams";
 
 export interface BacktestParams {
   initialCapital: number;
@@ -40,6 +41,9 @@ interface BacktestSettingsProps {
   onRun: () => void;
   isRunning: boolean;
   canRun?: boolean;
+  /** Strategy parameters (from PARAMS dict) - only when strategy open */
+  strategyParams?: StrategyParams;
+  onStrategyParamsChange?: (params: StrategyParams) => void;
 }
 
 export function BacktestSettings({
@@ -61,12 +65,18 @@ export function BacktestSettings({
   onRun,
   isRunning,
   canRun = true,
+  strategyParams = {},
+  onStrategyParamsChange,
 }: BacktestSettingsProps) {
   const maxYears = selectedInstrument?.yearsAvailable ?? 5;
   const minYears = 1;
+  const [paramsPanelOpen, setParamsPanelOpen] = useState(true);
 
   const inputClass = "w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200";
   const labelClass = "block text-sm text-zinc-400 mb-1";
+
+  const strategyParamEntries = Object.entries(strategyParams);
+  const hasStrategyParams = strategyParamEntries.length > 0;
 
   const content = (
     <div className="space-y-4">
@@ -197,6 +207,68 @@ export function BacktestSettings({
           )}
         </select>
       </div>
+      {canRun && (
+        <div className="border-t border-zinc-700 pt-3">
+          <button
+            type="button"
+            onClick={() => setParamsPanelOpen((o) => !o)}
+            className="flex items-center justify-between w-full text-left"
+          >
+            <h5 className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
+              Strategy Parameters
+            </h5>
+            <span className="text-zinc-500 text-sm">{paramsPanelOpen ? "▼" : "▶"}</span>
+          </button>
+          {paramsPanelOpen && (
+            <div className="mt-2 space-y-2">
+              {hasStrategyParams ? (
+                strategyParamEntries.map(([key, value]) => (
+                  <div key={key}>
+                    <label className={labelClass}>{key}</label>
+                    {typeof value === "number" ? (
+                      <input
+                        type="number"
+                        value={value}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value);
+                          if (!Number.isNaN(v)) {
+                            onStrategyParamsChange?.({ ...strategyParams, [key]: v });
+                          }
+                        }}
+                        step={Number.isInteger(value) ? 1 : 0.01}
+                        className={inputClass}
+                      />
+                    ) : typeof value === "boolean" ? (
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={value}
+                          onChange={(e) =>
+                            onStrategyParamsChange?.({ ...strategyParams, [key]: e.target.checked })
+                          }
+                          className="rounded"
+                        />
+                        <span className="text-sm text-zinc-300">{value ? "Yes" : "No"}</span>
+                      </label>
+                    ) : (
+                      <input
+                        type="text"
+                        value={String(value)}
+                        onChange={(e) =>
+                          onStrategyParamsChange?.({ ...strategyParams, [key]: e.target.value })
+                        }
+                        className={inputClass}
+                      />
+                    )}
+                  </div>
+                ))
+              ) : (
+                <p className="text-zinc-500 text-xs">No strategy parameters detected</p>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {canRun && onSelectIndicators && (
         <div>
           <label className="block text-sm text-zinc-400 mb-1">

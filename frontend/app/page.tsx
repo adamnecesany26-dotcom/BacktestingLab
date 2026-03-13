@@ -9,7 +9,13 @@ import { BacktestSettings } from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
 import { LogPanel } from "@/components/LogPanel";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
-import { saveBacktestResult } from "@/lib/firestore";
+import {
+  saveBacktestResult,
+  listBacktestResults,
+  deleteBacktestResult,
+  deleteAllBacktestResults,
+  type SavedBacktestRun,
+} from "@/lib/firestore";
 import {
   listItems,
   getFiles,
@@ -21,6 +27,7 @@ import {
   type FirestoreItem,
 } from "@/lib/firestore";
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
+import { parseStrategyParams, type StrategyParams } from "@/lib/strategyParams";
 import {
   filterInstrumentsByType,
   type RunResponse,
@@ -70,7 +77,9 @@ export default function Home() {
     pipValue: 10,
   });
 
+  const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
   const [results, setResults] = useState<RunResponse | null>(null);
+  const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [runProgress, setRunProgress] = useState(0);
@@ -140,6 +149,17 @@ export default function Home() {
       loadFileContent(openItem.type, openItem.id, selectedFile);
     }
   }, [openItem, selectedFile, loadFileContent]);
+
+  /** Parse PARAMS from main.py when strategy loads - reset when strategy changes */
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies") {
+      setStrategyParams({});
+      return;
+    }
+    getFileContent(openItem.type, openItem.id, "main.py").then((c) => {
+      setStrategyParams(parseStrategyParams(c ?? ""));
+    });
+  }, [openItem?.type, openItem?.id]);
 
   useEffect(() => {
     getAvailableData()
@@ -307,6 +327,7 @@ export default function Home() {
           lot_size: backtestParams.lotSize,
           pip_size: backtestParams.pipSize,
           pip_value: backtestParams.pipValue,
+          params: Object.keys(strategyParams).length > 0 ? strategyParams : undefined,
         },
         controller.signal,
         (ev) => {
@@ -321,6 +342,20 @@ export default function Home() {
       setResults(data);
       setShowResults(true);
       addLog(`Hotovo. ${data.metrics.tradeCount} obchodů, equity: ${data.metrics.finalEquity.toFixed(2)}`);
+      if (openItem) {
+        const payload = buildSavePayload(data);
+        try {
+          await saveBacktestResult(openItem.id, openItem.name, payload);
+          const history = await listBacktestResults(openItem.id);
+          setRunHistory(history);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          addLog(`Uložení výsledků selhalo: ${msg}`);
+          if (msg.includes("permission") || msg.includes("Permission")) {
+            addLog("→ Zkontrolujte Firestore pravidla (viz README nebo firestore.rules)");
+          }
+        }
+      }
     } catch (e) {
       if ((e as Error).name === "AbortError") {
         addLog("Zastaveno uživatelem");
@@ -344,27 +379,28 @@ export default function Home() {
     abortController?.abort();
   };
 
-  const getExportPayload = () => {
-    if (!results) return null;
-    let equityCurve = results.equityCurve;
-    if (!equityCurve?.length && results.equity?.length && results.ohlc?.length) {
-      const first = results.ohlc[0]?.date?.slice(0, 10);
+  function buildSavePayload(data: RunResponse) {
+    let equityCurve = data.equityCurve;
+    if (!equityCurve?.length && data.equity?.length && data.ohlc?.length) {
+      const first = data.ohlc[0]?.date?.slice(0, 10);
       const d = first ? new Date(first) : null;
       if (d) d.setDate(d.getDate() - 1);
       const dayBefore = d?.toISOString().slice(0, 10) ?? "0";
       equityCurve = [
-        { date: dayBefore, value: results.equity[0] ?? 0 },
-        ...results.ohlc.map((o, i) => ({ date: o.date.slice(0, 10), value: results.equity![i + 1] ?? 0 })),
+        { date: dayBefore, value: data.equity[0] ?? 0 },
+        ...data.ohlc.map((o, i) => ({ date: o.date.slice(0, 10), value: data.equity![i + 1] ?? 0 })),
       ];
-    } else if (!equityCurve?.length && results.equity?.length) {
-      equityCurve = results.equity.map((v, i) => ({ date: String(i), value: v }));
+    } else if (!equityCurve?.length && data.equity?.length) {
+      equityCurve = data.equity.map((v, i) => ({ date: String(i), value: v }));
     }
     return {
       equityCurve: equityCurve ?? [],
-      metrics: results.metrics,
-      trades: results.trades,
+      metrics: data.metrics,
+      trades: data.trades,
     };
-  };
+  }
+
+  const getExportPayload = () => (results ? buildSavePayload(results) : null);
 
   const handleExport = () => {
     const payload = getExportPayload();
@@ -380,23 +416,55 @@ export default function Home() {
     URL.revokeObjectURL(url);
   };
 
-  const handleSave = async () => {
-    const payload = getExportPayload();
-    if (!payload || !openItem) return;
+  const loadRunHistory = useCallback(async () => {
+    if (openItem?.type !== "strategies") {
+      setRunHistory([]);
+      return;
+    }
     try {
-      await saveBacktestResult(openItem.id, openItem.name, payload);
-      addLog(`Výsledky uloženy do Results / ${openItem.name}`);
+      const history = await listBacktestResults(openItem.id);
+      setRunHistory(history);
     } catch (e) {
-      addLog(`Chyba: ${(e as Error).message}`);
+      console.warn("Run history load failed:", e);
+      setRunHistory([]);
+    }
+  }, [openItem?.type, openItem?.id]);
+
+  useEffect(() => {
+    if (showResults && openItem?.type === "strategies") {
+      loadRunHistory();
+    }
+  }, [showResults, openItem?.type, openItem?.id, loadRunHistory]);
+
+  const handleDeleteRun = async (resultId: string) => {
+    if (!openItem) return;
+    try {
+      await deleteBacktestResult(openItem.id, resultId);
+      await loadRunHistory();
+    } catch (e) {
+      addLog(`Chyba mazání: ${(e as Error).message}`);
+    }
+  };
+
+  const handleDeleteAllRuns = async () => {
+    if (!openItem) return;
+    try {
+      await deleteAllBacktestResults(openItem.id);
+      setRunHistory([]);
+    } catch (e) {
+      addLog(`Chyba mazání: ${(e as Error).message}`);
     }
   };
 
   const centerContent = showResults ? (
     <ResultsView
       results={results}
+      runHistory={runHistory}
+      strategyId={openItem?.id ?? ""}
       onBack={() => setShowResults(false)}
       onExport={handleExport}
-      onSave={handleSave}
+      onDeleteRun={handleDeleteRun}
+      onDeleteAllRuns={handleDeleteAllRuns}
       strategyName={openItem?.name}
     />
   ) : (
@@ -486,7 +554,7 @@ export default function Home() {
             )}
             {centerContent}
           </div>
-          <div className="w-96 flex flex-col overflow-hidden bg-zinc-900/50 p-4">
+          <div className="w-96 flex flex-col min-h-0 overflow-y-auto bg-zinc-900/50 p-4">
             <BacktestSettings
               instruments={filteredInstruments}
               instrumentsLoaded={instrumentsLoaded}
@@ -506,6 +574,8 @@ export default function Home() {
               onRun={handleRun}
               isRunning={isRunning}
               canRun={openItem?.type === "strategies"}
+              strategyParams={strategyParams}
+              onStrategyParamsChange={setStrategyParams}
             />
           </div>
         </div>

@@ -35,9 +35,22 @@ export interface FirestoreFile {
 
 const DEFAULT_STRATEGY_CONTENT = `import backtrader as bt
 
+PARAMS = {
+    "sma_fast": 20,
+    "sma_slow": 50,
+    "risk_per_trade": 0.01,
+    "use_trailing_stop": True,
+}
 
 class Strategy(bt.Strategy):
     """Strategy template - implement your logic in next()."""
+
+    params = (
+        ("sma_fast", 20),
+        ("sma_slow", 50),
+        ("risk_per_trade", 0.01),
+        ("use_trailing_stop", True),
+    )
 
     def __init__(self):
         pass
@@ -178,6 +191,24 @@ export async function getMainStrategyCode(type: ItemType, itemId: string): Promi
   return getFileContent(type, itemId, "main.py");
 }
 
+/** Saved backtest run - minimal shape for run history */
+export interface SavedBacktestRun {
+  id: string;
+  strategyName: string;
+  savedAt: { seconds: number; nanoseconds: number } | null;
+  equityCurve?: { date: string; value: number }[];
+  metrics: {
+    sharpeRatio?: number;
+    totalReturnUsd?: number;
+    profitFactor?: number;
+    expectancyUsd?: number;
+    winRate?: number;
+    rMultiple?: number;
+    [key: string]: unknown;
+  };
+  trades: unknown[];
+}
+
 /** Save backtest result under strategy. Path: /strategies/{strategyId}/results/{backtestId} */
 export async function saveBacktestResult(
   strategyId: string,
@@ -192,4 +223,30 @@ export async function saveBacktestResult(
     ...result,
   });
   return id;
+}
+
+/** List all backtest results for a strategy, newest first */
+export async function listBacktestResults(strategyId: string): Promise<SavedBacktestRun[]> {
+  const resultsRef = collection(getDb(), "strategies", strategyId, "results");
+  const snap = await getDocs(resultsRef);
+  return snap.docs
+    .map((d) => ({ id: d.id, ...d.data() } as SavedBacktestRun))
+    .sort((a, b) => {
+      const aT = (a.savedAt as { seconds: number })?.seconds ?? 0;
+      const bT = (b.savedAt as { seconds: number })?.seconds ?? 0;
+      return bT - aT;
+    });
+}
+
+/** Delete a single backtest result */
+export async function deleteBacktestResult(strategyId: string, resultId: string): Promise<void> {
+  const ref = doc(getDb(), "strategies", strategyId, "results", resultId);
+  await deleteDoc(ref);
+}
+
+/** Delete all backtest results for a strategy */
+export async function deleteAllBacktestResults(strategyId: string): Promise<void> {
+  const resultsRef = collection(getDb(), "strategies", strategyId, "results");
+  const snap = await getDocs(resultsRef);
+  await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
 }

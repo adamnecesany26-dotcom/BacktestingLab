@@ -479,10 +479,23 @@ Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrd
 | Backtest selže | Docker neběží, chyba ve strategii | Zkontroluj `docker ps`, logy v LogPanelu, `.backtest_run/last_error_strategy.py` |
 | CORS chyba | Backend jiný port/origin | Nastav `allow_origins` v main.py nebo `NEXT_PUBLIC_API_URL` |
 | Firebase chyba | Chybějící konfigurace | Zkontroluj `firebase.ts`, service account / API key |
+| **FirebaseError: Missing or insufficient permissions** | Firestore pravidla blokují zápis | Nasazení pravidel: `firebase deploy --only firestore:rules` (v root projektu) |
 
 ---
 
-## 12. Další dokumentace
+## 12. Firestore pravidla
+
+Pro ukládání výsledků backtestů (Run history) musí být nasazena Firestore pravidla. V root projektu:
+
+```bash
+firebase deploy --only firestore:rules
+```
+
+Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase login`). Soubory `firestore.rules` a `firebase.json` jsou v projektu.
+
+---
+
+## 13. Další dokumentace
 
 - **SCRIPTS.md** – příkazy, skripty, edge cases
 - **strategies/test/readme.py** – tutoriál psaní strategií (Backtrader API, životní cyklus, příklady)

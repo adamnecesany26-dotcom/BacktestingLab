@@ -126,7 +126,13 @@ def _load_broker_config(data_path: str, instrument: str) -> dict | None:
         return None
 
 
-def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrument: str = "") -> dict:
+def run_backtest(
+    strategy_cls,
+    data: pd.DataFrame,
+    data_path: str = "",
+    instrument: str = "",
+    strategy_params: dict | None = None,
+) -> dict:
     """Run Backtrader backtest and return results dict."""
     equity_list = []
     trades_list = []
@@ -212,7 +218,8 @@ def run_backtest(strategy_cls, data: pd.DataFrame, data_path: str = "", instrume
     )
     cerebro.adddata(data_bt)
     cerebro.addstrategy(EquityRecorder, total_bars=total_bars)
-    cerebro.addstrategy(TradeRecordingStrategy)
+    params = strategy_params or {}
+    cerebro.addstrategy(TradeRecordingStrategy, **params)
 
     initial_capital = float(os.environ.get("INITIAL_CAPITAL", "100000"))
     slippage_perc = float(os.environ.get("SLIPPAGE_PERC", "0.001"))
@@ -321,6 +328,11 @@ def main():
     timeframe = os.environ.get("TIMEFRAME", "1d")
     years = float(os.environ.get("YEARS", "1"))
     data_file = os.environ.get("DATA_FILE", "")
+    strategy_params_raw = os.environ.get("STRATEGY_PARAMS", "{}")
+    try:
+        strategy_params = json.loads(strategy_params_raw) if strategy_params_raw else {}
+    except json.JSONDecodeError:
+        strategy_params = {}
 
     try:
         print("[engine] Loading strategy...", file=sys.stderr, flush=True)
@@ -328,7 +340,13 @@ def main():
         print("[engine] Loading data...", file=sys.stderr, flush=True)
         data = load_data(data_path, instrument, timeframe, years, data_file)
         print(f"[engine] Running backtest ({len(data)} bars)...", file=sys.stderr, flush=True)
-        result = run_backtest(strategy_cls, data, data_path=str(data_path), instrument=instrument)
+        result = run_backtest(
+            strategy_cls,
+            data,
+            data_path=str(data_path),
+            instrument=instrument,
+            strategy_params=strategy_params,
+        )
         print(json.dumps(result))
     except Exception as e:
         import traceback

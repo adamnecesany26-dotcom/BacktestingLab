@@ -1,0 +1,39 @@
+rules_version = '2';
+
+// Firestore security rules pro Backtesting aplikaci
+// Nasazení: firebase deploy --only firestore:rules
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Strategie, indikátory, moduly - plný přístup (pro development)
+    // V produkci doporučujeme přidat auth: request.auth != null
+    match /strategies/{strategyId} {
+      allow read, write: if true;
+
+      // Subkolekce: soubory strategie
+      match /files/{fileId} {
+        allow read, write: if true;
+      }
+
+      // Subkolekce: výsledky backtestů (Run history)
+      match /results/{resultId} {
+        allow read, write: if true;
+      }
+    }
+
+    match /indicators/{indicatorId} {
+      allow read, write: if true;
+      match /files/{fileId} {
+        allow read, write: if true;
+      }
+    }
+
+    match /modules/{moduleId} {
+      allow read, write: if true;
+      match /files/{fileId} {
+        allow read, write: if true;
+      }
+    }
+  }
+}
