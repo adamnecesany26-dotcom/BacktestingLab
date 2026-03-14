@@ -206,6 +206,32 @@ def run_backtest(
         elif "date" in data.columns:
             data = data.set_index("date")
 
+    # Broker config: futures (mult, margin, commission) or stocks (commission %)
+    broker_cfg = _load_broker_config(data_path, instrument)
+    instrument_type = os.environ.get("INSTRUMENT_TYPE", "futures")
+
+    if broker_cfg and instrument_type == "futures" and broker_cfg.get("margin") is not None:
+        # Futures: commission per contract, margin, mult for PnL
+        commission = float(broker_cfg.get("commission_per_contract", 0) or 0)
+        margin = float(broker_cfg.get("margin", 0) or 0)
+        mult = float(broker_cfg.get("mult", 1) or 1)
+        cerebro.broker.setcommission(commission=commission, margin=margin, mult=mult)
+    else:
+        # Stocks / Forex / no config: percentage commission or zero
+        default_cfg = None
+        try:
+            cfg_path = Path(data_path) / "broker_config.json"
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as f:
+                    full_cfg = json.load(f)
+                default_cfg = full_cfg.get("default", {})
+        except Exception:
+            pass
+        commission_pct = 0.0
+        if default_cfg and default_cfg.get("commission_perc") is not None:
+            commission_pct = float(default_cfg.get("commission_perc", 0) or 0)
+        cerebro.broker.setcommission(commission=commission_pct, margin=None, mult=1.0)
+
     data_bt = bt.feeds.PandasData(
         dataname=data,
         datetime=None,
@@ -225,7 +251,6 @@ def run_backtest(
     slippage_perc = float(os.environ.get("SLIPPAGE_PERC", "0.001"))
 
     cerebro.broker.setcash(initial_capital)
-    cerebro.broker.setcommission(commission=0)
     cerebro.broker.set_slippage_perc(slippage_perc)
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe")
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
@@ -295,7 +320,7 @@ def run_backtest(
         "profitFactor": float(profit_factor),
         "expectancyUsd": float(expectancy_usd),
         "expectancyR": float(expectancy_r),
-        "rMultiple": float(0.0),
+        "rMultiple": float(expectancy_r),  # expectancy in R = avg R-multiple per trade
     }
 
     # OHLC for chart (date, open, high, low, close)

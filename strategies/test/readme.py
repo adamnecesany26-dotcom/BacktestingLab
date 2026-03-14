@@ -102,6 +102,9 @@
 #
 # Přístup: self.params.ema_period, self.params.risk_pct
 #
+# Pro STOCKS: přidej share_size do params a používej self.buy(size=self.params.share_size).
+# Hodnota share_size se předává z UI (Position Size) automaticky.
+#
 # =============================================================================
 # 7. INDIKÁTORY
 # =============================================================================

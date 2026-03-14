@@ -83,6 +83,28 @@ def _read_stream_sync(
     threading.Thread(target=run, daemon=True).start()
 
 
+def _merge_strategy_params(
+    strategy_params: dict | None,
+    instrument_type: str,
+    share_size: int | None,
+    lot_size: float | None,
+    pip_size: float | None,
+    pip_value: float | None,
+) -> dict:
+    """Merge backtest params (share_size, lot_size, etc.) into strategy params for use in strategy."""
+    merged = dict(strategy_params or {})
+    if instrument_type == "stocks" and share_size is not None:
+        merged["share_size"] = share_size
+    if instrument_type == "forex":
+        if lot_size is not None:
+            merged["lot_size"] = lot_size
+        if pip_size is not None:
+            merged["pip_size"] = pip_size
+        if pip_value is not None:
+            merged["pip_value"] = pip_value
+    return merged
+
+
 def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, str] | None) -> str:
     """
     Write strategy files to run_dir. Returns the entry point filename (main.py or strategy.py).
@@ -155,6 +177,7 @@ async def run_strategy_streaming(
             "-v", f"{run_path}:/app/strategy:rw",
             "-v", f"{data_path}:/app/data:ro",
             "-e", f"STRATEGY_PATH=/app/strategy/{entry_file}",
+            "-e", f"DATA_PATH=/app/data",
             "-e", f"INSTRUMENT={instrument}",
             "-e", f"TIMEFRAME={timeframe}",
             "-e", f"YEARS={years}",
@@ -168,7 +191,7 @@ async def run_strategy_streaming(
             "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
             "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
             "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
-            "-e", f"STRATEGY_PARAMS={json.dumps(strategy_params or {})}",
+            "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(strategy_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
             "backtest-engine",
         ]
 
