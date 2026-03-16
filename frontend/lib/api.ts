@@ -81,6 +81,39 @@ export async function getAvailableData(): Promise<{
   return res.json();
 }
 
+export interface ViewLine {
+  name: string;
+  data: { date: string; value: number }[];
+}
+
+/** Fetch OHLC + optional module markers/lines for View chart. */
+export async function getViewData(
+  dataFile: string,
+  years: number,
+  moduleCode?: string | null,
+  params?: Record<string, number | boolean | string> | null
+): Promise<{
+  ohlc: OhlcBar[];
+  markers: { date: string; type: string; value: number }[];
+  lines: ViewLine[];
+}> {
+  const res = await fetch(`${API_BASE}/api/view`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      data_file: dataFile,
+      years,
+      module_code: moduleCode || null,
+      params: params || null,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
 /** Fetch mplfinance chart PNG from backend. */
 export async function getChartImage(ohlc: OhlcBar[], trades: Trade[]): Promise<Blob> {
   const res = await fetch(`${API_BASE}/api/chart`, {

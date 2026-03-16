@@ -7,6 +7,7 @@ import { CreateModal } from "@/components/CreateModal";
 import { AddFileModal } from "@/components/AddFileModal";
 import { BacktestSettings } from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
+import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import {
@@ -42,6 +43,7 @@ export default function Home() {
   const [files, setFiles] = useState<{ fileName: string; content: string }[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState("");
+  const [lastSavedContent, setLastSavedContent] = useState("");
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isAddFileModalOpen, setIsAddFileModalOpen] = useState(false);
 
@@ -86,6 +88,8 @@ export default function Home() {
   const [showResults, setShowResults] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
+  const [viewMode, setViewMode] = useState(false);
+  const [strategiesForView, setStrategiesForView] = useState<FirestoreItem[]>([]);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -106,7 +110,9 @@ export default function Home() {
 
   const loadFileContent = useCallback(async (type: ItemType, id: string, fileName: string) => {
     const content = await getFileContent(type, id, fileName);
-    setFileContent(content ?? "");
+    const v = content ?? "";
+    setFileContent(v);
+    setLastSavedContent(v);
   }, []);
 
   useEffect(() => {
@@ -114,7 +120,16 @@ export default function Home() {
   }, [selectedType, loadItems]);
 
   useEffect(() => {
+    if (viewMode) {
+      listItems("strategies").then(setStrategiesForView);
+    }
+  }, [viewMode]);
+
+  useEffect(() => {
     if (openItem?.type === "strategies") {
+      listItems("indicators").then(setIndicators);
+      listItems("modules").then(setModules);
+    } else if (viewMode) {
       listItems("indicators").then(setIndicators);
       listItems("modules").then(setModules);
     } else {
@@ -125,7 +140,7 @@ export default function Home() {
       setSelectedModuleIds([]);
       setAppliedModuleIds([]);
     }
-  }, [openItem?.type, openItem?.id]);
+  }, [openItem?.type, openItem?.id, viewMode]);
 
   useEffect(() => {
     if (openItem) {
@@ -134,6 +149,7 @@ export default function Home() {
       setFiles([]);
       setSelectedFile(null);
       setFileContent("");
+      setLastSavedContent("");
     }
   }, [openItem, loadFiles]);
 
@@ -141,10 +157,18 @@ export default function Home() {
     if (!openItem) return;
     if (selectedFile?.startsWith("indicator:")) {
       const id = selectedFile.replace("indicator:", "");
-      getFileContent("indicators", id, "main.py").then((c) => setFileContent(c ?? ""));
+      getFileContent("indicators", id, "main.py").then((c) => {
+        const v = c ?? "";
+        setFileContent(v);
+        setLastSavedContent(v);
+      });
     } else if (selectedFile?.startsWith("module:")) {
       const id = selectedFile.replace("module:", "");
-      getFileContent("modules", id, "main.py").then((c) => setFileContent(c ?? ""));
+      getFileContent("modules", id, "main.py").then((c) => {
+        const v = c ?? "";
+        setFileContent(v);
+        setLastSavedContent(v);
+      });
     } else if (selectedFile) {
       loadFileContent(openItem.type, openItem.id, selectedFile);
     }
@@ -237,6 +261,7 @@ export default function Home() {
     await loadFiles(openItem.type, openItem.id);
     setSelectedFile(fileName);
     setFileContent("");
+    setLastSavedContent("");
     addLog(`Vytvořen soubor: ${fileName}`);
   };
 
@@ -474,9 +499,22 @@ export default function Home() {
           <>
             <button
               onClick={handleSaveFile}
-              className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm"
+              disabled={fileContent === lastSavedContent}
+              className={`px-4 py-2 rounded-lg text-sm ${
+                fileContent === lastSavedContent
+                  ? "bg-zinc-800 text-zinc-500 cursor-default"
+                  : "bg-zinc-700 hover:bg-zinc-600"
+              }`}
             >
-              Uložit
+              {fileContent === lastSavedContent ? "Uloženo" : "Uložit"}
+            </button>
+            <button
+              onClick={() => setViewMode((v) => !v)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium ${
+                viewMode ? "bg-emerald-600 text-white" : "bg-zinc-700 hover:bg-zinc-600"
+              }`}
+            >
+              View
             </button>
             <span className="text-sm text-zinc-500">
               {selectedFile.startsWith("indicator:")
@@ -489,7 +527,44 @@ export default function Home() {
         )}
       </div>
       <div className="flex-1 min-h-0">
-        {openItem && selectedFile ? (
+        {viewMode ? (
+          <div className="h-full p-4 overflow-auto">
+            <StrategyViewChart
+              instruments={instruments}
+              modules={modules}
+              indicators={indicators}
+              strategies={strategiesForView}
+              defaultDataFile={selectedInstrument?.file ?? "mock/NQ_5Y.csv"}
+              initialItemId={
+                selectedFile?.startsWith("module:")
+                  ? selectedFile.replace("module:", "")
+                  : selectedFile?.startsWith("indicator:")
+                    ? selectedFile.replace("indicator:", "")
+                    : openItem?.type === "strategies" && openItem?.id
+                      ? openItem.id
+                      : openItem?.type === "modules" && openItem?.id
+                        ? openItem.id
+                        : openItem?.type === "indicators" && openItem?.id
+                          ? openItem.id
+                          : undefined
+              }
+              initialItemType={
+                selectedFile?.startsWith("module:")
+                  ? "module"
+                  : selectedFile?.startsWith("indicator:")
+                    ? "indicator"
+                    : openItem?.type === "strategies"
+                      ? "strategy"
+                      : openItem?.type === "modules"
+                        ? "module"
+                        : openItem?.type === "indicators"
+                          ? "indicator"
+                          : undefined
+              }
+              height={520}
+            />
+          </div>
+        ) : openItem && selectedFile ? (
           <StrategyEditor value={fileContent} onChange={setFileContent} />
         ) : (
           <div className="flex-1 flex items-center justify-center bg-zinc-950 p-8">

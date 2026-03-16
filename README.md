@@ -17,6 +17,8 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 5. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, win rate), seznam obchodů, candlestick grafy
 6. **Trade Highlight** – detail jednoho obchodu (okno entry–exit + kontext) s interaktivním výběrem
 7. **Run history** – automatické ukládání každého runu do Firestore, tabulka + grafy metrik napříč runy
+8. **View mode** – svíčkový graf s markery/čáry z modulu/indikátoru bez backtestu; **View params drawer** – ikona vedle Obnovit otevře panel pro úpravu `VIEW_PARAMS` (period, barva, …)
+9. **Uložit / Uloženo** – tlačítko Uložit se po uložení změní na „Uloženo“ (disabled), po změně kódu zpět na „Uložit“
 
 ### 1.2 Architektura (vysokoúrovňově)
 
@@ -38,6 +40,7 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 │  BACKEND (FastAPI, Python)                                                   │
 │  - GET /api/data: seznam dostupných instrumentů (podle složek mock/*)         │
 │  - POST /api/run?stream=1: spuštění backtestu (SSE: log, progress, result)    │
+│  - POST /api/view: OHLC + markery/čáry z modulu, View params                  │
 │  - POST /api/chart: generace PNG grafu (mplfinance)                          │
 │  - services/runner.py: orchestrace Dockeru, streamování výstupu              │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -90,6 +93,7 @@ Backtesting_app/
 │   │   │   ├── EquityChart.tsx
 │   │   │   ├── TradesChart.tsx
 │   │   │   └── TradeHighlightChart.tsx # Candlestick okno entry–exit pro jeden obchod
+│   │   ├── StrategyViewChart.tsx # View mode – Plotly candlestick + H/L markery, View params drawer (ikona vedle Obnovit)
 │   │   ├── LogPanel.tsx         # Spodní panel – logy z backendu
 │   │   ├── LoadingOverlay.tsx   # Progress bar + Zastavit
 │   │   ├── CreateModal.tsx     # Modal pro vytvoření strategie/indikátoru/modulu
@@ -98,7 +102,7 @@ Backtesting_app/
 │       ├── api.ts               # runBacktestStreaming, getAvailableData, getChartImage
 │       ├── firestore.ts         # listItems, createItem, getFiles, saveFile, saveBacktestResult, listBacktestResults, deleteBacktestResult, deleteAllBacktestResults
 │       ├── firebase.ts          # Firebase konfigurace
-│       └── strategyParams.ts    # parseStrategyParams – parsování PARAMS = {...} z Pythonu
+│       └── strategyParams.ts    # parseStrategyParams, parseViewParams – parsování PARAMS/VIEW_PARAMS (strip Python # komentářů)
 │
 ├── backend/
 │   ├── app/
@@ -106,6 +110,7 @@ Backtesting_app/
 │   │   ├── api/
 │   │   │   ├── run.py           # POST /api/run (streaming / non-streaming)
 │   │   │   ├── data.py          # GET /api/data, GET /api/data/debug
+│   │   │   ├── view.py          # POST /api/view (OHLC + markery/čáry z modulu, View params)
 │   │   │   └── chart.py         # POST /api/chart (PNG)
 │   │   ├── services/
 │   │   │   ├── runner.py        # Docker orchestrace, streamování
@@ -163,6 +168,8 @@ Backtesting_app/
 | 11 | (Volitelně) Upraví **Strategy Parameters** | `parseStrategyParams(main.py)` → dynamické inputy v Parameter Panel |
 | 12 | Nastaví **Délku** (roky) | `years` state |
 | 13 | Klikne **Run** | `handleRun()` – viz níže |
+| 14 | (Volitelně) Klikne **View** | Přepne na View chart – svíčkový graf s mock daty, výběr modulu/indikátoru pro vizualizaci H/L bodů; ikona params vedle Obnovit otevře drawer s parametry |
+| 15 | (Volitelně) Uloží soubor | Tlačítko „Uložit“ se změní na „Uloženo“ (disabled); po změně kódu zpět na „Uložit“ |
 
 ### 3.3 Run backtest – detailní tok
 
@@ -323,6 +330,7 @@ Backtesting_app/
 - `parseStrategyParams(code)` v `frontend/lib/strategyParams.ts` hledá v kódu `PARAMS = {...}`
 - Podporované typy: `number`, `boolean`, `string`
 - Python dict se převádí na JSON (True→true, 'key'→"key", …)
+- Před parsováním se odstraní Python komentáře (`# ...`) – zachová se `#` uvnitř řetězců
 
 ### 4.2 Zobrazení v UI
 
@@ -337,9 +345,94 @@ Backtesting_app/
 
 ---
 
-## 5. Typy instrumentů a ukládání dat
+## 5. View mode a View params panel
 
-### 5.1 Instrument Type
+### 5.1 Co je View mode
+
+**View** je záložka vedle Results, kde vidíš svíčkový graf s OHLC daty a volitelně **markery** (body) nebo **čáry** (indikátory) z tvého kódu – bez spuštění backtestu. Slouží k rychlé vizualizaci toho, jak modul/indikátor/strategie funguje na datech.
+
+**Typický workflow:**
+1. Vytvoříš indikátor (např. EMA) nebo modul (např. swing H/L)
+2. Přepneš na záložku **View**
+3. Vybereš instrument, období a modul/indikátor/strategii
+4. Graf se zobrazí s čárami nebo markery z tvého kódu
+
+### 5.2 Rozhraní pro View (detect, get_line)
+
+Modul, indikátor i strategie používají stejné rozhraní:
+
+| Funkce | Účel | Vrací |
+|--------|------|-------|
+| `detect(ohlc, params=None)` | Bodové značky (H/L, signály) | `[{"date": "YYYY-MM-DD", "type": "high"\|"low"\|"signal", "value": float}, ...]` |
+| `get_line(ohlc, params=None)` | Čáry (indikátory) | `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}` |
+
+- **type** u markerů: `"high"` = zelené, `"low"` = červené, `"signal"` = modré
+- **value**: cena (y-ová souřadnice)
+
+### 5.3 View params panel – dynamické parametry ve View módu
+
+Při vývoji indikátoru/modulu můžeš v View módu **měnit parametry bez úpravy kódu** – podobně jako Parameter Panel u backtestu, ale přímo u grafu.
+
+**Jak to funguje:**
+
+1. V kódu modulu/indikátoru/strategie deklaruješ `VIEW_PARAMS`:
+   ```python
+   VIEW_PARAMS = {"period": 20}
+   ```
+
+2. Funkce `detect` a/nebo `get_line` přijímají druhý argument `params`:
+   ```python
+   def get_line(ohlc, params=None):
+       params = params or {}
+       period = int(params.get("period", 20))
+       ema = ohlc["close"].ewm(span=period, adjust=False).mean()
+       # ...
+   ```
+
+3. Ve View záložce se zobrazí **ikona params** (tři čáry s tečkami) vedle tlačítka Obnovit – kliknutím otevře **drawer** z pravé strany s inputy pro každý parametr.
+
+4. Změníš hodnotu (např. period 20 → 50, barva `#ff0000`) a klikneš **Použít** → graf se znovu načte s novými parametry.
+
+### 5.3a View params drawer – přístup k parametrům
+
+- **Ikona** – zobrazí se vedle tlačítka „Obnovit“, když je vybraný modul/indikátor/strategie
+- **Drawer** – kliknutím na ikonu se z pravé strany vysune panel (šířka 320px) s parametry
+- **Žádné VIEW_PARAMS** – pokud modul nemá `VIEW_PARAMS`, drawer zobrazí návod, co přidat do kódu
+- **Barva čar** – `get_line` může vracet `{"EMA20": {"data": [...], "color": "#ff0000"}}` pro vlastní barvu čáry
+
+### 5.4 Pravidla pro View params panel
+
+| Pravidlo | Popis |
+|----------|-------|
+| **VIEW_PARAMS** | Musí být platný Python dict s klíči a výchozími hodnotami. Podporované typy: `number`, `boolean`, `string`. |
+| **params v signatuře** | `detect(ohlc, params=None)` a `get_line(ohlc, params=None)` – druhý argument je volitelný. Pokud ho funkce nemá, params se nepředávají (zpětná kompatibilita). |
+| **Parsování** | Frontend hledá v kódu `VIEW_PARAMS = {...}` (stejný formát jako `PARAMS`). Funkce `parseViewParams(code)` v `strategyParams.ts`. Před parsováním se odstraní Python komentáře (`# ...`) – zachová se `#` uvnitř řetězců (např. `"#3b82f6"`). |
+| **Backend** | `POST /api/view` přijímá `params` v body a předává je do `detect`/`get_line` pomocí `_call_with_params()` – podle signatury volá `fn(df, params)` nebo `fn(df)`. |
+
+### 5.5 Příklad (EMA s View params a barvou)
+
+```python
+VIEW_PARAMS = {"period": 20, "color": "#3b82f6"}
+
+def get_line(ohlc, params=None):
+    params = params or {}
+    period = int(params.get("period", 20))
+    color = str(params.get("color", "#3b82f6")).strip()
+    if not color.startswith("#"):
+        color = "#" + color
+    ema = ohlc["close"].ewm(span=period, adjust=False).mean()
+    data = [{"date": ohlc.index[i].strftime("%Y-%m-%d"), "value": float(ema.iloc[i])}
+            for i in range(len(ohlc))]
+    return {f"EMA{period}": {"data": data, "color": color}}
+```
+
+Viz `examples/ema_indicator_view.py`, `examples/ema_indicator_mock.py`, `examples/view_interface.md`.
+
+---
+
+## 6. Typy instrumentů a ukládání dat
+
+### 6.1 Instrument Type
 
 Aplikace podporuje tři typy:
 
@@ -349,7 +442,7 @@ Aplikace podporuje tři typy:
 | **Stocks** | Akcie | Position Size (počet akcií) |
 | **Forex** | Forex páry | Lot Size, Pip Size, Pip Value |
 
-### 5.2 Struktura složek pro data
+### 6.2 Struktura složek pro data
 
 Typ instrumentu se určuje podle **umístění souboru**:
 
@@ -367,19 +460,19 @@ data/mock/
     └── GBPUSD_3Y.csv
 ```
 
-### 5.3 Formát CSV
+### 6.3 Formát CSV
 
 - Povinné sloupce: `Date` nebo `date`, OHLC (Open, High, Low, Close/Last)
 - Volitelné: `Volume` (default 1000)
 - Název souboru: `{INSTRUMENT}_5Y.csv` → instrument = první část před `_`
 
-### 5.4 Filtrování instrumentů v UI
+### 6.4 Filtrování instrumentů v UI
 
 - `GET /api/data` vrací všechny instrumenty včetně `instrumentType`
 - Frontend: `filterInstrumentsByType(instruments, backtestParams.instrumentType)`
 - Při změně Instrument Type se výběr resetuje na první dostupný instrument daného typu
 
-### 5.5 broker_config.json (futures)
+### 6.5 broker_config.json (futures)
 
 ```json
 {
@@ -398,7 +491,7 @@ Používá se pro futures v engine (zatím primárně pro konfiguraci; výpočet
 
 ---
 
-## 6. Firestore struktura
+## 7. Firestore struktura
 
 ```
 /strategies/{strategyId}
@@ -419,7 +512,7 @@ Používá se pro futures v engine (zatím primárně pro konfiguraci; výpočet
     - fileName, content
 ```
 
-### 6.1 Run history – ukládání a mazání
+### 7.1 Run history – ukládání a mazání
 
 - **Uložení:** `saveBacktestResult(strategyId, strategyName, { equityCurve, metrics, trades })` – voláno automaticky po úspěšném Run
 - **Seznam:** `listBacktestResults(strategyId)` – seřazeno podle `savedAt` (nejnovější první)
@@ -428,7 +521,7 @@ Používá se pro futures v engine (zatím primárně pro konfiguraci; výpočet
 
 ---
 
-## 7. API reference
+## 8. API reference
 
 ### GET /api/data
 
@@ -472,6 +565,24 @@ Spustí backtest.
 - `{"type": "result", "data": RunResponse}`
 - `{"type": "error", "message": "..."}`
 
+### POST /api/view
+
+OHLC data + volitelné markery a čáry z modulu/indikátoru/strategie pro View chart.
+
+**Body:** `{ data_file: string, years: number, module_code?: string, params?: Record<string, number|boolean|string> }`
+
+**Response:** `{ ohlc: [...], markers: [...], lines: [{ name, data: [...] }, ...] }`
+
+**Rozhraní (modul, indikátor i strategie):**
+- `detect(ohlc, params=None)` → markery: `[{"date", "type": "high"|"low"|"signal", "value"}, ...]`
+- `get_line(ohlc, params=None)` → čáry: `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}`
+
+**View params:** Pokud modul definuje `VIEW_PARAMS = {...}`, frontend posílá `params` v requestu; backend předává `params` do `detect`/`get_line` (pokud funkce druhý argument přijímá). Backend zapisuje dočasný soubor s `encoding="utf-8"` (kvůli kompatibilitě na Windows).
+
+**Barva čar:** `get_line` může vracet `{"název": {"data": [...], "color": "#hex"}}` – frontend použije barvu v grafu.
+
+Viz `examples/view_interface.md`, `examples/hl_module_template.py`, `examples/ema_indicator_view.py`, `examples/ema_indicator_mock.py`.
+
 ### POST /api/chart
 
 Generuje PNG candlestick grafu s mplfinance.
@@ -482,7 +593,7 @@ Generuje PNG candlestick grafu s mplfinance.
 
 ---
 
-## 8. Indikátory a moduly
+## 9. Indikátory a moduly
 
 ### Import v strategii
 
@@ -499,7 +610,7 @@ Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrd
 
 ---
 
-## 9. Technologie
+## 10. Technologie
 
 | Vrstva | Technologie |
 |--------|-------------|
@@ -512,7 +623,7 @@ Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrd
 
 ---
 
-## 10. Konfigurace
+## 11. Konfigurace
 
 ### Environment variables
 
@@ -527,7 +638,7 @@ Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrd
 
 ---
 
-## 11. Firestore pravidla
+## 12. Firestore pravidla
 
 Pro ukládání výsledků backtestů (Run history) musí být nasazena Firestore pravidla. V root projektu:
 
@@ -539,7 +650,7 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 
 ---
 
-## 12. Známá omezení a TODO
+## 13. Známá omezení a TODO
 
 1. **Futures:** Engine nyní používá `broker_config.json` (mult, margin, commission_per_contract) pro správný výpočet PnL a commission.
 2. **Stocks:** Broker používá procentní commission z `broker_config.default.commission_perc`. Strategie musí mít `share_size` v params a volat `self.buy(size=self.params.share_size)` – hodnota se předává z UI.
@@ -547,7 +658,7 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 
 ---
 
-## 13. Troubleshooting
+## 14. Troubleshooting
 
 | Problém | Možná příčina | Řešení |
 |---------|---------------|--------|
@@ -558,10 +669,13 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 | Firebase chyba | Chybějící konfigurace | Zkontroluj `firebase.ts`, service account / API key |
 | **FirebaseError: Missing or insufficient permissions** | Firestore pravidla blokují zápis | Nasazení pravidel: `firebase deploy --only firestore:rules` (v root projektu) |
 | Run history prázdná | Firestore pravidla nebo chyba při ukládání | Zkontroluj logy („Uložení výsledků selhalo“), Firestore rules |
+| View params: „nemá VIEW_PARAMS“ | Python komentáře v dict, encoding | Odstranit `# komentář` za hodnotami; kód uložit jako UTF-8; viz `examples/ema_indicator_mock.py` |
 
 ---
 
-## 14. Další dokumentace
+## 15. Další dokumentace
 
 - **SCRIPTS.md** – příkazy, skripty, edge cases
 - **strategies/test/readme.py** – tutoriál psaní strategií (Backtrader API, životní cyklus, příklady)
+- **examples/view_interface.md** – rozhraní pro View (detect, get_line, VIEW_PARAMS)
+- **examples/ema_indicator_mock.py** – příklad indikátoru s VIEW_PARAMS (period, color)

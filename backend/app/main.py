@@ -6,7 +6,7 @@ Handles CORS, routes, and startup/shutdown events.
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import run, data, chart
+from app.api import run, data, chart, view
 
 app = FastAPI(
     title="Backtesting Platform API",
@@ -34,3 +34,4 @@ async def health():
 app.include_router(run.router, prefix="/api", tags=["run"])
 app.include_router(data.router, prefix="/api", tags=["data"])
 app.include_router(chart.router, prefix="/api", tags=["chart"])
+app.include_router(view.router, prefix="/api", tags=["view"])
