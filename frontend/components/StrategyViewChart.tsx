@@ -63,6 +63,9 @@ export function StrategyViewChart({
     initialItemType ?? "module"
   );
   const [lines, setLines] = useState<{ name: string; data: { date: string; value: number }[] }[]>([]);
+  const [zones, setZones] = useState<
+    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string }[]
+  >([]);
   const [viewParamsSchema, setViewParamsSchema] = useState<StrategyParams>({});
   const [viewParamsValues, setViewParamsValues] = useState<StrategyParams>({});
   const [paramsDrawerOpen, setParamsDrawerOpen] = useState(false);
@@ -115,10 +118,12 @@ export function StrategyViewChart({
       setOhlc(res.ohlc);
       setMarkers(res.markers);
       setLines(res.lines ?? []);
+      setZones(res.zones ?? []);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setOhlc([]);
       setMarkers([]);
+      setZones([]);
     } finally {
       setLoading(false);
     }
@@ -299,6 +304,22 @@ export function StrategyViewChart({
     })
     .filter((t) => t.x.length > 0);
 
+  const zoneShapes: any[] = zones.map((z) => {
+    const idxStart = dateToIndex.get(z.date_start.slice(0, 10)) ?? 0;
+    const idxEnd = dateToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
+    const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
+    return {
+      type: "rect",
+      x0: idxStart - 0.5,
+      x1: idxEnd + 0.5,
+      y0: z.value_low,
+      y1: z.value_high,
+      fillcolor: fill,
+      line: { width: 1, color: "#3b82f6" },
+      layer: "below",
+    };
+  });
+
   const layout: any = {
     height,
     margin: { t: 50, r: 40, b: 60, l: 60 },
@@ -321,6 +342,7 @@ export function StrategyViewChart({
     },
     dragmode: "zoom",
     legend: { x: 0, y: 1.1, orientation: "h" },
+    shapes: zoneShapes,
   };
 
   const config: any = {

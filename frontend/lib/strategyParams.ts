@@ -111,6 +111,16 @@ export function isValidParamValue(v: unknown): v is StrategyParamValue {
 }
 
 /**
+ * Normalize module name to param prefix (e.g. "Swing HL" -> "swing_hl").
+ */
+export function toModuleParamPrefix(name: string): string {
+  return (name || "module")
+    .replace(/\s+/g, "_")
+    .replace(/[^a-zA-Z0-9_]/g, "")
+    .toLowerCase() || "module";
+}
+
+/**
  * Parse VIEW_PARAMS = {...} from Python code for View mode.
  * Same format as PARAMS - used when building modules/indicators/strategies
  * to expose tunable params in the View params panel.

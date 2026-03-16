@@ -67,10 +67,10 @@ def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
 
 def _run_view_code(
     code: str, df: pd.DataFrame, params: dict | None = None
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], list[dict]]:
     """
-    Execute detect(ohlc) and/or get_line(ohlc) from module/indicator/strategy.
-    Returns (markers, lines).
+    Execute detect(ohlc), get_line(ohlc), get_zones(ohlc) from module/indicator/strategy.
+    Returns (markers, lines, zones).
 
     MODULE / INDICATOR / STRATEGIE – všechny používají stejné rozhraní:
 
@@ -80,9 +80,11 @@ def _run_view_code(
 
     # Čáry (indikátory – EMA, RSI, atd.):
     def get_line(ohlc: pd.DataFrame) -> list[dict] | dict:
-        # Vrátí buď [{date, value}, ...] nebo {name: str, data: [{date, value}, ...]}
-        return [{"date": "YYYY-MM-DD", "value": float}, ...]
-        # nebo pro více čar: {"EMA20": [...], "EMA50": [...]}
+        return [{"date", "value"}, ...] nebo {"EMA20": [...], "EMA50": [...]}
+
+    # Zóny/boxy (support/resistance, price zones):
+    def get_zones(ohlc: pd.DataFrame) -> list[dict]:
+        return [{"date_start": "YYYY-MM-DD", "date_end": "YYYY-MM-DD", "value_low": float, "value_high": float, "fillcolor"?: str, "name"?: str}, ...]
     """
     import tempfile
     import importlib.util
@@ -133,7 +135,28 @@ def _run_view_code(
                 if pts:
                     lines.append({"name": "line", "data": pts})
 
-        return markers, lines
+        zones = []
+        if hasattr(mod, "get_zones"):
+            result = _call_with_params(mod.get_zones, df, params)
+            if isinstance(result, list):
+                for item in result:
+                    if (
+                        isinstance(item, dict)
+                        and "date_start" in item
+                        and "date_end" in item
+                        and "value_low" in item
+                        and "value_high" in item
+                    ):
+                        zones.append({
+                            "date_start": str(item["date_start"])[:10],
+                            "date_end": str(item["date_end"])[:10],
+                            "value_low": float(item["value_low"]),
+                            "value_high": float(item["value_high"]),
+                            "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
+                            "name": str(item["name"]) if item.get("name") else None,
+                        })
+
+        return markers, lines, zones
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -181,12 +204,13 @@ async def get_view_data(req: ViewRequest):
 
     markers = []
     lines = []
+    zones = []
     if req.module_code and req.module_code.strip():
         try:
-            markers, lines = _run_view_code(
+            markers, lines, zones = _run_view_code(
                 req.module_code.strip(), df, params=req.params or {}
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"View error: {str(e)}")
 
-    return {"ohlc": ohlc, "markers": markers, "lines": lines}
+    return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}

@@ -44,6 +44,11 @@ interface BacktestSettingsProps {
   /** Strategy parameters (from PARAMS dict) - only when strategy open */
   strategyParams?: StrategyParams;
   onStrategyParamsChange?: (params: StrategyParams) => void;
+  /** Module parameters (VIEW_PARAMS per module) - keyed by module name */
+  moduleParams?: Record<string, StrategyParams>;
+  onModuleParamsChange?: (moduleName: string, params: StrategyParams) => void;
+  /** Module names for which to show params (from applied/selected modules) */
+  moduleNamesForParams?: string[];
 }
 
 export function BacktestSettings({
@@ -67,16 +72,36 @@ export function BacktestSettings({
   canRun = true,
   strategyParams = {},
   onStrategyParamsChange,
+  moduleParams = {},
+  onModuleParamsChange,
+  moduleNamesForParams = [],
 }: BacktestSettingsProps) {
   const maxYears = selectedInstrument?.yearsAvailable ?? 5;
   const minYears = 1;
   const [paramsPanelOpen, setParamsPanelOpen] = useState(true);
+  const [paramsTab, setParamsTab] = useState<"strategy" | string>("strategy");
 
   const inputClass = "w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200";
   const labelClass = "block text-sm text-zinc-400 mb-1";
 
   const strategyParamEntries = Object.entries(strategyParams);
   const hasStrategyParams = strategyParamEntries.length > 0;
+  const moduleTabs = moduleNamesForParams.filter((n) => {
+    const p = moduleParams[n];
+    return p && Object.keys(p).length > 0;
+  });
+  const hasModuleParams = moduleTabs.length > 0;
+  const hasAnyParams = hasStrategyParams || hasModuleParams;
+
+  const currentParams =
+    paramsTab === "strategy"
+      ? strategyParams
+      : moduleParams[paramsTab] ?? {};
+  const currentParamEntries = Object.entries(currentParams);
+  const onCurrentParamsChange =
+    paramsTab === "strategy"
+      ? (next: StrategyParams) => onStrategyParamsChange?.(next)
+      : (next: StrategyParams) => onModuleParamsChange?.(paramsTab, next);
 
   const content = (
     <div className="space-y-4">
@@ -215,55 +240,92 @@ export function BacktestSettings({
             className="flex items-center justify-between w-full text-left"
           >
             <h5 className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
-              Strategy Parameters
+              Parameters
             </h5>
             <span className="text-zinc-500 text-sm">{paramsPanelOpen ? "▼" : "▶"}</span>
           </button>
           {paramsPanelOpen && (
             <div className="mt-2 space-y-2">
-              {hasStrategyParams ? (
-                strategyParamEntries.map(([key, value]) => (
-                  <div key={key}>
-                    <label className={labelClass}>{key}</label>
-                    {typeof value === "number" ? (
-                      <input
-                        type="number"
-                        value={value}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          if (!Number.isNaN(v)) {
-                            onStrategyParamsChange?.({ ...strategyParams, [key]: v });
-                          }
-                        }}
-                        step={Number.isInteger(value) ? 1 : 0.01}
-                        className={inputClass}
-                      />
-                    ) : typeof value === "boolean" ? (
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={value}
-                          onChange={(e) =>
-                            onStrategyParamsChange?.({ ...strategyParams, [key]: e.target.checked })
-                          }
-                          className="rounded"
-                        />
-                        <span className="text-sm text-zinc-300">{value ? "Yes" : "No"}</span>
-                      </label>
-                    ) : (
-                      <input
-                        type="text"
-                        value={String(value)}
-                        onChange={(e) =>
-                          onStrategyParamsChange?.({ ...strategyParams, [key]: e.target.value })
-                        }
-                        className={inputClass}
-                      />
-                    )}
+              {hasAnyParams ? (
+                <>
+                  <div className="flex gap-1 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => setParamsTab("strategy")}
+                      className={`px-2 py-1 rounded text-xs ${
+                        paramsTab === "strategy"
+                          ? "bg-zinc-600 text-white"
+                          : "bg-zinc-800 text-zinc-400 hover:text-zinc-200"
+                      }`}
+                    >
+                      Strategie
+                    </button>
+                    {moduleTabs.map((name) => (
+                      <button
+                        key={name}
+                        type="button"
+                        onClick={() => setParamsTab(name)}
+                        className={`px-2 py-1 rounded text-xs ${
+                          paramsTab === name
+                            ? "bg-zinc-600 text-white"
+                            : "bg-zinc-800 text-zinc-400 hover:text-zinc-200"
+                        }`}
+                      >
+                        {name}
+                      </button>
+                    ))}
                   </div>
-                ))
+                  {currentParamEntries.length > 0 ? (
+                    currentParamEntries.map(([key, value]) => (
+                      <div key={key}>
+                        <label className={labelClass}>{key}</label>
+                        {typeof value === "number" ? (
+                          <input
+                            type="number"
+                            value={value}
+                            onChange={(e) => {
+                              const v = parseFloat(e.target.value);
+                              if (!Number.isNaN(v)) {
+                                onCurrentParamsChange?.({ ...currentParams, [key]: v });
+                              }
+                            }}
+                            step={Number.isInteger(value) ? 1 : 0.01}
+                            className={inputClass}
+                          />
+                        ) : typeof value === "boolean" ? (
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={value}
+                              onChange={(e) =>
+                                onCurrentParamsChange?.({ ...currentParams, [key]: e.target.checked })
+                              }
+                              className="rounded"
+                            />
+                            <span className="text-sm text-zinc-300">{value ? "Yes" : "No"}</span>
+                          </label>
+                        ) : (
+                          <input
+                            type="text"
+                            value={String(value)}
+                            onChange={(e) =>
+                              onCurrentParamsChange?.({ ...currentParams, [key]: e.target.value })
+                            }
+                            className={inputClass}
+                          />
+                        )}
+                      </div>
+                    ))
+                  ) : (
+                    <p className="text-zinc-500 text-xs">
+                      {paramsTab === "strategy"
+                        ? "Žádné parametry strategie"
+                        : `Žádné parametry pro ${paramsTab}`}
+                    </p>
+                  )}
+                </>
               ) : (
-                <p className="text-zinc-500 text-xs">No strategy parameters detected</p>
+                <p className="text-zinc-500 text-xs">Žádné parametry</p>
               )}
             </div>
           )}

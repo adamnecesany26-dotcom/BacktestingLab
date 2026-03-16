@@ -86,7 +86,17 @@ export interface ViewLine {
   data: { date: string; value: number }[];
 }
 
-/** Fetch OHLC + optional module markers/lines for View chart. */
+/** Zone/box for View chart */
+export interface ViewZone {
+  date_start: string;
+  date_end: string;
+  value_low: number;
+  value_high: number;
+  fillcolor?: string;
+  name?: string;
+}
+
+/** Fetch OHLC + optional module markers/lines/zones for View chart. */
 export async function getViewData(
   dataFile: string,
   years: number,
@@ -96,6 +106,7 @@ export async function getViewData(
   ohlc: OhlcBar[];
   markers: { date: string; type: string; value: number }[];
   lines: ViewLine[];
+  zones?: ViewZone[];
 }> {
   const res = await fetch(`${API_BASE}/api/view`, {
     method: "POST",

@@ -39,7 +39,9 @@ export interface RunRequest {
   pip_size?: number;
   pip_value?: number;
   /** Strategy parameters (from PARAMS dict) - override values without editing code */
-  params?: Record<string, number | boolean | string>;
+  params?: Record<string, number | boolean | string | Record<string, unknown>>;
+  /** Applied modules for module outputs (markers, lines) after backtest */
+  applied_modules?: { id: string; name: string; params?: Record<string, number | boolean | string> }[];
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -110,6 +112,23 @@ export interface OhlcBar {
   close: number;
 }
 
+/** Zone/box for chart (support/resistance, price zones) */
+export interface ModuleZone {
+  date_start: string;
+  date_end: string;
+  value_low: number;
+  value_high: number;
+  fillcolor?: string;
+  name?: string;
+}
+
+/** Module output (markers, lines, zones from detect/get_line/get_zones) */
+export interface ModuleOutput {
+  markers?: { date: string; type: string; value: number }[];
+  lines?: { name: string; data: { date: string; value: number }[]; color?: string }[];
+  zones?: ModuleZone[];
+}
+
 /** Run response payload */
 export interface RunResponse {
   equity: number[];
@@ -117,6 +136,8 @@ export interface RunResponse {
   metrics: BacktestMetrics;
   trades: Trade[];
   ohlc?: OhlcBar[];
+  /** Outputs from applied modules (detect, get_line) - keyed by module name */
+  moduleOutputs?: Record<string, ModuleOutput>;
 }
 
 /** Project structure for file tree */

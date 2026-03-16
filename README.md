@@ -12,13 +12,14 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 
 1. **Strategie** – uživatel vytváří a upravuje obchodní strategie v Pythonu (Backtrader API)
 2. **Indikátory a moduly** – znovupoužitelné komponenty (indikátory jako `bt.Indicator`, moduly jako utility funkce)
-3. **Parameter Panel** – dynamické parametry z `PARAMS = {...}` v kódu strategie, úprava bez editace kódu
+3. **Parameter Panel** – dynamické parametry z `PARAMS = {...}` strategie a `VIEW_PARAMS` modulů – záložky Strategie | Modul1 | Modul2, úprava bez editace kódu
 4. **Backtest** – spuštění strategie na historických OHLCV datech v izolovaném prostředí
-5. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, win rate), seznam obchodů, candlestick grafy
+5. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, win rate), seznam obchodů, candlestick grafy, záložka **Moduly** s výstupy modulů (markery, čáry)
 6. **Trade Highlight** – detail jednoho obchodu (okno entry–exit + kontext) s interaktivním výběrem
 7. **Run history** – automatické ukládání každého runu do Firestore, tabulka + grafy metrik napříč runy
 8. **View mode** – svíčkový graf s markery/čáry z modulu/indikátoru bez backtestu; **View params drawer** – ikona vedle Obnovit otevře panel pro úpravu `VIEW_PARAMS` (period, barva, …)
 9. **Uložit / Uloženo** – tlačítko Uložit se po uložení změní na „Uloženo“ (disabled), po změně kódu zpět na „Uložit“
+10. **FAQ** – ikona otazníku v pravém dolním rohu otevře modal s častými otázkami pro nové uživatele
 
 ### 1.2 Architektura (vysokoúrovňově)
 
@@ -28,7 +29,7 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 │  - page.tsx: hlavní stav, orchestrace, handleRun, saveBacktestResult          │
 │  - BacktestSettings: Instrument Type, Instrument, Parameter Panel, Run      │
 │  - StrategyEditor: Monaco editor (kód)                                       │
-│  - ResultsView: záložky Equity | Trades | Highlight | Detailed | Run history│
+│  - ResultsView: záložky Equity | Trades | Highlight | Detailed | Moduly | Run history│
 │  - TradeHighlight: graf jednoho obchodu + seznam obchodů                     │
 │  - RunHistory: tabulka runů + grafy metrik (Sharpe, R-multiple, P/L, …)       │
 │  - Firebase Firestore: strategie, indikátory, moduly, results (Run history)   │
@@ -97,7 +98,8 @@ Backtesting_app/
 │   │   ├── LogPanel.tsx         # Spodní panel – logy z backendu
 │   │   ├── LoadingOverlay.tsx   # Progress bar + Zastavit
 │   │   ├── CreateModal.tsx     # Modal pro vytvoření strategie/indikátoru/modulu
-│   │   └── AddFileModal.tsx    # Modal pro přidání souboru
+│   │   ├── AddFileModal.tsx    # Modal pro přidání souboru
+│   │   └── FaqModal.tsx        # Modal s častými otázkami (ikona ? v pravém dolním rohu)
 │   └── lib/
 │       ├── api.ts               # runBacktestStreaming, getAvailableData, getChartImage
 │       ├── firestore.ts         # listItems, createItem, getFiles, saveFile, saveBacktestResult, listBacktestResults, deleteBacktestResult, deleteAllBacktestResults
@@ -138,7 +140,8 @@ Backtesting_app/
 ├── firebase.json                # Konfigurace pro firebase deploy
 ├── strategies/                  # Lokální příklady (ne v produkci)
 ├── SCRIPTS.md                   # Příkazy, skripty, troubleshooting
-└── README.md
+├── README.md                    # Dokumentace pro vývojáře
+└── READMEAI.md                  # Referenční dokument pro AI/boty – architektura, data flow, workflow
 ```
 
 ---
@@ -205,7 +208,8 @@ Backtesting_app/
   "lot_size": null,
   "pip_size": null,
   "pip_value": null,
-  "params": { "sma_fast": 20, "sma_slow": 50, "risk_per_trade": 0.01, "use_trailing_stop": true }
+  "params": { "sma_fast": 20, "sma_slow": 50, "module_params": { "Swing HL": { "timeframe": "1d", "atr_period": 10 } } },
+  "applied_modules": [{ "id": "abc123", "name": "Swing HL", "params": { "timeframe": "1d", "atr_period": 10 } }]
 }
 ```
 
@@ -240,10 +244,11 @@ Backtesting_app/
    ```
 4. Čte stdout/stderr v odděleném vlákně
 5. Parsuje JSON z stdout → `{"equity": [...], "metrics": {...}, "trades": [...], "ohlc": [...]}` → event `result`
-6. Parsuje `PROGRESS:10` z stderr → event `progress`
-7. Při chybě: JSON `{"error": "..."}` → event `error`
-8. Streamuje události klientovi přes SSE
-9. Po dokončení smaže `.backtest_run/*.py`
+6. Pokud `applied_modules` v requestu: po obdržení výsledku volá `_run_module_outputs()` – pro každý modul importuje `detect`/`get_line`, spustí na OHLC datech a přidá `moduleOutputs` do odpovědi
+7. Parsuje `PROGRESS:10` z stderr → event `progress`
+8. Při chybě: JSON `{"error": "..."}` → event `error`
+9. Streamuje události klientovi přes SSE
+10. Po dokončení smaže `.backtest_run/*.py`
 
 **Engine (`docker/engine.py` – uvnitř kontejneru):**
 
@@ -287,7 +292,13 @@ Backtesting_app/
   "trades": [
     {"date": "...", "entryDate": "...", "exitDate": "...", "type": "buy", "size": 1, "pnl": 150, "entryPrice": 20000, "exitPrice": 20150}
   ],
-  "ohlc": [{"date": "...", "open": 20000, "high": 20100, "low": 19950, "close": 20050}]
+  "ohlc": [{"date": "...", "open": 20000, "high": 20100, "low": 19950, "close": 20050}],
+  "moduleOutputs": {
+    "Swing HL": {
+      "markers": [{"date": "2024-03-12", "type": "high", "value": 20100}, {"date": "2024-03-15", "type": "low", "value": 19950}],
+      "lines": []
+    }
+  }
 }
 ```
 
@@ -301,6 +312,7 @@ Backtesting_app/
 | **Trades** | TradesChart (P/L po obchodech) + TradesTable (všechny obchody) |
 | **Highlight** | TradeHighlight – graf jednoho obchodu (entry–exit + kontext) + seznam obchodů (klik pro detail) |
 | **Detailed** | DetailedChart – candlestick graf s entry/exit značkami pro celé období |
+| **Moduly** | Pro každý použitý modul: Plotly graf OHLC + markery/čáry z `detect`/`get_line` (zobrazí se jen pokud backtest vrací `moduleOutputs`) |
 | **Run history** | RunHistory – tabulka runů + grafy metrik napříč runy |
 
 **Trade Highlight (detail):**
@@ -323,25 +335,31 @@ Backtesting_app/
 
 ---
 
-## 4. Parameter Panel (Strategy Parameters)
+## 4. Parameter Panel (Parameters)
 
-### 4.1 Parsování PARAMS
+### 4.1 Parsování PARAMS a VIEW_PARAMS
 
-- `parseStrategyParams(code)` v `frontend/lib/strategyParams.ts` hledá v kódu `PARAMS = {...}`
+- `parseStrategyParams(code)` v `frontend/lib/strategyParams.ts` hledá v kódu strategie `PARAMS = {...}`
+- `parseViewParams(code)` hledá v kódu modulu/indikátoru `VIEW_PARAMS = {...}`
 - Podporované typy: `number`, `boolean`, `string`
 - Python dict se převádí na JSON (True→true, 'key'→"key", …)
 - Před parsováním se odstraní Python komentáře (`# ...`) – zachová se `#` uvnitř řetězců
 
-### 4.2 Zobrazení v UI
+### 4.2 Zobrazení v UI – záložky
 
-- Collapsible sekce „Strategy Parameters“ v BacktestSettings
+- Collapsible sekce **Parameters** v BacktestSettings
+- **Záložky:** Strategie | [Název modulu 1] | [Název modulu 2] | …
+- **Strategie:** parametry z `PARAMS` strategie
+- **Moduly:** parametry z `VIEW_PARAMS` každého vybraného modulu (vybrané v sekci Moduly)
 - Dynamické inputy podle typu: number → `<input type="number">`, boolean → checkbox, string → text input
-- Při změně strategie se parametry znovu naparsují z `main.py`
+- Při změně strategie se parametry znovu naparsují; při změně výběru modulů se načtou jejich `VIEW_PARAMS`
 
 ### 4.3 Předání do engine
 
-- `params` v `RunRequest` → `STRATEGY_PARAMS` env v Dockeru
-- Engine: `cerebro.addstrategy(TradeRecordingStrategy, **strategy_params)`
+- `params` v `RunRequest` obsahuje:
+  - ploché parametry strategie (`swing_tf`, `hh_count`, …)
+  - vnořený objekt `module_params`: `{"Swing HL": {"timeframe": "1d", "atr_period": 10, …}}`
+- Strategie přijímá `params` včetně `module_params` a předává je modulům (např. `get_swings(ohlc, params)`)
 
 ---
 
@@ -357,7 +375,7 @@ Backtesting_app/
 3. Vybereš instrument, období a modul/indikátor/strategii
 4. Graf se zobrazí s čárami nebo markery z tvého kódu
 
-### 5.2 Rozhraní pro View (detect, get_line)
+### 5.2 Rozhraní pro View (detect, get_line, get_zones)
 
 Modul, indikátor i strategie používají stejné rozhraní:
 
@@ -365,9 +383,11 @@ Modul, indikátor i strategie používají stejné rozhraní:
 |--------|------|-------|
 | `detect(ohlc, params=None)` | Bodové značky (H/L, signály) | `[{"date": "YYYY-MM-DD", "type": "high"\|"low"\|"signal", "value": float}, ...]` |
 | `get_line(ohlc, params=None)` | Čáry (indikátory) | `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}` |
+| `get_zones(ohlc, params=None)` | Zóny/boxy (support, resistance) | `[{"date_start", "date_end", "value_low", "value_high", "fillcolor"?, "name"?}, ...]` |
 
 - **type** u markerů: `"high"` = zelené, `"low"` = červené, `"signal"` = modré
 - **value**: cena (y-ová souřadnice)
+- **zóny**: obdélníky na grafu – `date_start`/`date_end` = časový rozsah, `value_low`/`value_high` = cenový rozsah, `fillcolor` = barva výplně (např. `"rgba(59, 130, 246, 0.2)"`)
 
 ### 5.3 View params panel – dynamické parametry ve View módu
 
@@ -555,9 +575,9 @@ Spustí backtest.
 
 **Query:** `?stream=1` – SSE stream (log, progress, result)
 
-**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy parameters)
+**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů)
 
-**Response (non-stream):** RunResponse (equity, equityCurve, metrics, trades, ohlc)
+**Response (non-stream):** RunResponse (equity, equityCurve, metrics, trades, ohlc, moduleOutputs)
 
 **SSE events (stream=1):**
 - `{"type": "log", "line": "..."}`
@@ -607,6 +627,21 @@ Generuje PNG candlestick grafu s mplfinance.
 3. Pro každý vybraný modul: `modules/{toModuleName(mod.name)}.py` = obsah `main.py` modulu
 
 Uživatel musí v BacktestSettings vybrat indikátory/moduly a kliknout **Potvrdit** před Run.
+
+### Výchozí obsah při vytvoření
+
+Při vytvoření nového indikátoru nebo modulu (`createItem` v `frontend/lib/firestore.ts`) se do `main.py` zapíše výchozí kód s návodem a funkčním příkladem:
+- **Indikátor:** backtrader třída + `get_line` (EMA příklad), `VIEW_PARAMS`, komentáře k rozhraní
+- **Modul:** `detect` (3-bar pivot příklad), `get_line` (prázdný), `VIEW_PARAMS`, komentáře k rozhraní
+
+### Příklad: Swing HL strategie (3× HH / 3× LL)
+
+Strategie `strategies/test/main.py` používá modul Swing HL:
+- **Long** při 3× Higher High (poslední 3 swing highy rostou)
+- **Short** při 3× Lower Low (poslední 3 swing lowy klesají)
+- Parametry: `swing_tf`, `hh_count`, `ll_count` (strategie) + `VIEW_PARAMS` modulu (timeframe, atr_period, …)
+- Modul musí být vybrán v panelu Moduly a potvrzen
+- Po backtestu se v záložce **Moduly** zobrazí graf OHLC + swing markery z `detect()`
 
 ---
 
@@ -675,6 +710,7 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 
 ## 15. Další dokumentace
 
+- **READMEAI.md** – referenční dokument pro AI/boty: architektura, data flow, workflow, API kontrakty, kde provádět změny
 - **SCRIPTS.md** – příkazy, skripty, edge cases
 - **strategies/test/readme.py** – tutoriál psaní strategií (Backtrader API, životní cyklus, příklady)
 - **examples/view_interface.md** – rozhraní pro View (detect, get_line, VIEW_PARAMS)

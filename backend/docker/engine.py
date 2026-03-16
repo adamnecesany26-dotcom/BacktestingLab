@@ -14,6 +14,12 @@ import os
 import sys
 from pathlib import Path
 
+# Add strategy dir to sys.path IMMEDIATELY so "from modules.X" / "from indicators.X" work
+_strategy_path = os.environ.get("STRATEGY_PATH", "/app/strategy/strategy.py")
+_strategy_dir = os.path.dirname(_strategy_path)
+if _strategy_dir and _strategy_dir not in sys.path:
+    sys.path.insert(0, _strategy_dir)
+
 import backtrader as bt
 import pandas as pd
 
@@ -23,6 +29,12 @@ def load_strategy(strategy_path: str):
     path = Path(strategy_path)
     if not path.exists():
         raise FileNotFoundError(f"Strategy not found: {strategy_path}")
+
+    # Add strategy directory to sys.path so "from modules.X" and "from indicators.X" work
+    strategy_dir = path.parent
+    strategy_dir_str = str(strategy_dir.resolve())
+    if strategy_dir_str not in sys.path:
+        sys.path.insert(0, strategy_dir_str)
 
     spec = importlib.util.spec_from_file_location("strategy_module", path)
     module = importlib.util.module_from_spec(spec)
@@ -261,7 +273,7 @@ def run_backtest(
 
     # Fallback: if notify_trade/notify_order didn't capture trades, try strategy's _trades
     if not trades_list and hasattr(strat, "_trades"):
-        for data, trades in strat._trades.items():
+        for _data_feed, trades in strat._trades.items():
             for t in trades:
                 if getattr(t, "isclosed", False):
                     _record_trade(t)
@@ -348,6 +360,11 @@ def run_backtest(
 
 def main():
     strategy_path = os.environ.get("STRATEGY_PATH", "/app/strategy/strategy.py")
+    # Add strategy dir to sys.path FIRST so "from modules.X" / "from indicators.X" work
+    strategy_dir = os.path.dirname(strategy_path)
+    if strategy_dir and strategy_dir not in sys.path:
+        sys.path.insert(0, strategy_dir)
+
     data_path = os.environ.get("DATA_PATH", "/app/data")
     instrument = os.environ.get("INSTRUMENT", "NQ")
     timeframe = os.environ.get("TIMEFRAME", "1d")
@@ -360,6 +377,11 @@ def main():
         strategy_params = {}
 
     try:
+        modules_dir = Path(strategy_dir) / "modules"
+        print(f"[engine] strategy_dir={strategy_dir} sys.path[0]={sys.path[0] if sys.path else '?'} modules_exists={modules_dir.exists()}", file=sys.stderr, flush=True)
+        if modules_dir.exists():
+            for f in modules_dir.iterdir():
+                print(f"[engine] modules/{f.name}", file=sys.stderr, flush=True)
         print("[engine] Loading strategy...", file=sys.stderr, flush=True)
         strategy_cls = load_strategy(strategy_path)
         print("[engine] Loading data...", file=sys.stderr, flush=True)

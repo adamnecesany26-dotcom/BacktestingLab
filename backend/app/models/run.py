@@ -2,9 +2,16 @@
 Request/response models for the /run endpoint.
 """
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
+
+
+class AppliedModule(BaseModel):
+    """Module applied to backtest - for running detect/get_line after run."""
+    id: str
+    name: str
+    params: Optional[dict[str, Any]] = None
 
 
 class RunRequest(BaseModel):
@@ -30,6 +37,8 @@ class RunRequest(BaseModel):
     pip_value: Optional[float] = None
     # Strategy parameters (from PARAMS dict)
     params: Optional[dict] = None
+    # Applied modules for module outputs (markers, lines) after backtest
+    applied_modules: Optional[List[AppliedModule]] = None
 
 
 class Trade(BaseModel):
@@ -77,6 +86,13 @@ class BacktestMetrics(BaseModel):
     rMultiple: Optional[float] = None
 
 
+class ModuleOutput(BaseModel):
+    """Output from module detect/get_line/get_zones."""
+    markers: Optional[List[dict]] = None
+    lines: Optional[List[dict]] = None
+    zones: Optional[List[dict]] = None
+
+
 class RunResponse(BaseModel):
     """Response payload from POST /run."""
     equity: List[float]
@@ -84,3 +100,4 @@ class RunResponse(BaseModel):
     metrics: BacktestMetrics
     trades: List[Trade]
     ohlc: Optional[List[OhlcBar]] = None
+    moduleOutputs: Optional[dict[str, ModuleOutput]] = None

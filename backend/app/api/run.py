@@ -53,6 +53,7 @@ async def run_backtest(request: RunRequest, req: Request):
                     pip_size=request.pip_size,
                     pip_value=request.pip_value,
                     strategy_params=request.params,
+                    applied_modules=request.applied_modules,
                     is_client_connected=is_connected,
                 ):
                     _debug_log.append(f"{ev.get('type')}: {str(ev)[:300]}")
@@ -95,6 +96,7 @@ async def run_backtest(request: RunRequest, req: Request):
             pip_size=request.pip_size,
             pip_value=request.pip_value,
             strategy_params=request.params,
+            applied_modules=request.applied_modules,
         )
         return result
     except Exception as e:

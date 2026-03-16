@@ -83,6 +83,11 @@ def _read_stream_sync(
     threading.Thread(target=run, daemon=True).start()
 
 
+def _to_module_name(name: str) -> str:
+    """Convert module display name to Python module name (e.g. 'Swing HL' -> 'Swing_HL')."""
+    return (name or "module").replace(" ", "_").replace("-", "_").replace(".", "_") or "module"
+
+
 def _merge_strategy_params(
     strategy_params: dict | None,
     instrument_type: str,
@@ -108,14 +113,14 @@ def _merge_strategy_params(
 def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, str] | None) -> str:
     """
     Write strategy files to run_dir. Returns the entry point filename (main.py or strategy.py).
-    Creates indicators/__init__.py when indicators/ subdir is used (for "from indicators.X import Y").
+    Always creates indicators/ and modules/ with __init__.py so "from modules.X" / "from indicators.X"
+    can resolve the package (avoids "No module named 'modules'" when user forgets to select module).
     """
     if files and len(files) > 0:
         for subdir in ("indicators", "modules"):
-            if any(fp.startswith(f"{subdir}/") for fp in files):
-                pkg_dir = run_dir / subdir
-                pkg_dir.mkdir(parents=True, exist_ok=True)
-                (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+            pkg_dir = run_dir / subdir
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
         for file_path, content in files.items():
             full_path = run_dir / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +132,150 @@ def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, st
         (run_dir / "strategy.py").write_text(code, encoding="utf-8")
         return "strategy.py"
     raise ValueError("Either code or files must be provided")
+
+
+def _run_module_outputs(
+    run_dir: Path,
+    ohlc: list[dict],
+    applied_modules: list[dict] | None,
+) -> dict[str, dict]:
+    """
+    Run detect/get_line for each applied module. Returns { module_name: { markers, lines } }.
+    """
+    if not applied_modules or not ohlc:
+        return {}
+
+    import inspect
+    import importlib.util
+    import sys
+
+    import pandas as pd
+
+    df = pd.DataFrame(ohlc)
+    if "date" in df.columns:
+        df["datetime"] = pd.to_datetime(df["date"])
+        df = df.set_index("datetime")
+    elif not df.empty and not hasattr(df.index, "dtype"):
+        pass
+    elif not df.empty and str(getattr(df.index.dtype, "name", "")) != "datetime64[ns]":
+        try:
+            df.index = pd.to_datetime(df.index)
+        except Exception:
+            pass
+
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns and c.capitalize() in df.columns:
+            df[c] = df[c.capitalize()]
+
+    outputs: dict[str, dict] = {}
+    modules_dir = run_dir / "modules"
+    if not modules_dir.exists():
+        return outputs
+
+    sys.path.insert(0, str(run_dir))
+
+    for mod in applied_modules:
+        name = mod.get("name") or ""
+        params = mod.get("params") or {}
+        mod_name = _to_module_name(name)
+        mod_path = modules_dir / f"{mod_name}.py"
+        if not mod_path.exists():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"mod_{mod_name}", mod_path
+            )
+            mod_obj = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod_obj
+            spec.loader.exec_module(mod_obj)
+
+            markers = []
+            lines = []
+            zones = []
+
+            if hasattr(mod_obj, "detect"):
+                try:
+                    sig = inspect.signature(mod_obj.detect)
+                    result = mod_obj.detect(df, params) if len(sig.parameters) >= 2 else mod_obj.detect(df)
+                except (ValueError, TypeError):
+                    result = mod_obj.detect(df)
+                if isinstance(result, list):
+                    for item in result:
+                        if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
+                            markers.append({
+                                "date": str(item["date"])[:10],
+                                "type": str(item["type"]).lower(),
+                                "value": float(item["value"]),
+                            })
+
+            if hasattr(mod_obj, "get_line"):
+                try:
+                    sig = inspect.signature(mod_obj.get_line)
+                    result = mod_obj.get_line(df, params) if len(sig.parameters) >= 2 else mod_obj.get_line(df)
+                except (ValueError, TypeError):
+                    result = mod_obj.get_line(df)
+                if isinstance(result, dict):
+                    for line_name, data in result.items():
+                        pts = []
+                        color = None
+                        if isinstance(data, list):
+                            pts = [
+                                {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
+                                for p in data if isinstance(p, dict)
+                            ]
+                        elif isinstance(data, dict) and "data" in data:
+                            pts = [
+                                {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
+                                for p in data["data"] if isinstance(p, dict)
+                            ]
+                            color = data.get("color")
+                        if pts:
+                            line_obj = {"name": str(line_name), "data": pts}
+                            if color:
+                                line_obj["color"] = str(color)
+                            lines.append(line_obj)
+                elif isinstance(result, list):
+                    pts = [
+                        {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
+                        for p in result if isinstance(p, dict)
+                    ]
+                    if pts:
+                        lines.append({"name": "line", "data": pts})
+
+            if hasattr(mod_obj, "get_zones"):
+                try:
+                    sig = inspect.signature(mod_obj.get_zones)
+                    result = mod_obj.get_zones(df, params) if len(sig.parameters) >= 2 else mod_obj.get_zones(df)
+                except (ValueError, TypeError):
+                    result = mod_obj.get_zones(df)
+                if isinstance(result, list):
+                    for item in result:
+                        if (
+                            isinstance(item, dict)
+                            and "date_start" in item
+                            and "date_end" in item
+                            and "value_low" in item
+                            and "value_high" in item
+                        ):
+                            zones.append({
+                                "date_start": str(item["date_start"])[:10],
+                                "date_end": str(item["date_end"])[:10],
+                                "value_low": float(item["value_low"]),
+                                "value_high": float(item["value_high"]),
+                                "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
+                                "name": str(item["name"]) if item.get("name") else None,
+                            })
+
+            outputs[name] = {"markers": markers, "lines": lines, "zones": zones}
+        except Exception as e:
+            print(f"[runner] Module {name} output error: {e}", flush=True)
+        finally:
+            if f"mod_{mod_name}" in sys.modules:
+                del sys.modules[f"mod_{mod_name}"]
+
+    if str(run_dir) in sys.path:
+        sys.path.remove(str(run_dir))
+    return outputs
 
 
 async def run_strategy_streaming(
@@ -146,6 +295,7 @@ async def run_strategy_streaming(
     pip_size: float | None = None,
     pip_value: float | None = None,
     strategy_params: dict | None = None,
+    applied_modules: list | None = None,
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -235,6 +385,19 @@ async def run_strategy_streaming(
                 continue
             if ev.get("type") == "result":
                 result_data = ev.get("data")
+                if result_data and applied_modules:
+                    ohlc_raw = result_data.get("ohlc", [])
+                    mods = [
+                        {"id": getattr(m, "id", ""), "name": getattr(m, "name", ""), "params": getattr(m, "params", None) or {}}
+                        for m in applied_modules
+                    ]
+                    try:
+                        mo = _run_module_outputs(run_dir, ohlc_raw, mods)
+                        if mo:
+                            result_data["moduleOutputs"] = mo
+                            ev = {"type": "result", "data": result_data}
+                    except Exception as ex:
+                        print(f"[runner] moduleOutputs error: {ex}", flush=True)
             if ev.get("type") == "error":
                 error_msg = ev.get("message")
                 preview = (error_msg or "")[:800]
@@ -299,6 +462,7 @@ async def run_strategy(
     pip_size: float | None = None,
     pip_value: float | None = None,
     strategy_params: dict | None = None,
+    applied_modules: list | None = None,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -319,6 +483,7 @@ async def run_strategy(
         pip_size=pip_size,
         pip_value=pip_value,
         strategy_params=strategy_params,
+        applied_modules=applied_modules,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")
@@ -337,4 +502,5 @@ async def run_strategy(
         metrics=BacktestMetrics(**result_data.get("metrics", {})),
         trades=[Trade(**t) for t in result_data.get("trades", [])],
         ohlc=[OhlcBar(**b) for b in ohlc_raw] if ohlc_raw else None,
+        moduleOutputs=module_outputs,
     )

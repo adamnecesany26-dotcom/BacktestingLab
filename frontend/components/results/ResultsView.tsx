@@ -4,6 +4,7 @@ import { useState } from "react";
 import { EquityChart } from "@/components/charts/EquityChart";
 import { TradesChart } from "@/components/charts/TradesChart";
 import { DetailedChart } from "@/components/charts/DetailedChart";
+import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { TradeHighlight } from "@/components/results/TradeHighlight";
 import { RunHistory } from "@/components/results/RunHistory";
 import { StatBlocks } from "@/components/results/StatBlocks";
@@ -11,7 +12,7 @@ import { TradesTable } from "@/components/results/TradesTable";
 import type { RunResponse } from "@shared/types";
 import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "trades" | "highlight" | "detailed" | "runHistory";
+type TabId = "equity" | "trades" | "highlight" | "detailed" | "modules" | "runHistory";
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -49,11 +50,13 @@ export function ResultsView({
     );
   }
 
+  const hasModuleOutputs = !!results.moduleOutputs && Object.keys(results.moduleOutputs).length > 0;
   const tabs: { id: TabId; label: string }[] = [
     { id: "equity", label: "Equity" },
     { id: "trades", label: "Trades" },
     { id: "highlight", label: "Highlight" },
     { id: "detailed", label: "Detailed" },
+    ...(hasModuleOutputs ? [{ id: "modules" as TabId, label: "Moduly" }] : []),
     { id: "runHistory", label: "Run history" },
   ];
 
@@ -92,7 +95,7 @@ export function ResultsView({
 
       <div
         className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
-          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory"
+          activeTab === "highlight" || activeTab === "detailed" || activeTab === "modules" || activeTab === "runHistory"
             ? "min-h-[560px]"
             : "min-h-[480px]"
         }`}
@@ -133,6 +136,19 @@ export function ResultsView({
         {activeTab === "detailed" && (
           <div className="py-4 h-full overflow-auto">
             <DetailedChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
+          </div>
+        )}
+        {activeTab === "modules" && hasModuleOutputs && results.ohlc && (
+          <div className="py-4 h-full overflow-auto space-y-4">
+            {Object.entries(results.moduleOutputs!).map(([modName, modOut]) => (
+              <ModuleOutputChart
+                key={modName}
+                ohlc={results.ohlc!}
+                moduleName={modName}
+                output={modOut}
+                height={420}
+              />
+            ))}
           </div>
         )}
         {activeTab === "runHistory" && (

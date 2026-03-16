@@ -10,6 +10,7 @@ import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
+import { FaqModal } from "@/components/FaqModal";
 import {
   saveBacktestResult,
   listBacktestResults,
@@ -28,7 +29,7 @@ import {
   type FirestoreItem,
 } from "@/lib/firestore";
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
-import { parseStrategyParams, type StrategyParams } from "@/lib/strategyParams";
+import { parseStrategyParams, parseViewParams, type StrategyParams } from "@/lib/strategyParams";
 import {
   filterInstrumentsByType,
   type RunResponse,
@@ -47,6 +48,7 @@ export default function Home() {
   const [isSaving, setIsSaving] = useState(false);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isAddFileModalOpen, setIsAddFileModalOpen] = useState(false);
+  const [isFaqOpen, setIsFaqOpen] = useState(false);
 
   const [instruments, setInstruments] = useState<DataInstrument[]>([]);
   const [instrumentsLoaded, setInstrumentsLoaded] = useState(false);
@@ -81,6 +83,7 @@ export default function Home() {
   });
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
+  const [moduleParams, setModuleParams] = useState<Record<string, StrategyParams>>({});
   const [results, setResults] = useState<RunResponse | null>(null);
   const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
@@ -186,6 +189,28 @@ export default function Home() {
     });
   }, [openItem?.type, openItem?.id]);
 
+  /** Load VIEW_PARAMS for selected modules */
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies" || selectedModuleIds.length === 0) {
+      setModuleParams({});
+      return;
+    }
+    const load = async () => {
+      const next: Record<string, StrategyParams> = {};
+      for (const modId of selectedModuleIds) {
+        const mod = modules.find((m) => m.id === modId);
+        if (!mod) continue;
+        const content = await getFileContent("modules", modId, "main.py");
+        const params = parseViewParams(content ?? "");
+        if (Object.keys(params).length > 0) {
+          next[mod.name] = params;
+        }
+      }
+      setModuleParams(next);
+    };
+    load();
+  }, [openItem?.type, openItem?.id, selectedModuleIds, modules]);
+
   useEffect(() => {
     getAvailableData()
       .then((d) => {
@@ -202,6 +227,25 @@ export default function Home() {
         setInstrumentsLoaded(true);
       });
   }, []);
+
+  /** Merge strategy params + module_params for run request */
+  const buildMergedParams = useCallback((): Record<string, unknown> | undefined => {
+    const flat: Record<string, unknown> = { ...strategyParams };
+    const mods: Record<string, Record<string, number | boolean | string>> = {};
+    for (const modId of selectedModuleIds) {
+      const mod = modules.find((m) => m.id === modId);
+      if (!mod) continue;
+      const p = moduleParams[mod.name];
+      if (p && Object.keys(p).length > 0) {
+        mods[mod.name] = p;
+      }
+    }
+    if (Object.keys(mods).length > 0) {
+      flat.module_params = mods;
+    }
+    if (Object.keys(flat).length === 0) return undefined;
+    return flat;
+  }, [strategyParams, selectedModuleIds, modules, moduleParams]);
 
   const handleSelectInstrument = (inv: DataInstrument) => {
     setSelectedInstrument(inv);
@@ -347,6 +391,19 @@ export default function Home() {
     addLog("Spouštím backtest...");
 
     try {
+      const appliedModules: { id: string; name: string; params?: Record<string, number | boolean | string> }[] =
+        selectedModuleIds
+          .map((id) => {
+            const mod = modules.find((m) => m.id === id);
+            if (!mod) return null;
+            return {
+              id: mod.id,
+              name: mod.name,
+              params: moduleParams[mod.name],
+            };
+          })
+          .filter((m): m is { id: string; name: string; params?: StrategyParams } => m !== null);
+
       const data = await runBacktestStreaming(
         {
           files: allFiles,
@@ -363,7 +420,8 @@ export default function Home() {
           lot_size: backtestParams.lotSize,
           pip_size: backtestParams.pipSize,
           pip_value: backtestParams.pipValue,
-          params: Object.keys(strategyParams).length > 0 ? strategyParams : undefined,
+          params: buildMergedParams(),
+          applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
         },
         controller.signal,
         (ev) => {
@@ -662,6 +720,13 @@ export default function Home() {
               canRun={openItem?.type === "strategies"}
               strategyParams={strategyParams}
               onStrategyParamsChange={setStrategyParams}
+              moduleParams={moduleParams}
+              onModuleParamsChange={(name, params) =>
+                setModuleParams((prev) => ({ ...prev, [name]: params }))
+              }
+              moduleNamesForParams={selectedModuleIds
+                .map((id) => modules.find((m) => m.id === id)?.name)
+                .filter((n): n is string => !!n)}
             />
           </div>
         </div>
@@ -671,6 +736,17 @@ export default function Home() {
           onToggleMinimize={() => setTerminalMinimized((v) => !v)}
         />
       </div>
+      <button
+        type="button"
+        onClick={() => setIsFaqOpen(true)}
+        className="fixed bottom-6 right-6 w-10 h-10 rounded-full bg-zinc-700 hover:bg-zinc-600 border border-zinc-600 flex items-center justify-center text-zinc-300 hover:text-white shadow-lg transition-colors z-40"
+        aria-label="Časté otázky"
+      >
+        <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z" />
+        </svg>
+      </button>
+      {isFaqOpen && <FaqModal onClose={() => setIsFaqOpen(false)} />}
     </div>
   );
 }
