@@ -13,6 +13,11 @@ const TIMEFRAMES = [
   { label: "3M", years: 0.25 },
   { label: "6M", years: 0.5 },
   { label: "1Y", years: 1 },
+  { label: "2Y", years: 2 },
+  { label: "3Y", years: 3 },
+  { label: "4Y", years: 4 },
+  { label: "5Y", years: 5 },
+  { label: "Max", years: 0 },
 ] as const;
 
 type ViewItemType = "module" | "indicator" | "strategy";
@@ -91,6 +96,10 @@ export function StrategyViewChart({
           const schema = parseViewParams(code);
           setViewParamsSchema(schema);
           const merged: StrategyParams = { ...schema };
+          if ("timeframe" in schema && instruments.length > 0) {
+            const inv = instruments.find((i) => i.file === dataFile);
+            if (inv) merged["timeframe"] = inv.timeframe;
+          }
           const current = viewParamsRef.current;
           for (const k of Object.keys(current)) {
             if (k in schema) merged[k] = current[k];
@@ -113,7 +122,7 @@ export function StrategyViewChart({
     } finally {
       setLoading(false);
     }
-  }, [dataFile, years, selectedItemId, selectedItemType]);
+  }, [dataFile, years, selectedItemId, selectedItemType, instruments]);
 
   useEffect(() => {
     import("react-plotly.js").then((mod) => setPlot(() => mod.default));
@@ -162,7 +171,15 @@ export function StrategyViewChart({
 
   const highMarkers = markers.filter((m) => m.type === "high");
   const lowMarkers = markers.filter((m) => m.type === "low");
-  const otherMarkers = markers.filter((m) => m.type !== "high" && m.type !== "low");
+  const internalHighMarkers = markers.filter((m) => m.type === "internal_high");
+  const internalLowMarkers = markers.filter((m) => m.type === "internal_low");
+  const otherMarkers = markers.filter(
+    (m) =>
+      m.type !== "high" &&
+      m.type !== "low" &&
+      m.type !== "internal_high" &&
+      m.type !== "internal_low"
+  );
 
   const mapMarkerToIndex = (m: ViewMarker) => {
     const idx = dateToIndex.get(m.date.slice(0, 10));
@@ -171,6 +188,12 @@ export function StrategyViewChart({
 
   const highMapped = highMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
   const lowMapped = lowMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
+  const internalHighMapped = internalHighMarkers
+    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
+    .filter((p) => p.idx >= 0);
+  const internalLowMapped = internalLowMarkers
+    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
+    .filter((p) => p.idx >= 0);
   const otherMapped = otherMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
 
   const highTrace: any = {
@@ -202,6 +225,42 @@ export function StrategyViewChart({
     name: "Low",
     showlegend: lowMarkers.length > 0,
   };
+
+  const internalHighTrace: any =
+    internalHighMapped.length > 0
+      ? {
+          type: "scatter",
+          x: internalHighMapped.map((p) => p.idx),
+          y: internalHighMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 4,
+            color: "#6ee7b7",
+            symbol: "circle",
+            line: { color: "#10b981", width: 0.5 },
+          },
+          name: "Internal High",
+          showlegend: true,
+        }
+      : null;
+
+  const internalLowTrace: any =
+    internalLowMapped.length > 0
+      ? {
+          type: "scatter",
+          x: internalLowMapped.map((p) => p.idx),
+          y: internalLowMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 4,
+            color: "#fca5a5",
+            symbol: "circle",
+            line: { color: "#ef4444", width: 0.5 },
+          },
+          name: "Internal Low",
+          showlegend: true,
+        }
+      : null;
 
   const otherTrace: any =
     otherMapped.length > 0
@@ -275,6 +334,8 @@ export function StrategyViewChart({
   const traces: any[] = [candlestickTrace];
   if (highMarkers.length > 0) traces.push(highTrace);
   if (lowMarkers.length > 0) traces.push(lowTrace);
+  if (internalHighTrace) traces.push(internalHighTrace);
+  if (internalLowTrace) traces.push(internalLowTrace);
   if (otherTrace) traces.push(otherTrace);
   traces.push(...lineTraces);
 
