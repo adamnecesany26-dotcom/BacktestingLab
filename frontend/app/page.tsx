@@ -44,6 +44,7 @@ export default function Home() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState("");
   const [lastSavedContent, setLastSavedContent] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isAddFileModalOpen, setIsAddFileModalOpen] = useState(false);
 
@@ -267,17 +268,27 @@ export default function Home() {
 
   const handleSaveFile = async () => {
     if (!openItem || !selectedFile) return;
-    if (selectedFile.startsWith("indicator:")) {
-      const id = selectedFile.replace("indicator:", "");
-      await saveFile("indicators", id, "main.py", fileContent);
-      addLog(`Uloženo: indikátor ${indicators.find((i) => i.id === id)?.name ?? id}`);
-    } else if (selectedFile.startsWith("module:")) {
-      const id = selectedFile.replace("module:", "");
-      await saveFile("modules", id, "main.py", fileContent);
-      addLog(`Uloženo: modul ${modules.find((m) => m.id === id)?.name ?? id}`);
-    } else {
-      await saveFile(openItem.type, openItem.id, selectedFile, fileContent);
-      addLog(`Uloženo: ${selectedFile}`);
+    const prevSaved = lastSavedContent;
+    setLastSavedContent(fileContent);
+    setIsSaving(true);
+    try {
+      if (selectedFile.startsWith("indicator:")) {
+        const id = selectedFile.replace("indicator:", "");
+        await saveFile("indicators", id, "main.py", fileContent);
+        addLog(`Uloženo: indikátor ${indicators.find((i) => i.id === id)?.name ?? id}`);
+      } else if (selectedFile.startsWith("module:")) {
+        const id = selectedFile.replace("module:", "");
+        await saveFile("modules", id, "main.py", fileContent);
+        addLog(`Uloženo: modul ${modules.find((m) => m.id === id)?.name ?? id}`);
+      } else {
+        await saveFile(openItem.type, openItem.id, selectedFile, fileContent);
+        addLog(`Uloženo: ${selectedFile}`);
+      }
+    } catch (e) {
+      setLastSavedContent(prevSaved);
+      addLog(`Chyba při ukládání: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setIsSaving(false);
     }
   };
 
@@ -499,14 +510,14 @@ export default function Home() {
           <>
             <button
               onClick={handleSaveFile}
-              disabled={fileContent === lastSavedContent}
+              disabled={fileContent === lastSavedContent || isSaving}
               className={`px-4 py-2 rounded-lg text-sm ${
-                fileContent === lastSavedContent
+                fileContent === lastSavedContent && !isSaving
                   ? "bg-zinc-800 text-zinc-500 cursor-default"
                   : "bg-zinc-700 hover:bg-zinc-600"
               }`}
             >
-              {fileContent === lastSavedContent ? "Uloženo" : "Uložit"}
+              {isSaving ? "Ukládám…" : fileContent === lastSavedContent ? "Uloženo" : "Uložit"}
             </button>
             <button
               onClick={() => setViewMode((v) => !v)}

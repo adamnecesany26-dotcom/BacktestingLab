@@ -31,12 +31,12 @@ ATR_FLOOR = 0.0001
 MIN_THRESHOLD_ATR_RATIO = 0.3
 
 TF_CONFIG = {
-    "1m": {"atr_period": 60, "min_bars_between_swings": 12, "window_bars": 2000},
-    "5m": {"atr_period": 40, "min_bars_between_swings": 8, "window_bars": 1000},
-    "15m": {"atr_period": 28, "min_bars_between_swings": 6, "window_bars": 500},
-    "1h": {"atr_period": 20, "min_bars_between_swings": 5, "window_bars": 360},
-    "4h": {"atr_period": 14, "min_bars_between_swings": 4, "window_bars": 180},
-    "1d": {"atr_period": 10, "min_bars_between_swings": 4, "window_bars": 120},
+    "1m": {"atr_period": 60, "min_bars_between_swings": 12, "window_bars": 2000, "max_bars": 7500},
+    "5m": {"atr_period": 40, "min_bars_between_swings": 8, "window_bars": 1000, "max_bars": 1500},
+    "15m": {"atr_period": 28, "min_bars_between_swings": 6, "window_bars": 500, "max_bars": 500},
+    "1h": {"atr_period": 20, "min_bars_between_swings": 5, "window_bars": 360, "max_bars": 360},
+    "4h": {"atr_period": 14, "min_bars_between_swings": 4, "window_bars": 180, "max_bars": 90},
+    "1d": {"atr_period": 10, "min_bars_between_swings": 4, "window_bars": 120, "max_bars": 180},
 }
 
 VIEW_PARAMS = {
@@ -44,6 +44,7 @@ VIEW_PARAMS = {
     "atr_period": 10,
     "atr_multiplier": 1.2,
     "min_bars_between_swings": 3,
+    "max_bars": 180,
     "max_candidate_bars": 0,
     "allow_unconfirmed_last_swing": True,
     "min_pullback_atr_ratio": 0.4,
@@ -390,10 +391,13 @@ def get_swings(
 ) -> list[dict]:
     """
     Detekce Swing High a Swing Low - candidate -> replacement -> confirmation -> locked.
-    Pri window_bars > 0 a delce dat > window_bars zpracuje data v prekryvajících se oknech.
+
+    Pri len(ohlc) > max_bars pouziva rolling window: kazde okno = poslednich max_bars baru,
+    swingy se sbiraji a deduplikuji. Umoznuje spolehlive zobrazeni na cele periode (View 2Y+).
 
     params["timeframe"]: "1m"|"5m"|"15m"|"1h"|"4h"|"1d" - skalovani parametru podle TF.
-    params["include_internals"]: True -> vrati {"swings": [...], "internals": [...]}, internals = pivoty mimo swingy.
+    params["max_bars"]: max. baru v jednom okne (pro 1d doporuceno 180 = 6M).
+    params["include_internals"]: True -> vrati {"swings": [...], "internals": [...]}.
 
     Strategie: swings = get_swings(ohlc, {"timeframe": params.get("swing_tf", "1d")})
 
@@ -405,50 +409,44 @@ def get_swings(
     base = TF_CONFIG.get(tf, TF_CONFIG["1d"])
     params = {**base, **params}
 
-    window_bars = int(params.get("window_bars", 0))
+    max_bars = int(params.get("max_bars", 0))
     atr_period = int(params.get("atr_period", 10))
     min_bars = max(int(params.get("min_bars_between_swings", 4)), 2)
 
     if ohlc is None or len(ohlc) < atr_period + 2:
         return {"swings": [], "internals": []} if include_internals else []
 
-    if window_bars <= 0 or len(ohlc) <= window_bars:
+    if max_bars <= 0 or len(ohlc) <= max_bars:
         swings, _ = _get_swings_core(ohlc, params)
         if include_internals:
             return _add_internals(swings, ohlc)
         return swings
 
-    atr_period_val = int(params.get("atr_period", 10))
-    overlap = max(2 * atr_period_val, 2 * min_bars, window_bars // 3)
-    stride = max(1, window_bars - overlap)
     all_swings: list[dict] = []
-    initial_state: dict | None = None
-
-    start = 0
-    while start < len(ohlc):
-        end = min(start + window_bars, len(ohlc))
-        window_df = ohlc.iloc[start:end]
-        if len(window_df) < atr_period + 2:
-            break
-        swings, final_state = _get_swings_core(window_df, params, initial_state)
-        if final_state:
-            last_global_idx = start + final_state["last_swing_idx"]
-            next_start = start + stride
-            computed_idx = last_global_idx - next_start
-            initial_state = {
-                "last_swing_type": final_state["last_swing_type"],
-                "last_swing_idx": max(-min_bars, computed_idx),
-                "last_swing_price": final_state["last_swing_price"],
-            }
-        else:
-            initial_state = None
+    stride = max(1, max_bars // 10)
+    seen_ends: set[int] = set()
+    for i in range(max_bars, len(ohlc) + 1, stride):
+        window = ohlc.iloc[i - max_bars : i]
+        if len(window) < atr_period + 2:
+            continue
+        swings, _ = _get_swings_core(window, params)
+        offset = i - max_bars
         for s in swings:
             s = dict(s)
-            s["index"] = start + s["index"]
+            s["index"] = s["index"] + offset
+            s["timestamp"] = ohlc.index[s["index"]]
             all_swings.append(s)
-        if end >= len(ohlc):
-            break
-        start += stride
+        seen_ends.add(i)
+    if len(ohlc) > max_bars and len(ohlc) not in seen_ends:
+        window = ohlc.iloc[-max_bars:]
+        if len(window) >= atr_period + 2:
+            swings, _ = _get_swings_core(window, params)
+            offset = len(ohlc) - max_bars
+            for s in swings:
+                s = dict(s)
+                s["index"] = s["index"] + offset
+                s["timestamp"] = ohlc.index[s["index"]]
+                all_swings.append(s)
 
     atr_series = _compute_atr(ohlc, atr_period)
     swings = _deduplicate_swings(all_swings, ohlc, atr_series)
@@ -457,11 +455,40 @@ def get_swings(
     return swings
 
 
+def _confirm_internal_by_next_candle(ohlc: pd.DataFrame, pivot: dict) -> bool:
+    """
+    Pravidlo: po internal High musi nasledujici svicka byt bearish nebo mit velmi male telo.
+    Po internal Low musi byt bullish nebo mit velmi male telo.
+    """
+    i = pivot["index"]
+    if i + 1 >= len(ohlc):
+        return False
+    open_ = float(ohlc["open"].iloc[i + 1])
+    close = float(ohlc["close"].iloc[i + 1])
+    body = abs(close - open_)
+    atr_period = 10
+    if len(ohlc) >= atr_period + 2:
+        atr = _compute_atr(ohlc, atr_period)
+        atr_val = max(float(atr.iloc[i + 1]), ATR_FLOOR)
+        small_body_threshold = atr_val * 0.15
+    else:
+        small_body_threshold = body + 1
+    is_small_body = body <= small_body_threshold
+    if pivot["type"] == "high":
+        return close < open_ or is_small_body
+    else:
+        return close > open_ or is_small_body
+
+
 def _add_internals(swings: list[dict], ohlc: pd.DataFrame) -> dict:
     """Pivot body, ktere nejsou na miste swingu. Vraci {"swings": [...], "internals": [...]}."""
     pivots = _get_pivot_points(ohlc)
     swing_keys = {(s["index"], s["type"]) for s in swings}
-    internals = [p for p in pivots if (p["index"], p["type"]) not in swing_keys]
+    internals = [
+        p
+        for p in pivots
+        if (p["index"], p["type"]) not in swing_keys and _confirm_internal_by_next_candle(ohlc, p)
+    ]
     return {"swings": swings, "internals": internals}
 
 

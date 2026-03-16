@@ -43,7 +43,7 @@ export function StrategyViewChart({
   defaultDataFile = "mock/NQ_5Y.csv",
   initialItemId,
   initialItemType,
-  height = 520,
+  height = 720,
 }: StrategyViewChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [ohlc, setOhlc] = useState<OhlcBar[]>([]);
