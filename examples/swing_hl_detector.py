@@ -1,27 +1,36 @@
 # -*- coding: utf-8 -*-
 """
-Swing High / Low Detector - samostatny modul pro detekci swing bodu.
+Swing High / Low Detector - samostatny modul pro detekci swing bodu, BOS a CHoCH.
 
 Pouziti v aplikaci:
 1. Vytvor modul (napr. "Swing HL") v sekci Moduly
 2. Zkopiruj tento kod do main.py modulu
 3. Uloz
 4. Ve View: vyber modul, ikona params - uprav parametry
-5. Ve strategii: from modules.Swing_HL import detect, get_swings  (nazev podle jmena modulu v app)
+5. Ve strategii: from modules.Swing_HL import detect, get_swings, get_bos  (nazev podle jmena modulu v app)
 
 Interface pro View:
-  detect(ohlc, params=None) -> [{"date": "YYYY-MM-DD", "type": "high"|"low", "value": float}, ...]
+  detect(ohlc, params=None) -> [{"date", "type": "high"|"low"|"major_high"|"major_low"|"internal_*", "value"}, ...]
+  get_line(ohlc, params=None) -> {"Trend": {"data": [...], "segments": [{"from","to","color"}, ...]}}
+    Trendová čára nad cenou. Score -100..+100 z Alignment (EMA), Slope, Position, Structure.
+  get_zones(ohlc, params=None) -> [{"date_start","date_end","value_low","value_high","fillcolor","name":"BOS"}, ...]
+    Čára od Swing H/L k místu BOS, oranžová, nápis uprostřed.
 
 Interface pro strategii/indikator:
-  get_swings(ohlc, params=None) -> [{"type": "high"|"low", "price": float, "index": int, "timestamp": ...}, ...]
+  get_swings(ohlc, params=None) -> [{"type","price","index","timestamp"}, ...]
+  get_major_swings(ohlc, params=None) -> [{"type":"major_high"|"major_low","price","index","timestamp"}, ...]
+  get_bos(ohlc, params=None) -> [{"swing_index","swing_date","bos_index","bos_date","level","type":"bos_bullish"|"bos_bearish"}, ...]
+  get_trend(ohlc, params=None) -> {"score": [float,...], "state": [str,...]}
+    Trend -100..+100, state: STRONG_BULL|WEAK_BULL|RANGE|WEAK_BEAR|STRONG_BEAR.
+    Strategie: trend = get_trend(ohlc, params); if trend["score"][i] >= trend_min_long: ...
 
-  Strategie predava timeframe pro skalovani parametru:
-    import os
-    tf = params.get("swing_tf", os.environ.get("TIMEFRAME", "1d"))
-    swings = get_swings(ohlc, {"timeframe": tf})
+TREND_PARAMS – doporučené parametry pro strategie (merge do PARAMS při doladění po runu):
+  trend_min_long, trend_max_short, trend_filter_enabled, trend_require_strong, ...
 
-Algoritmus: candidate -> replacement -> confirmation (ATR) -> locked.
-Vylepseni: zpracovani v oknech (window_bars), single candidate, ATR floor, inferred min_pullback.
+BOS (Break of Structure): close nad posledním swing high nebo pod posledním swing low.
+Následující 1 svíčka nesmí uzavřít zpět pod/přes tuto úroveň.
+
+Algoritmus swingu: candidate -> replacement -> confirmation (ATR) -> locked.
 """
 
 import pandas as pd
@@ -30,13 +39,34 @@ from typing import Any
 ATR_FLOOR = 0.0001
 MIN_THRESHOLD_ATR_RATIO = 0.3
 
+# Min. timeframe pro jednotlivé funkce
+MIN_TF_SWING = "5m"
+MIN_TF_BOS = "1m"
+MIN_TF_TREND = "30m"
+
+TF_FINE_TO_COARSE = {  # minuty pro porovnání
+    "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440,
+    "1w": 10080, "1M": 43200,
+}
+TF_TO_PANDAS = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "4h": "4h", "1d": "1D", "1w": "1W", "1M": "1ME",
+}
+TF_MAJOR_UP = {
+    "1m": "5m", "5m": "15m", "15m": "1h", "30m": "1h", "1h": "4h", "4h": "1d",
+    "1d": "1w", "1w": "1M", "1M": None,
+}
+
 TF_CONFIG = {
     "1m": {"atr_period": 60, "min_bars_between_swings": 12, "window_bars": 2000, "max_bars": 7500},
     "5m": {"atr_period": 40, "min_bars_between_swings": 8, "window_bars": 1000, "max_bars": 1500},
     "15m": {"atr_period": 28, "min_bars_between_swings": 6, "window_bars": 500, "max_bars": 500},
+    "30m": {"atr_period": 24, "min_bars_between_swings": 6, "window_bars": 360, "max_bars": 360},
     "1h": {"atr_period": 20, "min_bars_between_swings": 5, "window_bars": 360, "max_bars": 360},
     "4h": {"atr_period": 14, "min_bars_between_swings": 4, "window_bars": 180, "max_bars": 90},
     "1d": {"atr_period": 10, "min_bars_between_swings": 4, "window_bars": 120, "max_bars": 180},
+    "1w": {"atr_period": 8, "min_bars_between_swings": 4, "window_bars": 80, "max_bars": 52},
+    "1M": {"atr_period": 6, "min_bars_between_swings": 3, "window_bars": 48, "max_bars": 24},
 }
 
 VIEW_PARAMS = {
@@ -51,14 +81,88 @@ VIEW_PARAMS = {
     "sensitivity": 1.2,
     "window_bars": 120,
     "include_internals": False,
+    # BOS (Break of Structure) – close nad/pod posledním swing H/L, 1 bar acceptance
+    "acceptance_bars": 1,
+    # Trend detection – EMA-based scoring (-100 to +100)
+    "ema_fast": 9,
+    "ema_medium": 21,
+    "ema_slow": 50,
+    "trend_line_ema_period": 150,
+    "structure_lookback_swings": 4,
+    "trend_score_smooth_period": 8,
 }
+
+# Pro strategie používající get_trend – merge do PARAMS při doladění po runu
+TREND_PARAMS = {
+    "trend_min_long": 30,
+    "trend_max_short": -30,
+    "trend_filter_enabled": True,
+    "trend_require_strong": False,
+    "trend_smooth_period": 8,
+}
+
+
+def _infer_data_timeframe(ohlc: pd.DataFrame) -> str | None:
+    """Odhadne timeframe z časových rozestupů mezi bary."""
+    if ohlc is None or len(ohlc) < 2:
+        return None
+    idx = ohlc.index
+    diffs = pd.Series(idx).diff().dropna()
+    if len(diffs) == 0:
+        return None
+    median_td = diffs.median()
+    minutes = median_td.total_seconds() / 60
+    if minutes <= 1.5:
+        return "1m"
+    if minutes <= 7:
+        return "5m"
+    if minutes <= 22:
+        return "15m"
+    if minutes <= 45:
+        return "30m"
+    if minutes <= 90:
+        return "1h"
+    if minutes <= 300:
+        return "4h"
+    return "1d"
+
+
+def _resample_ohlc(ohlc: pd.DataFrame, target_tf: str, data_tf: str | None = None) -> pd.DataFrame:
+    """Resample OHLC na target_tf. Pouze na hrubší TF."""
+    if ohlc is None or len(ohlc) == 0:
+        return ohlc
+    target = target_tf.lower()
+    if target not in TF_TO_PANDAS:
+        return ohlc
+    src_tf = data_tf or _infer_data_timeframe(ohlc)
+    if src_tf and TF_FINE_TO_COARSE.get(target, 0) <= TF_FINE_TO_COARSE.get(src_tf, 0):
+        return ohlc
+    rule = TF_TO_PANDAS[target]
+    high_col = "high" if "high" in ohlc.columns else "High"
+    low_col = "low" if "low" in ohlc.columns else "Low"
+    open_col = "open" if "open" in ohlc.columns else "Open"
+    close_col = "close" if "close" in ohlc.columns else "Close"
+    agg = {open_col: "first", high_col: "max", low_col: "min", close_col: "last"}
+    if "volume" in ohlc.columns:
+        agg["volume"] = "sum"
+    return ohlc.resample(rule).agg(agg).dropna(how="all")
+
+
+def _ensure_min_tf(ohlc: pd.DataFrame, min_tf: str, tf_param: str, data_tf_param: str | None) -> pd.DataFrame:
+    """Resample na min_tf pokud je TF param jemnější."""
+    tf = str(tf_param or "1d").lower()
+    min_minutes = TF_FINE_TO_COARSE.get(min_tf, 0)
+    tf_minutes = TF_FINE_TO_COARSE.get(tf, 1440)
+    if tf_minutes >= min_minutes:
+        return ohlc
+    return _resample_ohlc(ohlc, min_tf, data_tf_param or _infer_data_timeframe(ohlc))
 
 
 def _compute_atr(ohlc: pd.DataFrame, period: int) -> pd.Series:
     """ATR - Average True Range."""
-    high = ohlc["high"]
-    low = ohlc["low"]
-    close = ohlc["close"]
+    high = ohlc["high"] if "high" in ohlc.columns else ohlc["High"]
+    low = ohlc["low"] if "low" in ohlc.columns else ohlc["Low"]
+    close = ohlc["close"] if "close" in ohlc.columns else ohlc["Close"]
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
@@ -385,6 +489,17 @@ def _get_swings_core(
     return swings, final_state
 
 
+def _map_swing_index_to_original(swing: dict, original_index: pd.DatetimeIndex) -> int:
+    """Mapuje swing index z resampled na original ohlc podle timestampu."""
+    ts = swing.get("timestamp")
+    if ts is None:
+        return swing.get("index", 0)
+    idx = original_index.searchsorted(ts, side="left")
+    if idx >= len(original_index):
+        idx = len(original_index) - 1
+    return int(idx)
+
+
 def get_swings(
     ohlc: pd.DataFrame,
     params: dict | None = None,
@@ -395,7 +510,9 @@ def get_swings(
     Pri len(ohlc) > max_bars pouziva rolling window: kazde okno = poslednich max_bars baru,
     swingy se sbiraji a deduplikuji. Umoznuje spolehlive zobrazeni na cele periode (View 2Y+).
 
-    params["timeframe"]: "1m"|"5m"|"15m"|"1h"|"4h"|"1d" - skalovani parametru podle TF.
+    params["timeframe"]: "1m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - skalovani parametru podle TF.
+    params["data_timeframe"]: TF vstupnich dat (odhadne se z dat, pokud chybi).
+    Swing H/L: min. 5m – pri jemnejsim TF se data resampluji.
     params["max_bars"]: max. baru v jednom okne (pro 1d doporuceno 180 = 6M).
     params["include_internals"]: True -> vrati {"swings": [...], "internals": [...]}.
 
@@ -405,28 +522,51 @@ def get_swings(
     """
     params = dict(params or {})
     tf = str(params.pop("timeframe", "1d")).lower()
+    data_tf = params.pop("data_timeframe", None)
     include_internals = params.pop("include_internals", False)
-    base = TF_CONFIG.get(tf, TF_CONFIG["1d"])
+
+    original_ohlc = ohlc
+    work_ohlc = _ensure_min_tf(ohlc, MIN_TF_SWING, tf, data_tf)
+    work_tf = MIN_TF_SWING if work_ohlc is not ohlc else tf
+    base = TF_CONFIG.get(work_tf, TF_CONFIG["1d"])
     params = {**base, **params}
 
     max_bars = int(params.get("max_bars", 0))
     atr_period = int(params.get("atr_period", 10))
     min_bars = max(int(params.get("min_bars_between_swings", 4)), 2)
 
-    if ohlc is None or len(ohlc) < atr_period + 2:
+    if work_ohlc is None or len(work_ohlc) < atr_period + 2:
         return {"swings": [], "internals": []} if include_internals else []
 
-    if max_bars <= 0 or len(ohlc) <= max_bars:
-        swings, _ = _get_swings_core(ohlc, params)
+    def _map_swings_to_original(sws: list[dict]) -> list[dict]:
+        if work_ohlc is original_ohlc:
+            return sws
+        out = []
+        orig_idx = original_ohlc.index
+        for s in sws:
+            s = dict(s)
+            s["index"] = _map_swing_index_to_original(s, orig_idx)
+            out.append(s)
+        return out
+
+    maj_params = {"timeframe": work_tf, "data_timeframe": data_tf, **params}
+    major_swings = get_major_swings(original_ohlc, maj_params)
+
+    if max_bars <= 0 or len(work_ohlc) <= max_bars:
+        swings, _ = _get_swings_core(work_ohlc, params)
+        swings = _map_swings_to_original(swings)
+        atr_series = _compute_atr(work_ohlc, atr_period)
+        swings = _deduplicate_swings(swings, original_ohlc, atr_series)
+        swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
         if include_internals:
-            return _add_internals(swings, ohlc)
+            return _add_internals(swings, original_ohlc, major_swings)
         return swings
 
     all_swings: list[dict] = []
     stride = max(1, max_bars // 10)
     seen_ends: set[int] = set()
-    for i in range(max_bars, len(ohlc) + 1, stride):
-        window = ohlc.iloc[i - max_bars : i]
+    for i in range(max_bars, len(work_ohlc) + 1, stride):
+        window = work_ohlc.iloc[i - max_bars : i]
         if len(window) < atr_period + 2:
             continue
         swings, _ = _get_swings_core(window, params)
@@ -434,25 +574,75 @@ def get_swings(
         for s in swings:
             s = dict(s)
             s["index"] = s["index"] + offset
-            s["timestamp"] = ohlc.index[s["index"]]
+            s["timestamp"] = work_ohlc.index[s["index"]]
             all_swings.append(s)
         seen_ends.add(i)
-    if len(ohlc) > max_bars and len(ohlc) not in seen_ends:
-        window = ohlc.iloc[-max_bars:]
+    if len(work_ohlc) > max_bars and len(work_ohlc) not in seen_ends:
+        window = work_ohlc.iloc[-max_bars:]
         if len(window) >= atr_period + 2:
             swings, _ = _get_swings_core(window, params)
-            offset = len(ohlc) - max_bars
+            offset = len(work_ohlc) - max_bars
             for s in swings:
                 s = dict(s)
                 s["index"] = s["index"] + offset
-                s["timestamp"] = ohlc.index[s["index"]]
+                s["timestamp"] = work_ohlc.index[s["index"]]
                 all_swings.append(s)
 
-    atr_series = _compute_atr(ohlc, atr_period)
-    swings = _deduplicate_swings(all_swings, ohlc, atr_series)
+    all_swings = _map_swings_to_original(all_swings)
+    atr_series = _compute_atr(work_ohlc, atr_period)
+    swings = _deduplicate_swings(all_swings, original_ohlc, atr_series)
+    swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
     if include_internals:
-        return _add_internals(swings, ohlc)
+        return _add_internals(swings, original_ohlc, major_swings)
     return swings
+
+
+def get_major_swings(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
+    """
+    Major Swing H/L – swingy na vyšším TF (5m->15m, 15m->1h, atd.).
+    Stejná logika jako get_swings, ale na resamplovaných datech.
+    Vrací [{"type":"major_high"|"major_low","price","index","timestamp"}, ...].
+    """
+    params = dict(params or {})
+    tf = str(params.get("timeframe", "1d")).lower()
+    data_tf = params.get("data_timeframe")
+    major_tf = TF_MAJOR_UP.get(tf)
+    if not major_tf or major_tf not in TF_CONFIG:
+        return []
+
+    resampled = _resample_ohlc(ohlc, major_tf, data_tf or _infer_data_timeframe(ohlc))
+    if resampled is ohlc or resampled is None or len(resampled) < 10:
+        return []
+
+    base = TF_CONFIG[major_tf]
+    maj_params = {**base, **params}
+    maj_params["timeframe"] = major_tf
+    swings, _ = _get_swings_core(resampled, maj_params)
+    orig_idx = ohlc.index
+    out = []
+    for s in swings:
+        idx = _map_swing_index_to_original(s, orig_idx)
+        out.append({
+            "type": f"major_{s['type']}",
+            "price": s["price"],
+            "index": idx,
+            "timestamp": ohlc.index[idx] if idx < len(ohlc) else s.get("timestamp"),
+        })
+    return sorted(out, key=lambda x: x["index"])
+
+
+def _swing_overlaps_major(swing: dict, major_swings: list[dict]) -> bool:
+    """True pokud swing je na stejném místě jako nějaký Major (v toleranci)."""
+    if not major_swings:
+        return False
+    base_type = swing["type"]
+    maj_type = "major_high" if base_type == "high" else "major_low"
+    for m in major_swings:
+        if m["type"] != maj_type:
+            continue
+        if abs(swing["index"] - m["index"]) <= MAJOR_SWING_INDEX_TOLERANCE:
+            return True
+    return False
 
 
 def _confirm_internal_by_next_candle(ohlc: pd.DataFrame, pivot: dict) -> bool:
@@ -480,20 +670,37 @@ def _confirm_internal_by_next_candle(ohlc: pd.DataFrame, pivot: dict) -> bool:
         return close > open_ or is_small_body
 
 
-def _add_internals(swings: list[dict], ohlc: pd.DataFrame) -> dict:
-    """Pivot body, ktere nejsou na miste swingu. Vraci {"swings": [...], "internals": [...]}."""
+def _pivot_overlaps_major(pivot: dict, major_swings: list[dict] | None) -> bool:
+    """True pokud pivot je v toleranci Major swingu stejného typu."""
+    if not major_swings:
+        return False
+    base_type = pivot["type"]
+    maj_type = "major_high" if base_type == "high" else "major_low"
+    for m in major_swings:
+        if m["type"] != maj_type:
+            continue
+        if abs(pivot["index"] - m["index"]) <= MAJOR_SWING_INDEX_TOLERANCE:
+            return True
+    return False
+
+
+def _add_internals(swings: list[dict], ohlc: pd.DataFrame, major_swings: list[dict] | None = None) -> dict:
+    """Pivot body, ktere nejsou na miste swingu ani Major. Vraci {"swings": [...], "internals": [...]}."""
     pivots = _get_pivot_points(ohlc)
     swing_keys = {(s["index"], s["type"]) for s in swings}
     internals = [
         p
         for p in pivots
-        if (p["index"], p["type"]) not in swing_keys and _confirm_internal_by_next_candle(ohlc, p)
+        if (p["index"], p["type"]) not in swing_keys
+        and not _pivot_overlaps_major(p, major_swings)
+        and _confirm_internal_by_next_candle(ohlc, p)
     ]
     return {"swings": swings, "internals": internals}
 
 
 DEDUP_INDEX_TOLERANCE = 2
 DEDUP_PRICE_ATR_TOLERANCE = 0.5
+MAJOR_SWING_INDEX_TOLERANCE = 3
 
 
 def _deduplicate_swings(
@@ -534,10 +741,400 @@ def _deduplicate_swings(
     return sorted(result, key=lambda x: x["index"])
 
 
+def _get_last_swing_high(swings: list[dict], up_to_index: int) -> tuple[float | None, int | None]:
+    """Poslední swing high před indexem. Vrací (price, index)."""
+    before = [s for s in swings if s["type"] == "high" and s["index"] < up_to_index]
+    if not before:
+        return None, None
+    s = max(before, key=lambda x: x["index"])
+    return s["price"], s["index"]
+
+
+def _get_last_swing_low(swings: list[dict], up_to_index: int) -> tuple[float | None, int | None]:
+    """Poslední swing low před indexem. Vrací (price, index)."""
+    before = [s for s in swings if s["type"] == "low" and s["index"] < up_to_index]
+    if not before:
+        return None, None
+    s = max(before, key=lambda x: x["index"])
+    return s["price"], s["index"]
+
+
+def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict]:
+    """
+    BOS = Break of Structure – close nad posledním swing high nebo pod posledním swing low.
+    Následující 1 svíčka nesmí uzavřít zpět pod/přes tuto úroveň.
+    Vrací: swing_index, swing_date, bos_index, bos_date, level
+    """
+    params = params or {}
+    accept_bars = int(params.get("acceptance_bars", 1))
+
+    close_col = ohlc["close"] if "close" in ohlc.columns else ohlc["Close"]
+    index = ohlc.index
+
+    results: list[dict] = []
+    consumed_swing_highs: set[int] = set()
+    consumed_swing_lows: set[int] = set()
+
+    for i in range(1, len(ohlc) - accept_bars):
+        close = float(close_col.iloc[i])
+
+        # Bullish BOS: close nad posledním swing high (jen pokud tento swing ještě nebyl zlomen)
+        level_high, swing_idx_high = _get_last_swing_high(swings, i)
+        if (
+            level_high is not None
+            and swing_idx_high is not None
+            and swing_idx_high not in consumed_swing_highs
+            and close > level_high
+        ):
+            ok = True
+            for j in range(1, accept_bars + 1):
+                if i + j >= len(ohlc):
+                    break
+                cj = float(close_col.iloc[i + j])
+                if cj < level_high:
+                    ok = False
+                    break
+            if ok:
+                results.append({
+                    "swing_index": swing_idx_high,
+                    "swing_date": _to_date_str(index[swing_idx_high]),
+                    "bos_index": i,
+                    "bos_date": _to_date_str(index[i]),
+                    "level": level_high,
+                    "type": "bos_bullish",
+                })
+                consumed_swing_highs.add(swing_idx_high)
+
+        # Bearish BOS: close pod posledním swing low (jen pokud tento swing ještě nebyl zlomen)
+        level_low, swing_idx_low = _get_last_swing_low(swings, i)
+        if (
+            level_low is not None
+            and swing_idx_low is not None
+            and swing_idx_low not in consumed_swing_lows
+            and close < level_low
+        ):
+            ok = True
+            for j in range(1, accept_bars + 1):
+                if i + j >= len(ohlc):
+                    break
+                cj = float(close_col.iloc[i + j])
+                if cj > level_low:
+                    ok = False
+                    break
+            if ok:
+                results.append({
+                    "swing_index": swing_idx_low,
+                    "swing_date": _to_date_str(index[swing_idx_low]),
+                    "bos_index": i,
+                    "bos_date": _to_date_str(index[i]),
+                    "level": level_low,
+                    "type": "bos_bearish",
+                })
+                consumed_swing_lows.add(swing_idx_low)
+
+    return sorted(results, key=lambda x: x["bos_index"])
+
+
+def get_bos(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
+    """
+    Vrací BOS události pro strategie.
+    [{"swing_index","swing_date","bos_index","bos_date","level","type":"bos_bullish"|"bos_bearish"}, ...]
+    """
+    swings = get_swings(ohlc, params)
+    if not swings:
+        return []
+    return _find_bos(ohlc, swings, params or {})
+
+
+def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
+    """
+    Zóny pro View – horizontální čára od Swing H/L k místu BOS, oranžová, nápis BOS uprostřed.
+    date_start = swing, date_end = BOS.
+    """
+    events = get_bos(ohlc, params)
+    if not events:
+        return []
+
+    zones: list[dict] = []
+    for ev in events:
+        zones.append({
+            "date_start": ev["swing_date"],
+            "date_end": ev["bos_date"],
+            "value_low": ev["level"],
+            "value_high": ev["level"],
+            "fillcolor": "rgba(245, 158, 11, 0.35)",
+            "name": "BOS",
+        })
+
+    return zones
+
+
+# --- Trend detection (EMA-based scoring -100 to +100) ---
+TREND_COLORS = {
+    "STRONG_BULL": "#22c55e",
+    "WEAK_BULL": "#86efac",
+    "RANGE": "#71717a",
+    "WEAK_BEAR": "#fca5a5",
+    "STRONG_BEAR": "#ef4444",
+}
+
+
+def _compute_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _score_alignment(ema_fast: float, ema_med: float, ema_slow: float) -> float:
+    """
+    Alignment (±40): directional agreement across EMA layers.
+    Strong bullish: fast > med > slow → +40
+    Partial bullish: 2 of 3 aligned → +25
+    Strong bearish: fast < med < slow → -40
+    Partial bearish: 2 of 3 aligned → -25
+    """
+    bull_align = (ema_fast > ema_med) + (ema_med > ema_slow)
+    bear_align = (ema_fast < ema_med) + (ema_med < ema_slow)
+    if bull_align == 2:
+        return 40.0
+    if bull_align == 1:
+        return 25.0
+    if bear_align == 2:
+        return -40.0
+    if bear_align == 1:
+        return -25.0
+    return 0.0
+
+
+def _score_slope(ema_series: pd.Series, i: int, lookback: int = 5) -> float:
+    """
+    Slope (±20): is the market actively moving?
+    Strong up: +20, Weak up: +10, Flat: 0, Weak down: -10, Strong down: -20
+    """
+    if i < lookback or len(ema_series) < lookback + 1:
+        return 0.0
+    curr = float(ema_series.iloc[i])
+    prev = float(ema_series.iloc[i - lookback])
+    if prev <= 0:
+        return 0.0
+    pct = (curr - prev) / prev
+    if pct > 0.02:
+        return 20.0
+    if pct > 0.005:
+        return 10.0
+    if pct < -0.02:
+        return -20.0
+    if pct < -0.005:
+        return -10.0
+    return 0.0
+
+
+def _score_position(close: float, ema: float, atr: float) -> float:
+    """
+    Position (±20): where is price relative to equilibrium (EMA)?
+    Clearly above: +20, Slightly above: +10, Neutral: 0, etc.
+    """
+    if atr <= 0:
+        return 0.0
+    diff_pct = (close - ema) / atr
+    if diff_pct > 1.0:
+        return 20.0
+    if diff_pct > 0.3:
+        return 10.0
+    if diff_pct < -1.0:
+        return -20.0
+    if diff_pct < -0.3:
+        return -10.0
+    return 0.0
+
+
+def _classify_swing_for_structure(swings: list[dict], idx: int, atr_val: float, eq_ratio: float = 0.35) -> str:
+    """Klasifikuje swing: HH, HL, LH, LL, EQH, EQL."""
+    if idx >= len(swings):
+        return "HH"
+    s = swings[idx]
+    typ = s["type"]
+    price = s["price"]
+    eq = max(atr_val * eq_ratio, ATR_FLOOR)
+    if typ == "high":
+        prev = [x for i, x in enumerate(swings) if x["type"] == "high" and i < idx]
+        if not prev:
+            return "HH"
+        last = max(prev, key=lambda x: x["index"])["price"]
+        d = price - last
+        if d > eq:
+            return "HH"
+        if d < -eq:
+            return "LH"
+        return "EQH"
+    else:
+        prev = [x for i, x in enumerate(swings) if x["type"] == "low" and i < idx]
+        if not prev:
+            return "HL"
+        last = max(prev, key=lambda x: x["index"])["price"]
+        d = last - price
+        if d > eq:
+            return "LL"
+        if d < -eq:
+            return "HL"
+        return "EQL"
+
+
+def _score_structure(swings: list[dict], bar_idx: int, atr: pd.Series, n: int, params: dict) -> float:
+    """
+    Structure (±20): does price action confirm direction? (HH/HL vs LL/LH)
+    Clear bullish: +20, Weak bullish: +10, No structure: 0, etc.
+    """
+    lookback = int(params.get("structure_lookback_swings", 4))
+    swings_up_to = [s for s in swings if s["index"] <= bar_idx]
+    if len(swings_up_to) < 2:
+        return 0.0
+    atr_val = max(float(atr.iloc[min(bar_idx, n - 1)]), ATR_FLOOR)
+    labels = [_classify_swing_for_structure(swings_up_to, idx, atr_val) for idx in range(len(swings_up_to))]
+    labels = labels[-lookback:]
+    bull_pairs = sum(1 for j in range(len(labels) - 1) if labels[j] == "HH" and labels[j + 1] == "HL")
+    bear_pairs = sum(1 for j in range(len(labels) - 1) if labels[j] == "LL" and labels[j + 1] == "LH")
+    if bull_pairs >= 2:
+        return 20.0
+    if bull_pairs >= 1:
+        return 10.0
+    if bear_pairs >= 2:
+        return -20.0
+    if bear_pairs >= 1:
+        return -10.0
+    return 0.0
+
+
+def _score_to_state(score: float) -> str:
+    """Mapuje score (-100..+100) na stav pro barvu."""
+    if score >= 60:
+        return "STRONG_BULL"
+    if score >= 30:
+        return "WEAK_BULL"
+    if score >= -30:
+        return "RANGE"
+    if score >= -60:
+        return "WEAK_BEAR"
+    return "STRONG_BEAR"
+
+
+def _compute_trend_scores(ohlc: pd.DataFrame, params: dict) -> list[tuple[int, float, str]]:
+    """
+    Vrací pro každý bar: (index, score, state).
+    score = alignment + slope + position + structure, clamped [-100, +100].
+    """
+    params = params or {}
+    close = ohlc["close"]
+    n = len(ohlc)
+    atr_period = int(params.get("atr_period", 10))
+    ema_f = int(params.get("ema_fast", 9))
+    ema_m = int(params.get("ema_medium", 21))
+    ema_s = int(params.get("ema_slow", 50))
+    slope_lookback = max(2, min(10, ema_m // 2))
+
+    atr = _compute_atr(ohlc, atr_period)
+    ema_fast = _compute_ema(close, ema_f)
+    ema_med = _compute_ema(close, ema_m)
+    ema_slow = _compute_ema(close, ema_s)
+
+    result = get_swings(ohlc, params)
+    swings = result["swings"] if isinstance(result, dict) else result
+
+    out: list[tuple[int, float, str]] = []
+    for i in range(n):
+        c = float(close.iloc[i])
+        atr_val = max(float(atr.iloc[i]), ATR_FLOOR)
+        a = _score_alignment(
+            float(ema_fast.iloc[i]),
+            float(ema_med.iloc[i]),
+            float(ema_slow.iloc[i]),
+        )
+        s = _score_slope(ema_med, i, slope_lookback)
+        p = _score_position(c, float(ema_med.iloc[i]), atr_val)
+        st = _score_structure(swings, i, atr, n, params) if swings else 0.0
+        score = max(-100.0, min(100.0, a + s + p + st))
+        out.append((i, score, None))
+
+    scores = pd.Series([x[1] for x in out])
+    smooth_period = max(1, int(params.get("trend_score_smooth_period") or params.get("trend_smooth_period", 8)))
+    smoothed = scores.ewm(span=smooth_period, adjust=False).mean()
+    for i in range(len(out)):
+        s = max(-100.0, min(100.0, float(smoothed.iloc[i])))
+        state = _score_to_state(s)
+        out[i] = (out[i][0], s, state)
+    return out
+
+
+def get_trend(ohlc: pd.DataFrame, params: dict | None = None) -> dict | None:
+    """
+    Vrací trend pro strategie: {"score": [float,...], "state": [str,...]}.
+    score: -100 (max bearish) až +100 (max bullish)
+    state: STRONG_BULL | WEAK_BULL | RANGE | WEAK_BEAR | STRONG_BEAR
+    Trend: min. 30m TF – při jemnějším TF se data resamplují.
+
+    Použití ve strategii:
+      from modules.Swing_HL import get_trend, TREND_PARAMS
+      trend = get_trend(ohlc, params)
+      if trend and trend["score"][i] >= params.get("trend_min_long", 30):
+          # long setup
+    """
+    if ohlc is None or len(ohlc) < 2:
+        return None
+    p = params or {}
+    tf = str(p.get("timeframe", "1d")).lower()
+    data_tf = p.get("data_timeframe")
+    work_ohlc = _ensure_min_tf(ohlc, MIN_TF_TREND, tf, data_tf)
+    scores = _compute_trend_scores(work_ohlc, p)
+    return {
+        "score": [s[1] for s in scores],
+        "state": [s[2] for s in scores],
+    }
+
+
+def get_line(ohlc: pd.DataFrame, params: dict | None = None) -> dict | None:
+    """
+    Trendová čára pro View – hladká EMA-like linka (perioda 150), barva podle trendu.
+    Trend = score -100..+100 z Alignment, Slope, Position, Structure.
+    Vrací {"Trend": {"data": [...], "segments": [{"from": i, "to": j, "color": "..."}, ...]}}.
+    """
+    if ohlc is None or len(ohlc) < 2:
+        return None
+
+    params = params or {}
+    ema_period = int(params.get("trend_line_ema_period", 150))
+    close = ohlc["close"]
+    index = ohlc.index
+    trend_ema = _compute_ema(close, ema_period)
+
+    trend_per_bar = _compute_trend_scores(ohlc, params)
+    data: list[dict] = []
+    for i in range(len(ohlc)):
+        value = float(trend_ema.iloc[i])
+        date_str = _to_date_str(index[i])
+        state = trend_per_bar[i][2]
+        data.append({"date": date_str, "value": value, "state": state})
+
+    segments: list[dict] = []
+    prev_end = -1
+    i = 0
+    while i < len(data):
+        state = data[i]["state"]
+        color = TREND_COLORS.get(state, TREND_COLORS["RANGE"])
+        j = i
+        while j < len(data) and data[j]["state"] == state:
+            j += 1
+        seg_end = j - 1
+        seg_start = prev_end if prev_end >= 0 else i
+        if seg_start <= seg_end:
+            segments.append({"from": seg_start, "to": seg_end, "color": color})
+        prev_end = seg_end
+        i = j
+
+    return {"Trend": {"data": data, "segments": segments}}
+
+
 def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
     Interface pro View chart - vrati markery ve formatu aplikace.
-    [{"date": "YYYY-MM-DD", "type": "high"|"low"|"internal_high"|"internal_low", "value": float}, ...]
+    [{"date": "YYYY-MM-DD", "type": "high"|"low"|"major_high"|"major_low"|"internal_high"|"internal_low", "value": float}, ...]
     """
     result = get_swings(ohlc, params)
     if isinstance(result, dict):
@@ -547,15 +1144,20 @@ def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         swings = result
         internals = []
 
+    p = params or {}
+    maj_params = {"timeframe": p.get("timeframe", "1d"), "data_timeframe": p.get("data_timeframe"), **p}
+    major_swings = get_major_swings(ohlc, maj_params)
+
     results = []
+    for s in major_swings:
+        ts = s.get("timestamp")
+        date_str = _to_date_str(ts) if ts is not None else ""
+        if date_str:
+            results.append({"date": date_str, "type": s["type"], "value": s["price"]})
     for s in swings:
         ts = s["timestamp"]
         date_str = _to_date_str(ts)
-        results.append({
-            "date": date_str,
-            "type": s["type"],
-            "value": s["price"],
-        })
+        results.append({"date": date_str, "type": s["type"], "value": s["price"]})
     for s in internals:
         ts = s["timestamp"]
         date_str = _to_date_str(ts)

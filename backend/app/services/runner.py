@@ -218,6 +218,7 @@ def _run_module_outputs(
                     for line_name, data in result.items():
                         pts = []
                         color = None
+                        segments = None
                         if isinstance(data, list):
                             pts = [
                                 {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
@@ -229,11 +230,20 @@ def _run_module_outputs(
                                 for p in data["data"] if isinstance(p, dict)
                             ]
                             color = data.get("color")
+                            segments = data.get("segments")
                         if pts:
-                            line_obj = {"name": str(line_name), "data": pts}
-                            if color:
-                                line_obj["color"] = str(color)
-                            lines.append(line_obj)
+                            if segments:
+                                for seg in segments:
+                                    if isinstance(seg, dict) and "from" in seg and "to" in seg and "color" in seg:
+                                        i0, i1 = int(seg["from"]), int(seg["to"]) + 1
+                                        seg_pts = pts[i0:i1]
+                                        if seg_pts:
+                                            lines.append({"name": str(line_name), "data": seg_pts, "color": str(seg["color"])})
+                            else:
+                                line_obj = {"name": str(line_name), "data": pts}
+                                if color:
+                                    line_obj["color"] = str(color)
+                                lines.append(line_obj)
                 elif isinstance(result, list):
                     pts = [
                         {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}

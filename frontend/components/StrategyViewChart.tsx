@@ -8,6 +8,47 @@ import type { DataInstrument } from "@shared/types";
 import type { FirestoreItem } from "@/lib/firestore";
 import type { OhlcBar } from "@shared/types";
 
+function toModuleName(name: string): string {
+  return (name || "module").replace(/\s+/g, "_").replace(/-/g, "_").replace(/\./g, "_") || "module";
+}
+
+function parseViewDependencies(code: string): string[] {
+  const m = code.match(/#\s*VIEW_DEPENDENCIES:\s*(.+)/);
+  if (!m) return [];
+  return m[1].split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+async function resolveModuleDependencies(
+  depNames: string[],
+  modules: FirestoreItem[]
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  const usedIds = new Set<string>();
+
+  for (const name of depNames) {
+    let mod = modules.find((m) => m.name === name && !usedIds.has(m.id));
+    if (!mod) {
+      const lower = name.toLowerCase();
+      const isSwing =
+        (lower.includes("swing") && (lower.includes("hl") || lower.includes("high"))) ||
+        (lower.includes("hl") && lower.includes("identificator"));
+      if (isSwing) {
+        mod = modules.find(
+          (m) =>
+            !usedIds.has(m.id) &&
+            (m.name.toLowerCase().includes("swing") ||
+              (m.name.toLowerCase().includes("hl") && m.name.toLowerCase().includes("identificator")))
+        );
+      }
+    }
+    if (!mod) continue;
+    usedIds.add(mod.id);
+    const content = await getFileContent("modules", mod.id, "main.py");
+    if (content) out["Swing_HL"] = content;
+  }
+  return out;
+}
+
 const TIMEFRAMES = [
   { label: "1M", years: 0.083 },
   { label: "3M", years: 0.25 },
@@ -43,7 +84,7 @@ export function StrategyViewChart({
   defaultDataFile = "mock/NQ_5Y.csv",
   initialItemId,
   initialItemType,
-  height = 720,
+  height = 960,
 }: StrategyViewChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [ohlc, setOhlc] = useState<OhlcBar[]>([]);
@@ -57,18 +98,19 @@ export function StrategyViewChart({
       setDataFile(instruments[0].file);
     }
   }, [instruments, dataFile]);
-  const [years, setYears] = useState(0.25);
+  const [years, setYears] = useState(0.5);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(initialItemId ?? null);
   const [selectedItemType, setSelectedItemType] = useState<ViewItemType>(
     initialItemType ?? "module"
   );
   const [lines, setLines] = useState<{ name: string; data: { date: string; value: number }[] }[]>([]);
   const [zones, setZones] = useState<
-    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string }[]
+    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string; base_length?: number; impulse_score?: number }[]
   >([]);
   const [viewParamsSchema, setViewParamsSchema] = useState<StrategyParams>({});
   const [viewParamsValues, setViewParamsValues] = useState<StrategyParams>({});
   const [paramsDrawerOpen, setParamsDrawerOpen] = useState(false);
+  const [valuesModalOpen, setValuesModalOpen] = useState(false);
   const viewParamsRef = useRef<StrategyParams>({});
   useEffect(() => {
     viewParamsRef.current = viewParamsValues;
@@ -114,7 +156,10 @@ export function StrategyViewChart({
         setViewParamsSchema({});
         setViewParamsValues({});
       }
-      const res = await getViewData(dataFile, years, code, paramsToSend);
+      const depNames = code ? parseViewDependencies(code) : [];
+      const moduleDeps =
+        depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
+      const res = await getViewData(dataFile, years, code, paramsToSend, moduleDeps);
       setOhlc(res.ohlc);
       setMarkers(res.markers);
       setLines(res.lines ?? []);
@@ -127,7 +172,88 @@ export function StrategyViewChart({
     } finally {
       setLoading(false);
     }
-  }, [dataFile, years, selectedItemId, selectedItemType, instruments]);
+  }, [dataFile, years, selectedItemId, selectedItemType, instruments, modules]);
+
+  const handleShuffle = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      let code: string | null = null;
+      let paramsToSend: StrategyParams | null = null;
+      if (selectedItemId) {
+        const type =
+          selectedItemType === "module"
+            ? "modules"
+            : selectedItemType === "indicator"
+              ? "indicators"
+              : "strategies";
+        code = await getFileContent(type, selectedItemId, "main.py");
+        if (code) {
+          const schema = parseViewParams(code);
+          const merged: StrategyParams = { ...schema };
+          if ("timeframe" in schema && instruments.length > 0) {
+            const inv = instruments.find((i) => i.file === dataFile);
+            if (inv) merged["timeframe"] = inv.timeframe;
+          }
+          const current = viewParamsRef.current;
+          for (const k of Object.keys(current)) {
+            if (k in schema) merged[k] = current[k];
+          }
+          paramsToSend = Object.keys(merged).length > 0 ? merged : null;
+        }
+      }
+      const depNames = code ? parseViewDependencies(code) : [];
+      const moduleDeps =
+        depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
+      const res = await getViewData(dataFile, 0, code, paramsToSend, moduleDeps);
+      const fullOhlc = res.ohlc;
+      const fullMarkers = res.markers ?? [];
+      const fullLines = res.lines ?? [];
+      const fullZones = res.zones ?? [];
+
+      if (fullOhlc.length < 2) {
+        setOhlc(fullOhlc);
+        setMarkers(fullMarkers);
+        setLines(fullLines);
+        setZones(fullZones);
+        return;
+      }
+
+      const windowBars = Math.min(126, Math.max(20, Math.floor(fullOhlc.length * 0.2)));
+      const maxStart = Math.max(0, fullOhlc.length - windowBars);
+      const startIdx = Math.floor(Math.random() * (maxStart + 1));
+      const endIdx = Math.min(startIdx + windowBars, fullOhlc.length);
+      const windowOhlc = fullOhlc.slice(startIdx, endIdx);
+      const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+      const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+
+      const inRange = (d: string) => {
+        const ds = d.slice(0, 10);
+        return ds >= startDate && ds <= endDate;
+      };
+
+      setOhlc(windowOhlc);
+      setMarkers(fullMarkers.filter((m) => inRange(m.date)));
+      setLines(
+        fullLines.map((line) => ({
+          ...line,
+          data: (line.data ?? []).filter((p) => inRange(p.date)),
+        })).filter((line) => line.data.length > 0)
+      );
+      setZones(
+        fullZones.filter(
+          (z) =>
+            (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
+            (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
+            (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+        )
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [dataFile, selectedItemId, selectedItemType, instruments]);
 
   useEffect(() => {
     import("react-plotly.js").then((mod) => setPlot(() => mod.default));
@@ -176,12 +302,16 @@ export function StrategyViewChart({
 
   const highMarkers = markers.filter((m) => m.type === "high");
   const lowMarkers = markers.filter((m) => m.type === "low");
+  const majorHighMarkers = markers.filter((m) => m.type === "major_high");
+  const majorLowMarkers = markers.filter((m) => m.type === "major_low");
   const internalHighMarkers = markers.filter((m) => m.type === "internal_high");
   const internalLowMarkers = markers.filter((m) => m.type === "internal_low");
   const otherMarkers = markers.filter(
     (m) =>
       m.type !== "high" &&
       m.type !== "low" &&
+      m.type !== "major_high" &&
+      m.type !== "major_low" &&
       m.type !== "internal_high" &&
       m.type !== "internal_low"
   );
@@ -193,6 +323,8 @@ export function StrategyViewChart({
 
   const highMapped = highMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
   const lowMapped = lowMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
+  const majorHighMapped = majorHighMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
+  const majorLowMapped = majorLowMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
   const internalHighMapped = internalHighMarkers
     .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
     .filter((p) => p.idx >= 0);
@@ -230,6 +362,42 @@ export function StrategyViewChart({
     name: "Low",
     showlegend: lowMarkers.length > 0,
   };
+
+  const majorHighTrace: any =
+    majorHighMapped.length > 0
+      ? {
+          type: "scatter",
+          x: majorHighMapped.map((p) => p.idx),
+          y: majorHighMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 14,
+            color: "#fbbf24",
+            symbol: "diamond",
+            line: { color: "#fff", width: 1.5 },
+          },
+          name: "Major High",
+          showlegend: true,
+        }
+      : null;
+
+  const majorLowTrace: any =
+    majorLowMapped.length > 0
+      ? {
+          type: "scatter",
+          x: majorLowMapped.map((p) => p.idx),
+          y: majorLowMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 14,
+            color: "#f59e0b",
+            symbol: "diamond",
+            line: { color: "#fff", width: 1.5 },
+          },
+          name: "Major Low",
+          showlegend: true,
+        }
+      : null;
 
   const internalHighTrace: any =
     internalHighMapped.length > 0
@@ -286,6 +454,7 @@ export function StrategyViewChart({
       : null;
 
   const lineColors = ["#3b82f6", "#f97316", "#a855f7", "#06b6d4"];
+  const trendNameCount = new Map<string, number>();
   const lineTraces = lines
     .map((line, i) => {
       const pts = line.data
@@ -293,32 +462,75 @@ export function StrategyViewChart({
         .filter((p) => p.idx >= 0)
         .sort((a, b) => a.idx - b.idx);
       const color = (line as { color?: string }).color ?? lineColors[i % lineColors.length];
+      const count = (trendNameCount.get(line.name) ?? 0) + 1;
+      trendNameCount.set(line.name, count);
       return {
         type: "scatter" as const,
         x: pts.map((p) => p.idx),
         y: pts.map((p) => p.val),
         mode: "lines" as const,
-        line: { color, width: 2 },
+        line: { color, width: 2, shape: "linear" },
+        connectgaps: true,
         name: line.name,
+        legendgroup: line.name,
+        showlegend: count === 1,
       };
     })
     .filter((t) => t.x.length > 0);
 
-  const zoneShapes: any[] = zones.map((z) => {
+  const zoneShapes: any[] = [];
+  const zoneAnnotations: any[] = [];
+  for (const z of zones) {
     const idxStart = dateToIndex.get(z.date_start.slice(0, 10)) ?? 0;
     const idxEnd = dateToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
-    return {
-      type: "rect",
-      x0: idxStart - 0.5,
-      x1: idxEnd + 0.5,
-      y0: z.value_low,
-      y1: z.value_high,
-      fillcolor: fill,
-      line: { width: 1, color: "#3b82f6" },
-      layer: "below",
-    };
-  });
+    const isLine = z.value_low === z.value_high;
+    const lineColor =
+      z.name === "Demand"
+        ? "#22c55e"
+        : z.name === "Supply"
+          ? "#ef4444"
+          : z.name === "BOS"
+            ? "#f59e0b"
+            : "#3b82f6";
+
+    if (isLine) {
+      zoneShapes.push({
+        type: "line",
+        x0: idxStart - 0.5,
+        x1: idxEnd + 0.5,
+        y0: z.value_low,
+        y1: z.value_high,
+        line: { width: 2, color: lineColor, dash: "solid" },
+        layer: "below",
+      });
+    } else {
+      zoneShapes.push({
+        type: "rect",
+        x0: idxStart - 0.5,
+        x1: idxEnd + 0.5,
+        y0: z.value_low,
+        y1: z.value_high,
+        fillcolor: fill,
+        line: { width: 1, color: lineColor },
+        layer: "below",
+      });
+    }
+
+    if (z.name) {
+      const label = z.name === "Demand" ? "D" : z.name === "Supply" ? "S" : z.name;
+      const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
+      zoneAnnotations.push({
+        x: (idxStart + idxEnd) / 2,
+        y: yCenter,
+        text: label,
+        showarrow: false,
+        font: { size: 11, color: lineColor },
+        xanchor: "center",
+        yanchor: "middle",
+      });
+    }
+  }
 
   const layout: any = {
     height,
@@ -343,6 +555,7 @@ export function StrategyViewChart({
     dragmode: "zoom",
     legend: { x: 0, y: 1.1, orientation: "h" },
     shapes: zoneShapes,
+    annotations: zoneAnnotations,
   };
 
   const config: any = {
@@ -356,6 +569,8 @@ export function StrategyViewChart({
   const traces: any[] = [candlestickTrace];
   if (highMarkers.length > 0) traces.push(highTrace);
   if (lowMarkers.length > 0) traces.push(lowTrace);
+  if (majorHighTrace) traces.push(majorHighTrace);
+  if (majorLowTrace) traces.push(majorLowTrace);
   if (internalHighTrace) traces.push(internalHighTrace);
   if (internalLowTrace) traces.push(internalLowTrace);
   if (otherTrace) traces.push(otherTrace);
@@ -437,6 +652,14 @@ export function StrategyViewChart({
           >
             {loading ? "Načítám..." : "Obnovit"}
           </button>
+          <button
+            onClick={handleShuffle}
+            disabled={loading}
+            title="Náhodné 6M okno z dat"
+            className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
+          >
+            Shuffle
+          </button>
           {selectedItemId && (
             <button
               onClick={() => setParamsDrawerOpen(true)}
@@ -467,8 +690,125 @@ export function StrategyViewChart({
               </svg>
             </button>
           )}
+          <button
+            onClick={() => setValuesModalOpen(true)}
+            title="Zobrazit hodnoty z algoritmu"
+            className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm text-zinc-300 disabled:opacity-50"
+          >
+            Values
+          </button>
         </div>
       </div>
+
+      {valuesModalOpen && (
+        <div
+          className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+          onClick={() => setValuesModalOpen(false)}
+        >
+          <div
+            className="bg-zinc-900 rounded-xl border border-zinc-700 w-full max-w-2xl max-h-[85vh] flex flex-col shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 shrink-0">
+              <h3 className="text-lg font-semibold text-zinc-100">Hodnoty z algoritmu</h3>
+              <button
+                onClick={() => setValuesModalOpen(false)}
+                className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200"
+                aria-label="Zavřít"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-6 space-y-6">
+              <div>
+                <h4 className="text-sm font-medium text-emerald-400/90 mb-2">Swing H/L (markers)</h4>
+                <p className="text-xs text-zinc-500 mb-2">Bodové značky – kde algoritmus určil swing high / swing low</p>
+                {markers.length === 0 ? (
+                  <p className="text-sm text-zinc-500 italic">Žádné markery</p>
+                ) : (
+                  <div className="overflow-x-auto rounded-lg border border-zinc-700">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="bg-zinc-800/80">
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">Datum</th>
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">Typ</th>
+                          <th className="px-3 py-2 text-right text-zinc-400 font-medium">Hodnota</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {markers.map((m, i) => (
+                          <tr key={i} className="border-t border-zinc-700/50">
+                            <td className="px-3 py-2 text-zinc-200">{m.date}</td>
+                            <td className="px-3 py-2 text-zinc-300">{m.type}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{m.value.toFixed(2)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+              <div>
+                <h4 className="text-sm font-medium text-amber-400/90 mb-2">Zóny (BOS / S-D)</h4>
+                <p className="text-xs text-zinc-500 mb-2">Break of Structure – čára od Swing H/L k místu, kde se BOS stal. S/D Zones: Demand (zelená), Supply (červená).</p>
+                {zones.length === 0 ? (
+                  <div className="space-y-1">
+                    <p className="text-sm text-zinc-500 italic">Žádné zóny</p>
+                    <p className="text-xs text-zinc-600">
+                      S/D Zones vyžaduje modul Swing HL. Zkontrolujte, že máte modul s názvem &quot;Swing HL&quot; nebo &quot;HL identificator&quot; v sekci Moduly.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-lg border border-zinc-700">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="bg-zinc-800/80">
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">Swing (od)</th>
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">BOS (do)</th>
+                          <th className="px-3 py-2 text-right text-zinc-400 font-medium">Low</th>
+                          <th className="px-3 py-2 text-right text-zinc-400 font-medium">High</th>
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">Název</th>
+                          <th className="px-3 py-2 text-right text-zinc-400 font-medium">Base</th>
+                          <th className="px-3 py-2 text-right text-zinc-400 font-medium">Impulse</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {zones.map((z, i) => (
+                          <tr key={i} className="border-t border-zinc-700/50">
+                            <td className="px-3 py-2 text-zinc-200">{z.date_start}</td>
+                            <td className="px-3 py-2 text-zinc-200">{z.date_end}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.value_low.toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.value_high.toFixed(2)}</td>
+                            <td className="px-3 py-2 text-zinc-300">{z.name ?? "—"}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.base_length ?? "—"}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.impulse_score ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+              {lines.length > 0 && (
+                <div>
+                  <h4 className="text-sm font-medium text-blue-400/90 mb-2">Čáry (lines)</h4>
+                  <p className="text-xs text-zinc-500 mb-2">Indikátory – čáry</p>
+                  {lines.map((line, i) => (
+                    <div key={i} className="mb-3">
+                      <p className="text-xs text-zinc-400 mb-1">{line.name}</p>
+                      <p className="text-xs text-zinc-500 font-mono">
+                        {line.data?.length ?? 0} bodů
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {paramsDrawerOpen && selectedItemId && (
         <>

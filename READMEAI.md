@@ -276,12 +276,24 @@ Backend executes `module_code` in temp file, checks `hasattr(mod, "detect")`, `h
 - Dict in code: `VIEW_PARAMS = {"period": 20, "color": "#3b82f6"}`
 - Parsed by `parseViewParams(code)` in `strategyParams.ts`
 - Sent to POST /api/view as `params`
+- **Při backtestu:** Parameters panel má záložky Strategie | [Modul 1] | [Modul 2]. Každá záložka modulu zobrazuje VIEW_PARAMS daného modulu – lze upravit před Run. Hodnoty jdou do `module_params` v requestu.
 - Supported types: number, boolean, string
 
-### 6.3 Naming for Imports
+### 6.3 Swing HL Module (complete interface)
+
+| Feature | Strategy API | View/Results |
+|---------|--------------|--------------|
+| Swing H/L | `get_swings(ohlc, params)` | `detect()` – markers |
+| Internal H/L | `get_swings(..., include_internals=True)` | `detect()` – internal_high/low |
+| BOS | `get_bos(ohlc, params)` | `get_zones()` |
+| Trend | `get_trend(ohlc, params)` → `{score, state}` | `get_line()` – colored trend line |
+
+Strategy passes `params.module_params["Swing HL"]` to module functions.
+
+### 6.4 Naming for Imports
 
 - Indicator "EMA 20" → `indicators/EMA_20.py` → `from indicators.EMA_20 import MyIndicator`
-- Module "Swing HL" → `modules/Swing_HL.py` → `from modules.Swing_HL import detect, get_swings`
+- Module "Swing HL" → `modules/Swing_HL.py` → `from modules.Swing_HL import detect, get_swings, get_bos, get_trend`
 - Conversion: spaces/special chars → underscore, `toModuleName` in runner
 
 ---

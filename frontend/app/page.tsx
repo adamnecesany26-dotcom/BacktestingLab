@@ -630,7 +630,7 @@ export default function Home() {
                           ? "indicator"
                           : undefined
               }
-              height={520}
+              height={700}
             />
           </div>
         ) : openItem && selectedFile ? (

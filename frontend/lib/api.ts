@@ -94,6 +94,8 @@ export interface ViewZone {
   value_high: number;
   fillcolor?: string;
   name?: string;
+  base_length?: number;
+  impulse_score?: number;
 }
 
 /** Fetch OHLC + optional module markers/lines/zones for View chart. */
@@ -101,7 +103,8 @@ export async function getViewData(
   dataFile: string,
   years: number,
   moduleCode?: string | null,
-  params?: Record<string, number | boolean | string> | null
+  params?: Record<string, number | boolean | string> | null,
+  moduleDependencies?: Record<string, string> | null
 ): Promise<{
   ohlc: OhlcBar[];
   markers: { date: string; type: string; value: number }[];
@@ -116,6 +119,7 @@ export async function getViewData(
       years,
       module_code: moduleCode || null,
       params: params || null,
+      module_dependencies: moduleDependencies || null,
     }),
   });
   if (!res.ok) {

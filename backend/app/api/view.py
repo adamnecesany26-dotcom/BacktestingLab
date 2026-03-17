@@ -66,11 +66,16 @@ def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
 
 
 def _run_view_code(
-    code: str, df: pd.DataFrame, params: dict | None = None
+    code: str,
+    df: pd.DataFrame,
+    params: dict | None = None,
+    module_dependencies: dict[str, str] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """
     Execute detect(ohlc), get_line(ohlc), get_zones(ohlc) from module/indicator/strategy.
     Returns (markers, lines, zones).
+
+    module_dependencies: { "Swing_HL": "..." } – moduly pro "from modules.Swing_HL import ..."
 
     MODULE / INDICATOR / STRATEGIE – všechny používají stejné rozhraní:
 
@@ -86,16 +91,32 @@ def _run_view_code(
     def get_zones(ohlc: pd.DataFrame) -> list[dict]:
         return [{"date_start": "YYYY-MM-DD", "date_end": "YYYY-MM-DD", "value_low": float, "value_high": float, "fillcolor"?: str, "name"?: str}, ...]
     """
-    import tempfile
     import importlib.util
+    import shutil
     import sys
+    import tempfile
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
-        f.write(code)
-        tmp_path = f.name
+    tmp_dir = None
+    main_path = None
+    mod = None
 
     try:
-        spec = importlib.util.spec_from_file_location("view_module", tmp_path)
+        if module_dependencies:
+            tmp_dir = Path(tempfile.mkdtemp())
+            modules_dir = tmp_dir / "modules"
+            modules_dir.mkdir()
+            (modules_dir / "__init__.py").write_text("", encoding="utf-8")
+            for mod_name, mod_content in module_dependencies.items():
+                (modules_dir / f"{mod_name}.py").write_text(mod_content, encoding="utf-8")
+            main_path = tmp_dir / "main.py"
+            main_path.write_text(code, encoding="utf-8")
+            sys.path.insert(0, str(tmp_dir))
+        else:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+                f.write(code)
+                main_path = Path(f.name)
+
+        spec = importlib.util.spec_from_file_location("view_module", main_path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules["view_module"] = mod
         spec.loader.exec_module(mod)
@@ -120,16 +141,26 @@ def _run_view_code(
                 for name, data in result.items():
                     pts = []
                     color = None
+                    segments = None
                     if isinstance(data, list):
                         pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
                     elif isinstance(data, dict) and "data" in data:
                         pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in data["data"] if isinstance(p, dict)]
                         color = data.get("color")
+                        segments = data.get("segments")
                     if pts:
-                        line_obj = {"name": str(name), "data": pts}
-                        if color:
-                            line_obj["color"] = str(color)
-                        lines.append(line_obj)
+                        if segments:
+                            for seg in segments:
+                                if isinstance(seg, dict) and "from" in seg and "to" in seg and "color" in seg:
+                                    i0, i1 = int(seg["from"]), int(seg["to"]) + 1
+                                    seg_pts = pts[i0:i1]
+                                    if seg_pts:
+                                        lines.append({"name": str(name), "data": seg_pts, "color": str(seg["color"])})
+                        else:
+                            line_obj = {"name": str(name), "data": pts}
+                            if color:
+                                line_obj["color"] = str(color)
+                            lines.append(line_obj)
             elif isinstance(result, list):
                 pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in result if isinstance(p, dict)]
                 if pts:
@@ -147,18 +178,28 @@ def _run_view_code(
                         and "value_low" in item
                         and "value_high" in item
                     ):
-                        zones.append({
+                        zone = {
                             "date_start": str(item["date_start"])[:10],
                             "date_end": str(item["date_end"])[:10],
                             "value_low": float(item["value_low"]),
                             "value_high": float(item["value_high"]),
                             "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
                             "name": str(item["name"]) if item.get("name") else None,
-                        })
+                        }
+                        if "base_length" in item:
+                            zone["base_length"] = int(item["base_length"])
+                        if "impulse_score" in item:
+                            zone["impulse_score"] = int(item["impulse_score"])
+                        zones.append(zone)
 
         return markers, lines, zones
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if tmp_dir and tmp_dir.exists():
+            if str(tmp_dir) in sys.path:
+                sys.path.remove(str(tmp_dir))
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        elif main_path and main_path.exists():
+            main_path.unlink(missing_ok=True)
 
 
 class ViewRequest(BaseModel):
@@ -166,6 +207,7 @@ class ViewRequest(BaseModel):
     years: float = 0.25
     module_code: str | None = None
     params: dict | None = None
+    module_dependencies: dict[str, str] | None = None
 
 
 def _call_with_params(fn, df: pd.DataFrame, params: dict):
@@ -208,7 +250,10 @@ async def get_view_data(req: ViewRequest):
     if req.module_code and req.module_code.strip():
         try:
             markers, lines, zones = _run_view_code(
-                req.module_code.strip(), df, params=req.params or {}
+                req.module_code.strip(),
+                df,
+                params=req.params or {},
+                module_dependencies=req.module_dependencies,
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"View error: {str(e)}")

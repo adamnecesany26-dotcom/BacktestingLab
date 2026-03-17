@@ -14,6 +14,8 @@ interface ModuleOutputChartProps {
 const MARKER_COLORS: Record<string, string> = {
   high: "#ef4444",
   low: "#10b981",
+  major_high: "#fbbf24",
+  major_low: "#f59e0b",
   internal_high: "#f97316",
   internal_low: "#22c55e",
 };
@@ -96,35 +98,80 @@ export function ModuleOutputChart({
   }
 
   const lines = output.lines ?? [];
+  const lineNameCount = new Map<string, number>();
   for (const line of lines) {
     const pts = line.data ?? [];
     if (pts.length > 0) {
+      const name = line.name ?? "line";
+      const count = (lineNameCount.get(name) ?? 0) + 1;
+      lineNameCount.set(name, count);
       traces.push({
         type: "scatter",
         x: pts.map((p: { date: string }) => p.date),
         y: pts.map((p: { value: number }) => p.value),
         mode: "lines",
         line: { color: line.color ?? "#3b82f6", width: 2 },
-        name: line.name ?? "line",
-        showlegend: true,
+        name,
+        legendgroup: name,
+        showlegend: count === 1,
       });
     }
   }
 
   const zoneShapes: any[] = [];
+  const zoneAnnotations: any[] = [];
   const zones = output.zones ?? [];
   for (const z of zones) {
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
-    zoneShapes.push({
-      type: "rect",
-      x0: z.date_start,
-      x1: z.date_end,
-      y0: z.value_low,
-      y1: z.value_high,
-      fillcolor: fill,
-      line: { width: 1, color: "#3b82f6" },
-      layer: "below",
-    });
+    const isLine = z.value_low === z.value_high;
+    const lineColor =
+      z.name === "Demand"
+        ? "#22c55e"
+        : z.name === "Supply"
+          ? "#ef4444"
+          : z.name === "BOS"
+            ? "#f59e0b"
+            : "#3b82f6";
+
+    if (isLine) {
+      zoneShapes.push({
+        type: "line",
+        x0: z.date_start,
+        x1: z.date_end,
+        y0: z.value_low,
+        y1: z.value_high,
+        line: { width: 2, color: lineColor, dash: "solid" },
+        layer: "below",
+      });
+    } else {
+      zoneShapes.push({
+        type: "rect",
+        x0: z.date_start,
+        x1: z.date_end,
+        y0: z.value_low,
+        y1: z.value_high,
+        fillcolor: fill,
+        line: { width: 1, color: lineColor },
+        layer: "below",
+      });
+    }
+
+    if (z.name) {
+      const label = z.name === "Demand" ? "D" : z.name === "Supply" ? "S" : z.name;
+      const t1 = new Date(z.date_start).getTime();
+      const t2 = new Date(z.date_end).getTime();
+      const midDate = new Date((t1 + t2) / 2).toISOString().slice(0, 10);
+      const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
+      zoneAnnotations.push({
+        x: midDate,
+        y: yCenter,
+        text: label,
+        showarrow: false,
+        font: { size: 11, color: lineColor },
+        xanchor: "center",
+        yanchor: "middle",
+      });
+    }
   }
 
   const layout: any = {
@@ -149,6 +196,7 @@ export function ModuleOutputChart({
     showlegend: traces.length > 1,
     legend: { x: 1, y: 1, xanchor: "right" },
     shapes: zoneShapes,
+    annotations: zoneAnnotations,
   };
 
   const config: any = {

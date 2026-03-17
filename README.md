@@ -351,6 +351,7 @@ Backtesting_app/
 - **Záložky:** Strategie | [Název modulu 1] | [Název modulu 2] | …
 - **Strategie:** parametry z `PARAMS` strategie
 - **Moduly:** parametry z `VIEW_PARAMS` každého vybraného modulu (vybrané v sekci Moduly)
+- Při backtestu lze upravit VIEW_PARAMS každého modulu v záložce daného modulu – hodnoty se předávají do `module_params` a strategie je předává modulům
 - Dynamické inputy podle typu: number → `<input type="number">`, boolean → checkbox, string → text input
 - Při změně strategie se parametry znovu naparsují; při změně výběru modulů se načtou jejich `VIEW_PARAMS`
 
@@ -634,14 +635,20 @@ Při vytvoření nového indikátoru nebo modulu (`createItem` v `frontend/lib/f
 - **Indikátor:** backtrader třída + `get_line` (EMA příklad), `VIEW_PARAMS`, komentáře k rozhraní
 - **Modul:** `detect` (3-bar pivot příklad), `get_line` (prázdný), `VIEW_PARAMS`, komentáře k rozhraní
 
-### Příklad: Swing HL strategie (3× HH / 3× LL)
+### Příklad: Swing HL modul
 
-Strategie `strategies/test/main.py` používá modul Swing HL:
-- **Long** při 3× Higher High (poslední 3 swing highy rostou)
-- **Short** při 3× Lower Low (poslední 3 swing lowy klesají)
-- Parametry: `swing_tf`, `hh_count`, `ll_count` (strategie) + `VIEW_PARAMS` modulu (timeframe, atr_period, …)
-- Modul musí být vybrán v panelu Moduly a potvrzen
-- Po backtestu se v záložce **Moduly** zobrazí graf OHLC + swing markery z `detect()`
+Modul **Swing HL** (`examples/swing_hl_detector.py`) vrací:
+
+| Funkcionalita | Pro strategii | Pro View/Results |
+|---------------|---------------|------------------|
+| Swing H/L | `get_swings(ohlc, params)` | `detect()` – markery high/low |
+| Internal H/L | `get_swings(ohlc, {**params, "include_internals": True})` | `detect()` – markery internal_high/low |
+| BOS | `get_bos(ohlc, params)` | `get_zones()` – zóny BOS |
+| Trend | `get_trend(ohlc, params)` → `{"score", "state"}` | `get_line()` – trendová čára |
+
+- Parametry: `VIEW_PARAMS` modulu (timeframe, atr_period, ema_fast, …) – upravitelné v panelu Parameters při backtestu (záložka modulu)
+- Strategie musí modul vybrat v panelu Moduly; params z `params.module_params["Swing HL"]` předat do modulu
+- Po backtestu: záložka **Moduly** zobrazí OHLC + markery + trendová čára + BOS zóny
 
 ---
 
