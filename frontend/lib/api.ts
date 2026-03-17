@@ -96,6 +96,9 @@ export interface ViewZone {
   name?: string;
   base_length?: number;
   impulse_score?: number;
+  touches?: number;
+  strength?: number;
+  has_touch?: boolean;
 }
 
 /** Fetch OHLC + optional module markers/lines/zones for View chart. */

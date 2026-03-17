@@ -72,13 +72,13 @@ TF_CONFIG = {
 VIEW_PARAMS = {
     "timeframe": "1d",
     "atr_period": 10,
-    "atr_multiplier": 1.2,
-    "min_bars_between_swings": 3,
+    "atr_multiplier": 1.6, #nechat!
+    "min_bars_between_swings": 3, #nechat!
     "max_bars": 180,
     "max_candidate_bars": 0,
     "allow_unconfirmed_last_swing": True,
     "min_pullback_atr_ratio": 0.4,
-    "sensitivity": 1.2,
+    "sensitivity": 1.0, #nechat!
     "window_bars": 120,
     "include_internals": False,
     # BOS (Break of Structure) – close nad/pod posledním swing H/L, 1 bar acceptance
@@ -145,7 +145,8 @@ def _resample_ohlc(ohlc: pd.DataFrame, target_tf: str, data_tf: str | None = Non
     agg = {open_col: "first", high_col: "max", low_col: "min", close_col: "last"}
     if "volume" in ohlc.columns:
         agg["volume"] = "sum"
-    return ohlc.resample(rule).agg(agg).dropna(how="all")
+    use_right = target in ("1w", "1m", "1me", "w", "me", "m")
+    return ohlc.resample(rule, label="right" if use_right else "left", closed="right" if use_right else "left").agg(agg).dropna(how="all")
 
 
 def _ensure_min_tf(ohlc: pd.DataFrame, min_tf: str, tf_param: str, data_tf_param: str | None) -> pd.DataFrame:
@@ -500,6 +501,71 @@ def _map_swing_index_to_original(swing: dict, original_index: pd.DatetimeIndex) 
     return int(idx)
 
 
+# Resample pravidla s label='right', closed='right' (W, ME)
+_RESAMPLE_RIGHT_LABEL = frozenset({"1w", "1W", "1M", "1ME", "W", "ME", "M"})
+
+
+def _map_major_swing_to_original(
+    swing: dict,
+    resampled: pd.DataFrame,
+    original_ohlc: pd.DataFrame,
+    major_tf: str = "1w",
+) -> tuple[int, float]:
+    """
+    Mapuje Major swing z resampled na bar v original ohlc – hledá bar s min(low)
+    resp. max(high) v periodě resamplovaného baru. Používá searchsorted na
+    hranice periody (konzistentní s pandas resample).
+    Vrací (index, price) – price z nalezeného baru pro přesné vertikální zarovnání.
+    """
+    res_idx = swing.get("index", 0)
+    orig_idx = original_ohlc.index
+    if res_idx >= len(resampled):
+        fallback = _map_swing_index_to_original(swing, orig_idx)
+        return fallback, float(swing.get("price", 0))
+
+    rule = (major_tf or "1w").lower()
+    use_right = rule in _RESAMPLE_RIGHT_LABEL
+
+    if use_right:
+        period_end = resampled.index[res_idx]
+        if res_idx > 0:
+            period_start = resampled.index[res_idx - 1]
+            start_pos = int(orig_idx.searchsorted(period_start, side="right"))
+        else:
+            start_pos = 0
+        end_pos = int(orig_idx.searchsorted(period_end, side="right"))
+    else:
+        period_start = resampled.index[res_idx]
+        start_pos = int(orig_idx.searchsorted(period_start, side="left"))
+        if res_idx + 1 < len(resampled):
+            period_end = resampled.index[res_idx + 1]
+            end_pos = int(orig_idx.searchsorted(period_end, side="left"))
+        else:
+            end_pos = len(original_ohlc)
+
+    if start_pos >= end_pos:
+        start_pos = max(0, min(start_pos, len(original_ohlc) - 1))
+        return start_pos, float(swing.get("price", 0))
+
+    slice_ohlc = original_ohlc.iloc[start_pos:end_pos]
+    high_col = "high" if "high" in slice_ohlc.columns else "High"
+    low_col = "low" if "low" in slice_ohlc.columns else "Low"
+    h_vals = slice_ohlc[high_col].values
+    l_vals = slice_ohlc[low_col].values
+    if len(h_vals) == 0 or len(l_vals) == 0:
+        return min(start_pos, len(original_ohlc) - 1), float(swing.get("price", 0))
+
+    if swing.get("type") == "high":
+        pos_in_slice = int(h_vals.argmax())
+        price = float(h_vals[pos_in_slice])
+    else:
+        pos_in_slice = int(l_vals.argmin())
+        price = float(l_vals[pos_in_slice])
+    pos = start_pos + pos_in_slice
+    pos = min(max(0, pos), len(original_ohlc) - 1)
+    return pos, price
+
+
 def get_swings(
     ohlc: pd.DataFrame,
     params: dict | None = None,
@@ -559,7 +625,9 @@ def get_swings(
         swings = _deduplicate_swings(swings, original_ohlc, atr_series)
         swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
         if include_internals:
-            return _add_internals(swings, original_ohlc, major_swings)
+            out = _add_internals(swings, original_ohlc, major_swings)
+            out["major_swings"] = major_swings
+            return out
         return swings
 
     all_swings: list[dict] = []
@@ -593,7 +661,9 @@ def get_swings(
     swings = _deduplicate_swings(all_swings, original_ohlc, atr_series)
     swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
     if include_internals:
-        return _add_internals(swings, original_ohlc, major_swings)
+        out = _add_internals(swings, original_ohlc, major_swings)
+        out["major_swings"] = major_swings
+        return out
     return swings
 
 
@@ -618,13 +688,12 @@ def get_major_swings(ohlc: pd.DataFrame, params: dict | None = None) -> list[dic
     maj_params = {**base, **params}
     maj_params["timeframe"] = major_tf
     swings, _ = _get_swings_core(resampled, maj_params)
-    orig_idx = ohlc.index
     out = []
     for s in swings:
-        idx = _map_swing_index_to_original(s, orig_idx)
+        idx, price = _map_major_swing_to_original(s, resampled, ohlc, major_tf)
         out.append({
             "type": f"major_{s['type']}",
-            "price": s["price"],
+            "price": price,
             "index": idx,
             "timestamp": ohlc.index[idx] if idx < len(ohlc) else s.get("timestamp"),
         })
@@ -742,8 +811,11 @@ def _deduplicate_swings(
 
 
 def _get_last_swing_high(swings: list[dict], up_to_index: int) -> tuple[float | None, int | None]:
-    """Poslední swing high před indexem. Vrací (price, index)."""
-    before = [s for s in swings if s["type"] == "high" and s["index"] < up_to_index]
+    """Poslední swing high před indexem. Vrací (price, index). Akceptuje type 'high' i 'major_high'."""
+    before = [
+        s for s in swings
+        if (s["type"] == "high" or s["type"] == "major_high") and s["index"] < up_to_index
+    ]
     if not before:
         return None, None
     s = max(before, key=lambda x: x["index"])
@@ -751,19 +823,28 @@ def _get_last_swing_high(swings: list[dict], up_to_index: int) -> tuple[float | 
 
 
 def _get_last_swing_low(swings: list[dict], up_to_index: int) -> tuple[float | None, int | None]:
-    """Poslední swing low před indexem. Vrací (price, index)."""
-    before = [s for s in swings if s["type"] == "low" and s["index"] < up_to_index]
+    """Poslední swing low před indexem. Vrací (price, index). Akceptuje type 'low' i 'major_low'."""
+    before = [
+        s for s in swings
+        if (s["type"] == "low" or s["type"] == "major_low") and s["index"] < up_to_index
+    ]
     if not before:
         return None, None
     s = max(before, key=lambda x: x["index"])
     return s["price"], s["index"]
 
 
-def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict]:
+def _find_bos_from_swings(
+    ohlc: pd.DataFrame,
+    swings: list[dict],
+    params: dict,
+    is_major: bool = False,
+) -> list[dict]:
     """
     BOS = Break of Structure – close nad posledním swing high nebo pod posledním swing low.
-    Následující 1 svíčka nesmí uzavřít zpět pod/přes tuto úroveň.
-    Vrací: swing_index, swing_date, bos_index, bos_date, level
+    Následující acceptance_bars svíček nesmí uzavřít zpět.
+    is_major: True pokud swings jsou major swingy.
+    Vrací: swing_index, swing_date, bos_index, bos_date, level, type, is_major
     """
     params = params or {}
     accept_bars = int(params.get("acceptance_bars", 1))
@@ -778,7 +859,6 @@ def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict
     for i in range(1, len(ohlc) - accept_bars):
         close = float(close_col.iloc[i])
 
-        # Bullish BOS: close nad posledním swing high (jen pokud tento swing ještě nebyl zlomen)
         level_high, swing_idx_high = _get_last_swing_high(swings, i)
         if (
             level_high is not None
@@ -802,10 +882,10 @@ def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict
                     "bos_date": _to_date_str(index[i]),
                     "level": level_high,
                     "type": "bos_bullish",
+                    "is_major": is_major,
                 })
                 consumed_swing_highs.add(swing_idx_high)
 
-        # Bearish BOS: close pod posledním swing low (jen pokud tento swing ještě nebyl zlomen)
         level_low, swing_idx_low = _get_last_swing_low(swings, i)
         if (
             level_low is not None
@@ -829,27 +909,44 @@ def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict
                     "bos_date": _to_date_str(index[i]),
                     "level": level_low,
                     "type": "bos_bearish",
+                    "is_major": is_major,
                 })
                 consumed_swing_lows.add(swing_idx_low)
 
     return sorted(results, key=lambda x: x["bos_index"])
 
 
+def _find_bos(ohlc: pd.DataFrame, swings: list[dict], params: dict) -> list[dict]:
+    """BOS na běžných swingech. Zachovává zpětnou kompatibilitu."""
+    return _find_bos_from_swings(ohlc, swings, params, is_major=False)
+
+
 def get_bos(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
-    Vrací BOS události pro strategie.
-    [{"swing_index","swing_date","bos_index","bos_date","level","type":"bos_bullish"|"bos_bearish"}, ...]
+    Vrací BOS události pro strategie – na swing H/L i na Major Swing H/L.
+    [{"swing_index","swing_date","bos_index","bos_date","level","type","is_major"}, ...]
+    is_major: True = BOS na Major Swing H/L, False = BOS na běžném swing H/L.
     """
-    swings = get_swings(ohlc, params)
-    if not swings:
-        return []
-    return _find_bos(ohlc, swings, params or {})
+    p = dict(params or {})
+    swing_res = get_swings(ohlc, p)
+    swings = swing_res.get("swings", []) if isinstance(swing_res, dict) else (swing_res or [])
+
+    p2 = dict(params or {})
+    tf = p2.get("timeframe", "1d")
+    data_tf = p2.get("data_timeframe")
+    maj_params = {"timeframe": tf, "data_timeframe": data_tf, **p2}
+    major_swings = get_major_swings(ohlc, maj_params)
+
+    results = _find_bos_from_swings(ohlc, swings, params or {}, is_major=False)
+    results_major = _find_bos_from_swings(ohlc, major_swings, params or {}, is_major=True)
+    results = sorted(results + results_major, key=lambda x: x["bos_index"])
+    return results
 
 
 def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
-    Zóny pro View – horizontální čára od Swing H/L k místu BOS, oranžová, nápis BOS uprostřed.
-    date_start = swing, date_end = BOS.
+    Zóny pro View – horizontální čára od Swing H/L k místu BOS.
+    BOS na Major Swing: name "BOS (M)", odlišená barva.
     """
     events = get_bos(ohlc, params)
     if not events:
@@ -857,13 +954,16 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
 
     zones: list[dict] = []
     for ev in events:
+        is_major = ev.get("is_major", False)
+        name = "BOS (M)" if is_major else "BOS"
+        fill = "rgba(251, 191, 36, 0.45)" if is_major else "rgba(245, 158, 11, 0.35)"
         zones.append({
             "date_start": ev["swing_date"],
             "date_end": ev["bos_date"],
             "value_low": ev["level"],
             "value_high": ev["level"],
-            "fillcolor": "rgba(245, 158, 11, 0.35)",
-            "name": "BOS",
+            "fillcolor": fill,
+            "name": name,
         })
 
     return zones

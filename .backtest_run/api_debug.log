@@ -1,4 +1,19 @@
-SUCCESS
-progress: {'type': 'progress', 'value': 90}
-progress: {'type': 'progress', 'value': 100}
-result: {'type': 'result', 'data': {'equity': [100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 100000.0, 1
+log: {'type': 'log', 'line': '[engine] strategy_dir=/app/strategy sys.path[0]=/app/strategy modules_exists=True', 'stream': 'stderr'}
+log: {'type': 'log', 'line': '[engine] modules/__init__.py', 'stream': 'stderr'}
+log: {'type': 'log', 'line': '[engine] modules/__pycache__', 'stream': 'stderr'}
+log: {'type': 'log', 'line': '[engine] Loading strategy...', 'stream': 'stderr'}
+error: {'type': 'error', 'message': 'No module named \'modules.HL_identificator\'\n\nTraceback (most recent call last):\n  File "/app/engine.py", line 386, in main\n    strategy_cls = load_strategy(strategy_path)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File "/app/engine.py", line 42, in load_st
+
+ERROR: No module named 'modules.HL_identificator'
+
+Traceback (most recent call last):
+  File "/app/engine.py", line 386, in main
+    strategy_cls = load_strategy(strategy_path)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/engine.py", line 42, in load_strategy
+    spec.loader.exec_module(module)
+  File "<frozen importlib._bootstrap_external>", line 940, in exec_module
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/app/strategy/main.py", line 25, in <module>
+    from modules.HL_identificator import get_swings
+ModuleNotFoundError: No module named 'modules.HL_identificator'

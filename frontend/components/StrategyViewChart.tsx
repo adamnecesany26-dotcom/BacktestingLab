@@ -105,7 +105,7 @@ export function StrategyViewChart({
   );
   const [lines, setLines] = useState<{ name: string; data: { date: string; value: number }[] }[]>([]);
   const [zones, setZones] = useState<
-    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string; base_length?: number; impulse_score?: number }[]
+    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string; base_length?: number; impulse_score?: number; touches?: number; strength?: number }[]
   >([]);
   const [viewParamsSchema, setViewParamsSchema] = useState<StrategyParams>({});
   const [viewParamsValues, setViewParamsValues] = useState<StrategyParams>({});
@@ -490,9 +490,15 @@ export function StrategyViewChart({
         ? "#22c55e"
         : z.name === "Supply"
           ? "#ef4444"
-          : z.name === "BOS"
-            ? "#f59e0b"
-            : "#3b82f6";
+          : z.name === "Support"
+            ? "#22c55e"
+            : z.name === "Resistance"
+              ? "#ef4444"
+              : z.name === "BOS" || z.name === "BOS (M)"
+                ? z.name === "BOS (M)"
+                  ? "#fbbf24"
+                  : "#f59e0b"
+                : "#3b82f6";
 
     if (isLine) {
       zoneShapes.push({
@@ -518,7 +524,22 @@ export function StrategyViewChart({
     }
 
     if (z.name) {
-      const label = z.name === "Demand" ? "D" : z.name === "Supply" ? "S" : z.name;
+      let label =
+        z.name === "Demand"
+          ? "D"
+          : z.name === "Supply"
+            ? "S"
+            : z.name === "Support"
+              ? "Sup"
+              : z.name === "Resistance"
+                ? "Res"
+                : z.name === "BOS (M)"
+                  ? "BOS M"
+                  : z.name;
+      const imp = typeof z.impulse_score === "number" && z.impulse_score > 0 ? z.impulse_score : null;
+      const touches = typeof z.touches === "number" && z.touches > 0 ? z.touches : null;
+      if (imp !== null) label += ` ${imp}`;
+      if (touches !== null && (z.name === "Support" || z.name === "Resistance")) label += ` (${touches})`;
       const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
       zoneAnnotations.push({
         x: (idxStart + idxEnd) / 2,
@@ -751,8 +772,22 @@ export function StrategyViewChart({
                 )}
               </div>
               <div>
-                <h4 className="text-sm font-medium text-amber-400/90 mb-2">Zóny (BOS / S-D)</h4>
-                <p className="text-xs text-zinc-500 mb-2">Break of Structure – čára od Swing H/L k místu, kde se BOS stal. S/D Zones: Demand (zelená), Supply (červená).</p>
+                <h4 className="text-sm font-medium text-amber-400/90 mb-2">S/D zóny</h4>
+                <p className="text-xs text-zinc-500 mb-2">Demand (zelená), Supply (červená). Zóny vznikají na základě BOS.</p>
+                <p className="text-xs text-zinc-500 mb-2">
+                  <span className="text-amber-400/80 font-medium">Silnost move ze zóny (Impulse):</span> 1–4 (4=velmi silný, 3=silný, 2=průměrný, 1=slabý). Sloupec Impulse u každé zóny.
+                  {zones.length > 0 && (() => {
+                    const withImpulse = zones.filter((z) => typeof z.impulse_score === "number" && z.impulse_score > 0);
+                    if (withImpulse.length === 0) return null;
+                    const avg = Math.round(withImpulse.reduce((s, z) => s + (z.impulse_score ?? 0), 0) / withImpulse.length);
+                    const maxZ = withImpulse.reduce((a, b) => ((a.impulse_score ?? 0) > (b.impulse_score ?? 0) ? a : b));
+                    return (
+                      <span className="block mt-1 text-amber-300/90">
+                        Průměr: {avg}/4 · Nejsilnější: {maxZ.name} {maxZ.impulse_score}/4
+                      </span>
+                    );
+                  })()}
+                </p>
                 {zones.length === 0 ? (
                   <div className="space-y-1">
                     <p className="text-sm text-zinc-500 italic">Žádné zóny</p>

@@ -190,7 +190,17 @@ def _run_view_code(
                             zone["base_length"] = int(item["base_length"])
                         if "impulse_score" in item:
                             zone["impulse_score"] = int(item["impulse_score"])
+                        if "touches" in item:
+                            zone["touches"] = int(item["touches"])
+                        if "strength" in item:
+                            zone["strength"] = int(item["strength"])
+                        if "has_touch" in item:
+                            zone["has_touch"] = bool(item["has_touch"])
                         zones.append(zone)
+
+        # Pro moduly se zónami (S/D): doplnit Major Swing HL z dependency, pokud chybí
+        if zones and module_dependencies:
+            _merge_major_markers_from_deps(markers, df, params, module_dependencies, tmp_dir)
 
         return markers, lines, zones
     finally:
@@ -220,6 +230,69 @@ def _call_with_params(fn, df: pd.DataFrame, params: dict):
     except (ValueError, TypeError):
         pass
     return fn(df)
+
+
+def _merge_major_markers_from_deps(
+    markers: list[dict],
+    df: pd.DataFrame,
+    params: dict,
+    module_dependencies: dict[str, str],
+    tmp_dir: "Path | None",
+) -> None:
+    """
+    Doplní major_high a major_low markery z dependency modulu (Swing_HL).
+    Použije se pro S/D Zones, aby Major Swing HL byly vždy viditelné na grafu.
+    """
+    import importlib.util
+    import sys
+
+    if not tmp_dir or not tmp_dir.exists() or str(tmp_dir) not in sys.path:
+        return
+
+    existing = {(m["date"], m["type"]) for m in markers}
+    has_major = any(t in ("major_high", "major_low") for _, t in existing)
+    if has_major:
+        return  # už máme major markery
+
+    for mod_name in ("Swing_HL", "HL_identificator"):
+        if mod_name not in module_dependencies:
+            continue
+        mod_path = tmp_dir / "modules" / f"{mod_name}.py"
+        if not mod_path.exists():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location(
+                f"view_dep_{mod_name}", mod_path
+            )
+            dep_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(dep_mod)
+            if not hasattr(dep_mod, "detect"):
+                continue
+            result = _call_with_params(dep_mod.detect, df, params)
+            if not isinstance(result, list):
+                continue
+            for item in result:
+                if not (
+                    isinstance(item, dict)
+                    and "date" in item
+                    and "type" in item
+                    and "value" in item
+                ):
+                    continue
+                t = str(item["type"]).lower()
+                if t not in ("major_high", "major_low"):
+                    continue
+                key = (str(item["date"])[:10], t)
+                if key not in existing:
+                    markers.append({
+                        "date": key[0],
+                        "type": t,
+                        "value": float(item["value"]),
+                    })
+                    existing.add(key)
+            break  # stačí jeden dependency
+        except Exception:
+            continue
 
 
 @router.post("/view")

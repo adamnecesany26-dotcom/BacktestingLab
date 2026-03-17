@@ -157,7 +157,9 @@ export function ModuleOutputChart({
     }
 
     if (z.name) {
-      const label = z.name === "Demand" ? "D" : z.name === "Supply" ? "S" : z.name;
+      let label = z.name === "Demand" ? "D" : z.name === "Supply" ? "S" : z.name;
+      const imp = (z as { impulse_score?: number }).impulse_score;
+      if (typeof imp === "number" && imp > 0) label += ` ${imp}`;
       const t1 = new Date(z.date_start).getTime();
       const t2 = new Date(z.date_end).getTime();
       const midDate = new Date((t1 + t2) / 2).toISOString().slice(0, 10);

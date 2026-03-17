@@ -267,14 +267,19 @@ def _run_module_outputs(
                             and "value_low" in item
                             and "value_high" in item
                         ):
-                            zones.append({
+                            zone = {
                                 "date_start": str(item["date_start"])[:10],
                                 "date_end": str(item["date_end"])[:10],
                                 "value_low": float(item["value_low"]),
                                 "value_high": float(item["value_high"]),
                                 "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
                                 "name": str(item["name"]) if item.get("name") else None,
-                            })
+                            }
+                            if "base_length" in item:
+                                zone["base_length"] = int(item["base_length"])
+                            if "impulse_score" in item:
+                                zone["impulse_score"] = int(item["impulse_score"])
+                            zones.append(zone)
 
             outputs[name] = {"markers": markers, "lines": lines, "zones": zones}
         except Exception as e:

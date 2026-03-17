@@ -50,7 +50,7 @@ for z in zones:
     if z["name"] == "Demand":
         # long setup – cena v zóně z["value_low"] .. z["value_high"]
         # z["base_length"] – počet svíček doleva
-        # z["impulse_score"] – síla momentum 1–10
+        # z["impulse_score"] – síla momentum 1–4
         pass
     elif z["name"] == "Supply":
         # short setup
@@ -88,7 +88,7 @@ Vrací S/D zóny (pouze Demand a Supply, ne BOS).
         "fillcolor": "rgba(34, 197, 94, 0.25)",
         "name": "Demand",
         "base_length": int,      # počet svíček doleva od pivotu
-        "impulse_score": int,   # 1–10 síla momentum ze zóny
+        "impulse_score": int,   # 1–4 síla momentum ze zóny
     },
     {"name": "Supply", ...},
 ]
@@ -133,19 +133,18 @@ V podobném místě (cenový overlap ≥ 25 %) a blízkém čase (≤ 7 barů) n
 
 ---
 
-## 5. Impulse score (1–10)
+## 5. Impulse score (1–4)
 
-Hodnocení síly momentum ze zóny. Komponenty (max 10 bodů):
+**Síla pohybu ze zóny**:
 
-| Komponenta | Max | Popis |
-|------------|-----|-------|
-| Body dominance | 2 | Průměr body/(H–L) u pivot + 2 barů |
-| Direction alignment | 2 | Barvy svíček ve směru (bullish Demand, bearish Supply) |
-| FVG | 2 | Fair Value Gap v momentum leg |
-| Consecutive momentum | 2 | Po sobě jdoucí bary ve směru |
-| Range expansion | 2 | Velikost pohybu vs. ATR |
+- **4** = velmi silný pohyb
+- **3** = silný pohyb
+- **2** = průměrný pohyb
+- **1** = slabý pohyb
 
-Normalizace na 1–10. Vyšší = silnější impulz.
+- **agg** = `move / (ATR × √bars)` – rychlost pohybu
+- **direction_factor** = 0.3 + 0.7 × (svíčky ve směru / celkem)
+- **agg_adj** = agg × direction_factor → prahy 0.5 / 0.28 / 0.12 pro 4 / 3 / 2
 
 ---
 
@@ -201,8 +200,8 @@ Normalizace na 1–10. Vyšší = silnější impulz.
 
 ### Impulse score je vždy nízký
 
-- **Příčina**: Slabý momentum v momentum leg, žádné FVG, malý pohyb vs. ATR
-- **Řešení**: Očekávané u choppy trhu. Pro filtraci setupů použij např. `impulse_score >= 6`.
+- **Příčina**: Malý pohyb (move/ATR) nebo pomalý pohyb (mnoho barů na krátkou vzdálenost)
+- **Řešení**: Očekávané u choppy trhu. Pro filtraci setupů použij např. `impulse_score >= 3`.
 
 ---
 
