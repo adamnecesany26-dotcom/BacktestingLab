@@ -49,6 +49,30 @@ async function resolveModuleDependencies(
   return out;
 }
 
+/** Klíče pro přepínání viditelnosti – rozšířitelné pro další moduly */
+export type VisibilityKey =
+  | "swing_hl"
+  | "internal_hl"
+  | "major_hl"
+  | "bos_levels"
+  | "inducement_points"
+  | "demand_supply_zones"
+  | "support_resistance_zones"
+  | "premium_discount_zones"
+  | "lines";
+
+const DEFAULT_VISIBILITY: Record<VisibilityKey, boolean> = {
+  swing_hl: true,
+  internal_hl: true,
+  major_hl: true,
+  bos_levels: true,
+  inducement_points: true,
+  demand_supply_zones: true,
+  support_resistance_zones: true,
+  premium_discount_zones: true,
+  lines: true,
+};
+
 const TIMEFRAMES = [
   { label: "1M", years: 0.083 },
   { label: "3M", years: 0.25 },
@@ -105,12 +129,14 @@ export function StrategyViewChart({
   );
   const [lines, setLines] = useState<{ name: string; data: { date: string; value: number }[] }[]>([]);
   const [zones, setZones] = useState<
-    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string; base_length?: number; impulse_score?: number; touches?: number; strength?: number }[]
+    { date_start: string; date_end: string; value_low: number; value_high: number; fillcolor?: string; name?: string; base_length?: number; impulse_score?: number; touches?: number; strength?: number; inducements?: { date: string; value: number; type: string }[]; inducement_count?: number; inducement_points?: number; has_gap?: boolean; gap_type?: string; gap_date?: string; gap_value_low?: number; gap_value_high?: number }[]
   >([]);
   const [viewParamsSchema, setViewParamsSchema] = useState<StrategyParams>({});
   const [viewParamsValues, setViewParamsValues] = useState<StrategyParams>({});
   const [paramsDrawerOpen, setParamsDrawerOpen] = useState(false);
+  const [visibilityPanelOpen, setVisibilityPanelOpen] = useState(false);
   const [valuesModalOpen, setValuesModalOpen] = useState(false);
+  const [visibility, setVisibility] = useState<Record<VisibilityKey, boolean>>(() => ({ ...DEFAULT_VISIBILITY }));
   const viewParamsRef = useRef<StrategyParams>({});
   useEffect(() => {
     viewParamsRef.current = viewParamsValues;
@@ -333,6 +359,78 @@ export function StrategyViewChart({
     .filter((p) => p.idx >= 0);
   const otherMapped = otherMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
 
+  const inducementPointsByZone = zones.flatMap((z) =>
+    (z.inducements ?? []).map((ind) => {
+      const rawIndex = (ind as { index?: number }).index;
+      let idx: number;
+      if (typeof rawIndex === "number" && !Number.isNaN(rawIndex)) {
+        idx = Math.max(0, Math.min(rawIndex, n - 1));
+      } else {
+        idx = dateToIndex.get((ind.date ?? "").slice(0, 10)) ?? -1;
+      }
+      return { idx, val: ind.value, zoneName: z.name };
+    })
+  ).filter((p): p is { idx: number; val: number; zoneName: string } => p.idx >= 0);
+
+  const inducementDemand = inducementPointsByZone.filter((p) => p.zoneName === "Demand");
+  const inducementSupply = inducementPointsByZone.filter((p) => p.zoneName === "Supply");
+  const inducementOther = inducementPointsByZone.filter((p) => p.zoneName !== "Demand" && p.zoneName !== "Supply");
+  const inducementPoints = inducementPointsByZone;
+
+  const inducementDemandTrace: any =
+    inducementDemand.length > 0
+      ? {
+          type: "scatter",
+          x: inducementDemand.map((p) => p.idx),
+          y: inducementDemand.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 10,
+            color: "#3b82f6",
+            symbol: "diamond",
+            line: { color: "#fff", width: 1 },
+          },
+          name: "Inducement (D)",
+          showlegend: true,
+        }
+      : null;
+
+  const inducementSupplyTrace: any =
+    inducementSupply.length > 0
+      ? {
+          type: "scatter",
+          x: inducementSupply.map((p) => p.idx),
+          y: inducementSupply.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 10,
+            color: "#a855f7",
+            symbol: "diamond",
+            line: { color: "#fff", width: 1 },
+          },
+          name: "Inducement (S)",
+          showlegend: true,
+        }
+      : null;
+
+  const inducementOtherTrace: any =
+    inducementOther.length > 0
+      ? {
+          type: "scatter",
+          x: inducementOther.map((p) => p.idx),
+          y: inducementOther.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 10,
+            color: "#64748b",
+            symbol: "diamond",
+            line: { color: "#fff", width: 1 },
+          },
+          name: "Inducement",
+          showlegend: true,
+        }
+      : null;
+
   const highTrace: any = {
     type: "scatter",
     x: highMapped.map((p) => p.idx),
@@ -478,9 +576,17 @@ export function StrategyViewChart({
     })
     .filter((t) => t.x.length > 0);
 
+  const isBosZone = (name?: string) => name === "BOS" || name === "BOS (M)";
+  const isDemandSupplyZone = (name?: string) => name === "Demand" || name === "Supply";
+  const isSupportResistanceZone = (name?: string) => name === "Support" || name === "Resistance";
+
   const zoneShapes: any[] = [];
   const zoneAnnotations: any[] = [];
   for (const z of zones) {
+    if (isBosZone(z.name) && !visibility.bos_levels) continue;
+    if (isDemandSupplyZone(z.name) && !visibility.demand_supply_zones) continue;
+    if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
+
     const idxStart = dateToIndex.get(z.date_start.slice(0, 10)) ?? 0;
     const idxEnd = dateToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
@@ -498,7 +604,13 @@ export function StrategyViewChart({
                 ? z.name === "BOS (M)"
                   ? "#fbbf24"
                   : "#f59e0b"
-                : "#3b82f6";
+                : z.name === "Discount"
+                  ? "#22c55e"
+                  : z.name === "Premium"
+                    ? "#ef4444"
+                    : z.name === "Mid"
+                      ? "#a1a1aa"
+                      : "#3b82f6";
 
     if (isLine) {
       zoneShapes.push({
@@ -535,10 +647,22 @@ export function StrategyViewChart({
                 ? "Res"
                 : z.name === "BOS (M)"
                   ? "BOS M"
-                  : z.name;
-      const imp = typeof z.impulse_score === "number" && z.impulse_score > 0 ? z.impulse_score : null;
+                  : z.name === "Discount"
+                    ? "Disc"
+                    : z.name === "Premium"
+                      ? "Prem"
+                      : z.name === "Mid"
+                        ? "Mid"
+                        : z.name;
+      const base = typeof z.base_length === "number" && z.base_length >= 0 ? z.base_length : null;
+      const im = typeof z.impulse_score === "number" && z.impulse_score > 0 ? z.impulse_score : null;
+      const ipCount = Math.max(0, (z as { inducement_count?: number }).inducement_count ?? 0);
+      const ipPoints = Math.max(0, z.inducement_points ?? 0);
+      const hasIp = (ipCount > 0 || ipPoints > 0) && (z.name === "Demand" || z.name === "Supply");
       const touches = typeof z.touches === "number" && z.touches > 0 ? z.touches : null;
-      if (imp !== null) label += ` ${imp}`;
+      if (base !== null && (z.name === "Demand" || z.name === "Supply")) label += ` B:${base}`;
+      if (im !== null && (z.name === "Demand" || z.name === "Supply")) label += ` IM:${im}`;
+      if (hasIp) label += ` IP:${ipCount},${ipPoints}`;
       if (touches !== null && (z.name === "Support" || z.name === "Resistance")) label += ` (${touches})`;
       const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
       zoneAnnotations.push({
@@ -588,14 +712,19 @@ export function StrategyViewChart({
   };
 
   const traces: any[] = [candlestickTrace];
-  if (highMarkers.length > 0) traces.push(highTrace);
-  if (lowMarkers.length > 0) traces.push(lowTrace);
-  if (majorHighTrace) traces.push(majorHighTrace);
-  if (majorLowTrace) traces.push(majorLowTrace);
-  if (internalHighTrace) traces.push(internalHighTrace);
-  if (internalLowTrace) traces.push(internalLowTrace);
+  if (visibility.swing_hl && highMarkers.length > 0) traces.push(highTrace);
+  if (visibility.swing_hl && lowMarkers.length > 0) traces.push(lowTrace);
+  if (visibility.major_hl && majorHighTrace) traces.push(majorHighTrace);
+  if (visibility.major_hl && majorLowTrace) traces.push(majorLowTrace);
+  if (visibility.internal_hl && internalHighTrace) traces.push(internalHighTrace);
+  if (visibility.internal_hl && internalLowTrace) traces.push(internalLowTrace);
+  if (visibility.inducement_points) {
+    if (inducementDemandTrace) traces.push(inducementDemandTrace);
+    if (inducementSupplyTrace) traces.push(inducementSupplyTrace);
+    if (inducementOtherTrace) traces.push(inducementOtherTrace);
+  }
   if (otherTrace) traces.push(otherTrace);
-  traces.push(...lineTraces);
+  if (visibility.lines) traces.push(...lineTraces);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -680,6 +809,26 @@ export function StrategyViewChart({
             className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
           >
             Shuffle
+          </button>
+          <button
+            onClick={() => setVisibilityPanelOpen(true)}
+            title="Viditelnost prvků"
+            className="p-2 rounded text-zinc-300 disabled:opacity-50 bg-zinc-700 hover:bg-zinc-600"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+              <circle cx="12" cy="12" r="3" />
+            </svg>
           </button>
           {selectedItemId && (
             <button
@@ -807,6 +956,7 @@ export function StrategyViewChart({
                           <th className="px-3 py-2 text-left text-zinc-400 font-medium">Název</th>
                           <th className="px-3 py-2 text-right text-zinc-400 font-medium">Base</th>
                           <th className="px-3 py-2 text-right text-zinc-400 font-medium">Impulse</th>
+                          <th className="px-3 py-2 text-left text-zinc-400 font-medium">Gap</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -819,6 +969,15 @@ export function StrategyViewChart({
                             <td className="px-3 py-2 text-zinc-300">{z.name ?? "—"}</td>
                             <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.base_length ?? "—"}</td>
                             <td className="px-3 py-2 text-right text-zinc-200 font-mono">{z.impulse_score ?? "—"}</td>
+                            <td className="px-3 py-2 text-zinc-300 text-xs">
+                              {z.has_gap ? (
+                                <span title={`${z.gap_type === "up" ? "Gap up" : "Gap down"} ${z.gap_date ?? ""} ${z.gap_value_low != null && z.gap_value_high != null ? `(${z.gap_value_low.toFixed(2)}–${z.gap_value_high.toFixed(2)})` : ""}`}>
+                                  {z.gap_type === "up" ? "↑" : "↓"} {z.gap_date ?? ""}
+                                </span>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
@@ -843,6 +1002,113 @@ export function StrategyViewChart({
             </div>
           </div>
         </div>
+      )}
+
+      {visibilityPanelOpen && (
+        <>
+          <div
+            className="fixed inset-0 bg-black/50 z-40"
+            onClick={() => setVisibilityPanelOpen(false)}
+            aria-hidden
+          />
+          <div className="fixed top-0 right-0 h-full w-72 max-w-[90vw] bg-zinc-900 border-l border-zinc-700 shadow-xl z-50 flex flex-col">
+            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-700 shrink-0">
+              <h3 className="text-sm font-medium text-zinc-200">Viditelnost prvků</h3>
+              <button
+                onClick={() => setVisibilityPanelOpen(false)}
+                className="p-1.5 rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200"
+                aria-label="Zavřít"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto p-4 space-y-3">
+              {[
+                {
+                  key: "swing_hl" as const,
+                  label: "Swing HL",
+                  hasData: highMarkers.length > 0 || lowMarkers.length > 0,
+                },
+                {
+                  key: "internal_hl" as const,
+                  label: "Internal HL",
+                  hasData: internalHighMarkers.length > 0 || internalLowMarkers.length > 0,
+                },
+                {
+                  key: "major_hl" as const,
+                  label: "Major HL",
+                  hasData: majorHighMarkers.length > 0 || majorLowMarkers.length > 0,
+                },
+                {
+                  key: "bos_levels" as const,
+                  label: "BOS úrovně",
+                  hasData: zones.some((z) => z.name === "BOS" || z.name === "BOS (M)"),
+                },
+                {
+                  key: "inducement_points" as const,
+                  label: "Inducement points",
+                  hasData:
+                    inducementPoints.length > 0 ||
+                    zones.some((z) => (z.inducements?.length ?? 0) > 0),
+                },
+                {
+                  key: "demand_supply_zones" as const,
+                  label: "Demand / Supply zóny",
+                  hasData: zones.some((z) => z.name === "Demand" || z.name === "Supply"),
+                },
+                {
+                  key: "support_resistance_zones" as const,
+                  label: "Support / Resistance zóny",
+                  hasData: zones.some((z) => z.name === "Support" || z.name === "Resistance"),
+                },
+                {
+                  key: "premium_discount_zones" as const,
+                  label: "Premium / Mid / Discount",
+                  hasData: zones.some(
+                    (z) => z.name === "Discount" || z.name === "Mid" || z.name === "Premium"
+                  ),
+                },
+                {
+                  key: "lines" as const,
+                  label: "Čáry (indikátory)",
+                  hasData: lines.length > 0,
+                },
+              ].map(({ key, label, hasData }) => (
+                <label
+                  key={key}
+                  className={`flex items-center gap-3 cursor-pointer py-1.5 ${
+                    !hasData ? "opacity-50 cursor-not-allowed" : ""
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={visibility[key]}
+                    onChange={(e) =>
+                      setVisibility((prev) => ({ ...prev, [key]: e.target.checked }))
+                    }
+                    disabled={!hasData}
+                    className="rounded"
+                  />
+                  <span className="text-sm text-zinc-300">{label}</span>
+                  {!hasData && (
+                    <span className="text-xs text-zinc-500 ml-auto">(žádná data)</span>
+                  )}
+                </label>
+              ))}
+            </div>
+            <div className="p-4 border-t border-zinc-700 shrink-0">
+              <button
+                onClick={() => setVisibility({ ...DEFAULT_VISIBILITY })}
+                className="w-full px-4 py-2 rounded bg-zinc-700 hover:bg-zinc-600 text-sm text-zinc-300"
+              >
+                Obnovit výchozí
+              </button>
+            </div>
+          </div>
+        </>
       )}
 
       {paramsDrawerOpen && selectedItemId && (

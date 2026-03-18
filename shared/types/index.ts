@@ -120,6 +120,16 @@ export interface ModuleZone {
   value_high: number;
   fillcolor?: string;
   name?: string;
+  base_length?: number;
+  impulse_score?: number;
+  inducements?: { date: string; value: number; type: string }[];
+  inducement_count?: number;
+  inducement_points?: number;
+  has_gap?: boolean;
+  gap_type?: string;
+  gap_date?: string;
+  gap_value_low?: number;
+  gap_value_high?: number;
 }
 
 /** Module output (markers, lines, zones from detect/get_line/get_zones) */

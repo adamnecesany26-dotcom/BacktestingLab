@@ -15,7 +15,8 @@ Použití:
 
 Interface pro View:
   detect(ohlc, params=None) -> [{"date","type":"high"|"low"|"internal_high"|"internal_low","value"}, ...]
-  get_zones(ohlc, params=None) -> [{"date_start","date_end","value_low","value_high","fillcolor","name","base_length","impulse_score"}, ...]
+  get_zones(ohlc, params=None) -> [{"date_start","date_end","value_low","value_high","fillcolor","name","base_length","impulse_score",
+    "has_gap"?, "gap_type"?, "gap_date"?, "gap_value_low"?, "gap_value_high"?}, ...]
 
 Pravidla S/D v-1.0 (viz SD_def.md):
 - Demand: bullish BOS + pivot = bar s min(low) v momentum leg (od swing low k BOS)
@@ -49,6 +50,10 @@ VIEW_PARAMS = {
     "zone_price_overlap_threshold": 0.25,
     # Touch v blízkosti: předchozí bar musí být do X×ATR od zóny (tap před vyražením)
     "zone_touch_vicinity_atr": 0.5,
+    # Inducement (pasivní likvidita): max. vzdálenost H/L od zóny v ATR
+    "inducement_max_distance_atr": 2.0,
+    # Inducement: max. barů od pivotu (pohyb od zóny)
+    "inducement_max_bars": 40,
 }
 
 
@@ -56,6 +61,17 @@ def _to_date_str(ts: Any) -> str:
     if hasattr(ts, "strftime"):
         return ts.strftime("%Y-%m-%d")
     return str(ts)[:10]
+
+
+def _bar_overlap_ratio(bar_high: float, bar_low: float, zone_low: float, zone_high: float) -> float:
+    """Podíl H-L range svíčky v zóně. 0 pokud bar_range <= 0."""
+    bar_range = bar_high - bar_low
+    if bar_range <= 0:
+        return 0.0
+    overlap_low = max(zone_low, bar_low)
+    overlap_high = min(zone_high, bar_high)
+    overlap_len = max(0.0, overlap_high - overlap_low)
+    return overlap_len / bar_range
 
 
 def _compute_zone_width(
@@ -106,6 +122,43 @@ def _compute_zone_width(
     return leftmost
 
 
+def _compute_base_width(
+    ohlc: pd.DataFrame,
+    pivot_idx: int,
+    zone_low: float,
+    zone_high: float,
+    rightmost: int,
+    base_threshold: float = 0.49,
+) -> int:
+    """
+    Base = svíčky s >= base_threshold (49%) své H-L range v zóně, v obou směrech od pivotu.
+    Vrací počet barů (min 1).
+    """
+    high = ohlc["high"].values if "high" in ohlc.columns else ohlc["High"].values
+    low = ohlc["low"].values if "low" in ohlc.columns else ohlc["Low"].values
+    n = len(ohlc)
+
+    leftmost_base = pivot_idx
+    for j in range(pivot_idx - 1, -1, -1):
+        bar_high = float(high[j])
+        bar_low = float(low[j])
+        if _bar_overlap_ratio(bar_high, bar_low, zone_low, zone_high) >= base_threshold:
+            leftmost_base = j
+        else:
+            break
+
+    rightmost_base = pivot_idx
+    for j in range(pivot_idx + 1, min(rightmost + 1, n)):
+        bar_high = float(high[j])
+        bar_low = float(low[j])
+        if _bar_overlap_ratio(bar_high, bar_low, zone_low, zone_high) >= base_threshold:
+            rightmost_base = j
+        else:
+            break
+
+    return max(1, rightmost_base - leftmost_base + 1)
+
+
 def _compute_zone_width_right(
     ohlc: pd.DataFrame,
     pivot_idx: int,
@@ -118,8 +171,10 @@ def _compute_zone_width_right(
 ) -> tuple[int, bool]:
     """
     Vrátí (rightmost_idx, has_touch).
-    Zóna zaniká při prvním close pod (Demand) resp. nad (Supply) zónou.
-    has_touch = True pokud byl dotyk v blízkosti zóny (cena ještě nevyrazila, tapnula a pak vyrazila).
+    Zóna zaniká: 1) close invalidation (close pod/nad zónou), NEBO
+                 2) dotyk ceny se zónou POTÉ, co cena nejdřív opustila zónu
+                    (Demand: bar_low > zone_high pak bar_low <= zone_high; Supply: obráceně).
+    has_touch = True pokud byl dotyk v blízkosti zóny (tap před vyražením).
     """
     high = ohlc["high"].values if "high" in ohlc.columns else ohlc["High"].values
     low = ohlc["low"].values if "low" in ohlc.columns else ohlc["Low"].values
@@ -128,6 +183,7 @@ def _compute_zone_width_right(
 
     rightmost = pivot_idx
     has_touch = False
+    has_left_zone = False
 
     for j in range(pivot_idx + 1, min(pivot_idx + max_bars + 1, n)):
         bar_close = float(close[j])
@@ -135,10 +191,26 @@ def _compute_zone_width_right(
         bar_low = float(low[j])
 
         if zone_type == "Demand":
+            if bar_low > zone_high:
+                has_left_zone = True
+            if has_left_zone and bar_low <= zone_high:
+                atr_val = float(atr_series.iloc[min(j - 1, n - 1)]) if j > 0 else 1e-8
+                if atr_val <= 0:
+                    atr_val = 1e-8
+                margin = atr_val * touch_vicinity_atr
+                prev_close = float(close[j - 1])
+                if zone_low - margin <= prev_close <= zone_high + margin:
+                    has_touch = True
+                # Touch má prioritu – zóna končí 3 bary po dotyku (rezerva pro entry)
+                rightmost = min(j + 3, n - 1)
+                break
             if bar_close < zone_low:
                 rightmost = j - 1
                 break
-            if bar_low <= zone_high:
+        else:
+            if bar_high < zone_low:
+                has_left_zone = True
+            if has_left_zone and bar_high >= zone_low:
                 atr_val = float(atr_series.iloc[min(j - 1, n - 1)]) if j > 0 else 1e-8
                 if atr_val <= 0:
                     atr_val = 1e-8
@@ -146,18 +218,12 @@ def _compute_zone_width_right(
                 prev_close = float(close[j - 1])
                 if zone_low - margin <= prev_close <= zone_high + margin:
                     has_touch = True
-        else:
+                # Touch má prioritu – zóna končí 3 bary po dotyku (rezerva pro entry)
+                rightmost = min(j + 3, n - 1)
+                break
             if bar_close > zone_high:
                 rightmost = j - 1
                 break
-            if bar_high >= zone_low:
-                atr_val = float(atr_series.iloc[min(j - 1, n - 1)]) if j > 0 else 1e-8
-                if atr_val <= 0:
-                    atr_val = 1e-8
-                margin = atr_val * touch_vicinity_atr
-                prev_close = float(close[j - 1])
-                if zone_low - margin <= prev_close <= zone_high + margin:
-                    has_touch = True
 
         rightmost = j
     return rightmost, has_touch
@@ -167,13 +233,18 @@ def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
     Swing pointy + Major Swing HL + Internal HL pro View.
     """
+    get_major_swings = None
     try:
-        from modules.Swing_HL import get_swings
+        from modules.Swing_HL import get_swings, get_major_swings
     except ImportError:
         try:
             from modules.HL_identificator import get_swings
         except ImportError:
             return []
+        try:
+            from modules.HL_identificator import get_major_swings
+        except ImportError:
+            get_major_swings = None
 
     params = dict(params or {})
     params["include_internals"] = True
@@ -182,10 +253,16 @@ def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         swings = result.get("swings", [])
         internals = result.get("internals", [])
         major_swings = result.get("major_swings", [])
+        if not major_swings and get_major_swings:
+            maj_params = {"timeframe": params.get("timeframe", "1d"), "data_timeframe": params.get("data_timeframe"), **params}
+            major_swings = get_major_swings(ohlc, maj_params)
     else:
         swings = result
         internals = []
         major_swings = []
+        if get_major_swings:
+            maj_params = {"timeframe": params.get("timeframe", "1d"), "data_timeframe": params.get("data_timeframe"), **params}
+            major_swings = get_major_swings(ohlc, maj_params)
 
     out: list[dict] = []
     for s in major_swings:
@@ -364,6 +441,137 @@ def _find_pivot_momentum_leg(
         return max_high_idx
 
 
+def _find_inducements(
+    ohlc: pd.DataFrame,
+    zone_low: float,
+    zone_high: float,
+    pivot_idx: int,
+    rightmost: int,
+    zone_type: str,
+    swings: list[dict],
+    internals: list[dict],
+    major_swings: list[dict],
+    atr_series: pd.Series,
+    params: dict,
+) -> tuple[list[dict], int]:
+    """
+    Inducement = H/L (swing/internal/major) během pohybu od zóny – pasivní likvidita.
+    Demand: hledáme lows; Supply: hledáme highs.
+    Pravidla: max vzdálenost od zóny (ATR).
+    Invalidation: 1) cena udělala nižší low (Demand) / vyšší high (Supply) než inducement;
+                  2) novější inducement sáhl pod/nad starší.
+    Vrací (inducements, inducement_count, inducement_points).
+    inducement_count = počet míst, inducement_points = bodování (max 4).
+    """
+    max_dist_atr = float(params.get("inducement_max_distance_atr", 2.0))
+    max_bars = int(params.get("inducement_max_bars", 40))
+    search_end = min(pivot_idx + max_bars, rightmost, len(ohlc) - 1)
+    search_start = pivot_idx + 1
+    if search_end <= search_start:
+        return [], 0
+
+    atr_val = float(atr_series.iloc[pivot_idx]) if pivot_idx < len(atr_series) else float(atr_series.iloc[-1])
+    if atr_val <= 0:
+        atr_val = 1e-8
+
+    # Demand: zone_high je horní hranice; low inducement musí být blízko (nad zone_high, do max_dist_atr*ATR)
+    # Supply: zone_low je dolní hranice; high inducement musí být blízko (pod zone_low, do max_dist_atr*ATR)
+    if zone_type == "Demand":
+        ref_level = zone_high
+        max_dist = max_dist_atr * atr_val
+        # low je validní pokud je v [zone_high - malá tolerance, zone_high + max_dist] - vlastně "nad" zónou
+        # Inducement low = pullback během pohybu nahoru. Musí být blízko zóny = ne moc daleko nad zone_high
+        def in_range(val: float) -> bool:
+            dist = val - ref_level  # distance above zone
+            return 0 <= dist <= max_dist  # low musí být nad zónou, ale ne moc daleko
+
+        def invalidation(newer_val: float, older_val: float) -> bool:
+            return newer_val < older_val  # novější low pod starším = starší invalidní
+    else:
+        ref_level = zone_low
+        max_dist = max_dist_atr * atr_val
+        def in_range(val: float) -> bool:
+            dist = ref_level - val  # distance below zone
+            return 0 <= dist <= max_dist  # high musí být pod zónou, ale ne moc daleko
+
+        def invalidation(newer_val: float, older_val: float) -> bool:
+            return newer_val > older_val  # novější high nad starším = starší invalidní
+
+    candidates: list[dict] = []
+
+    def add(t: str, pts: int, s: dict):
+        idx = s.get("index", -1)
+        if search_start <= idx <= search_end:
+            val = float(s.get("price", 0))
+            if in_range(val):
+                candidates.append({"index": idx, "value": val, "type": t, "points": pts})
+
+    for s in swings:
+        if zone_type == "Demand" and s.get("type") == "low":
+            add("swing_low", 2, s)
+        elif zone_type == "Supply" and s.get("type") == "high":
+            add("swing_high", 2, s)
+
+    for s in internals:
+        if zone_type == "Demand" and s.get("type") == "low":
+            add("internal_low", 1, s)
+        elif zone_type == "Supply" and s.get("type") == "high":
+            add("internal_high", 1, s)
+
+    for s in major_swings:
+        if zone_type == "Demand" and s.get("type") == "major_low":
+            add("major_low", 4, s)
+        elif zone_type == "Supply" and s.get("type") == "major_high":
+            add("major_high", 4, s)
+
+    # Invalidation: 1) cena udělala nižší low (Demand) / vyšší high (Supply) než inducement -> invalidní
+    # 2) novější inducement sáhl pod/nad starší -> starší invalidní
+    low_col = ohlc["low"].values if "low" in ohlc.columns else ohlc["Low"].values
+    high_col = ohlc["high"].values if "high" in ohlc.columns else ohlc["High"].values
+    n_bars = len(ohlc)
+
+    candidates.sort(key=lambda x: x["index"])
+    valid: list[dict] = []
+    for i, c in enumerate(candidates):
+        invalidated = False
+        ind_idx = c["index"]
+        ind_val = c["value"]
+        for j in range(ind_idx + 1, min(search_end + 1, n_bars)):
+            if zone_type == "Demand":
+                if float(low_col[j]) < ind_val:
+                    invalidated = True
+                    break
+            else:
+                if float(high_col[j]) > ind_val:
+                    invalidated = True
+                    break
+        if invalidated:
+            continue
+        for j in range(i + 1, len(candidates)):
+            if invalidation(candidates[j]["value"], ind_val):
+                invalidated = True
+                break
+        if not invalidated:
+            valid.append(c)
+
+    # count = počet míst (úrovní likvidity), total = bodování (internal=1, swing=2, major=4, max 4)
+    count = len(valid)
+    total = min(4, sum(c["points"] for c in valid))
+
+    index = ohlc.index
+    inducements = [
+        {
+            "date": _to_date_str(index[c["index"]]),
+            "value": c["value"],
+            "type": c["type"],
+            "index": c["index"],
+        }
+        for c in valid
+    ]
+
+    return inducements, count, total
+
+
 def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
     Supply/Demand zóny v-1.0 - BOS-based.
@@ -372,12 +580,16 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     Supply: pivot = bar s max(high) od swing high k BOS.
     """
     try:
-        from modules.Swing_HL import get_bos, get_swings
+        from modules.Swing_HL import get_bos, get_swings, get_major_swings
     except ImportError:
         try:
-            from modules.HL_identificator import get_bos, get_swings
+            from modules.HL_identificator import get_bos, get_swings, get_major_swings
         except ImportError:
-            return []
+            try:
+                from modules.HL_identificator import get_bos, get_swings
+            except ImportError:
+                return []
+            get_major_swings = None
 
     params = params or {}
     threshold = float(params.get("zone_overlap_threshold", 0.33))
@@ -399,8 +611,23 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     if not events:
         return []
 
-    swing_result = get_swings(ohlc, params)
-    swings = swing_result["swings"] if isinstance(swing_result, dict) else swing_result
+    swing_params = dict(params)
+    swing_params["include_internals"] = True
+    swing_result = get_swings(ohlc, swing_params)
+    if isinstance(swing_result, dict):
+        swings = swing_result.get("swings", [])
+        internals = swing_result.get("internals", [])
+        major_swings = swing_result.get("major_swings", [])
+        if not major_swings and get_major_swings:
+            maj_params = {"timeframe": params.get("timeframe", "1d"), "data_timeframe": params.get("data_timeframe"), **params}
+            major_swings = get_major_swings(ohlc, maj_params)
+    else:
+        swings = swing_result
+        internals = []
+        major_swings = []
+        if get_major_swings:
+            maj_params = {"timeframe": params.get("timeframe", "1d"), "data_timeframe": params.get("data_timeframe"), **params}
+            major_swings = get_major_swings(ohlc, maj_params)
 
     zones: list[dict] = []
 
@@ -438,14 +665,28 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         zone_low = float(low_col.iloc[pivot_idx])
         zone_high = float(high_col.iloc[pivot_idx])
 
-        # Gap mezi pivotem a následující svíčkou: zóna se protáhne do High/Low následující svíčky
+        # Detekce gapu přímo u zóny (mezi pivotem a následující svíčkou) – zóna se NEROZŠIŘUJE
+        gap_info: dict | None = None
         if pivot_idx + 1 < len(ohlc):
             next_low = float(low_col.iloc[pivot_idx + 1])
             next_high = float(high_col.iloc[pivot_idx + 1])
+            next_date = _to_date_str(index[pivot_idx + 1])
             if next_low > zone_high:
-                zone_high = next_low
-            if next_high < zone_low:
-                zone_low = next_high
+                gap_info = {
+                    "has_gap": True,
+                    "gap_type": "up",
+                    "gap_date": next_date,
+                    "gap_value_low": zone_high,
+                    "gap_value_high": next_low,
+                }
+            elif next_high < zone_low:
+                gap_info = {
+                    "has_gap": True,
+                    "gap_type": "down",
+                    "gap_date": next_date,
+                    "gap_value_low": next_high,
+                    "gap_value_high": zone_low,
+                }
 
         if ev["type"] == "bos_bullish":
             zone_type = "Demand"
@@ -475,15 +716,21 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
 
         if ev["type"] == "bos_bullish":
             leftmost = _compute_zone_width(ohlc, pivot_idx, zone_low, zone_high, threshold, body_threshold)
-            base_length = pivot_idx - leftmost
+            base_length = _compute_base_width(ohlc, pivot_idx, zone_low, zone_high, rightmost)
             impulse_score = _compute_impulse_score(
                 ohlc, pivot_idx, bos_idx, "Demand",
                 high_col, low_col, open_col, close_col, atr_series, atr_period,
             )
+            inducements, inducement_count, inducement_points = _find_inducements(
+                ohlc, zone_low, zone_high, pivot_idx, rightmost, "Demand",
+                swings, internals, major_swings, atr_series, params,
+            )
             fill = "rgba(34, 197, 94, 0.35)" if has_touch else "rgba(34, 197, 94, 0.25)"
-            zones.append({
+            zone_dict: dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
+                "start_idx": leftmost,
+                "end_idx": rightmost,
                 "value_low": zone_low,
                 "value_high": zone_high,
                 "fillcolor": fill,
@@ -492,19 +739,31 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
-            })
+                "inducements": inducements,
+                "inducement_count": inducement_count,
+                "inducement_points": inducement_points,
+            }
+            if gap_info:
+                zone_dict.update(gap_info)
+            zones.append(zone_dict)
             added_sd.append((pivot_idx, zone_low, zone_high, "Demand"))
         elif ev["type"] == "bos_bearish":
             leftmost = _compute_zone_width(ohlc, pivot_idx, zone_low, zone_high, threshold, body_threshold)
-            base_length = pivot_idx - leftmost
+            base_length = _compute_base_width(ohlc, pivot_idx, zone_low, zone_high, rightmost)
             impulse_score = _compute_impulse_score(
                 ohlc, pivot_idx, bos_idx, "Supply",
                 high_col, low_col, open_col, close_col, atr_series, atr_period,
             )
+            inducements, inducement_count, inducement_points = _find_inducements(
+                ohlc, zone_low, zone_high, pivot_idx, rightmost, "Supply",
+                swings, internals, major_swings, atr_series, params,
+            )
             fill = "rgba(239, 68, 68, 0.35)" if has_touch else "rgba(239, 68, 68, 0.25)"
-            zones.append({
+            zone_dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
+                "start_idx": leftmost,
+                "end_idx": rightmost,
                 "value_low": zone_low,
                 "value_high": zone_high,
                 "fillcolor": fill,
@@ -513,7 +772,13 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
-            })
+                "inducements": inducements,
+                "inducement_count": inducement_count,
+                "inducement_points": inducement_points,
+            }
+            if gap_info:
+                zone_dict.update(gap_info)
+            zones.append(zone_dict)
             added_sd.append((pivot_idx, zone_low, zone_high, "Supply"))
 
     return zones

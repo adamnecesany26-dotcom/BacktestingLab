@@ -2,7 +2,7 @@
   "NQ": {
     "tick_size": 0.25,
     "tick_value": 20,
-    "mult": 80,
+    "mult": 20,
     "margin": 20000,
     "commission_per_contract": 2.5
   },

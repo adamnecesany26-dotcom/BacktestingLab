@@ -602,7 +602,7 @@ def get_swings(
     min_bars = max(int(params.get("min_bars_between_swings", 4)), 2)
 
     if work_ohlc is None or len(work_ohlc) < atr_period + 2:
-        return {"swings": [], "internals": []} if include_internals else []
+        return {"swings": [], "internals": [], "major_swings": []} if include_internals else []
 
     def _map_swings_to_original(sws: list[dict]) -> list[dict]:
         if work_ohlc is original_ohlc:

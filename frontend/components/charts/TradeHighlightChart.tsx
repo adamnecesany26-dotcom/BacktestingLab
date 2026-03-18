@@ -10,10 +10,14 @@ interface TradeHighlightChartProps {
   height?: number;
 }
 
-const CONTEXT_BARS = 5;
+const CONTEXT_BARS = 15;
 
+/** Normalize date to YYYY-MM-DD for matching (handles ISO, datetime, timezone). */
 function toYmd(s: string): string {
-  return (s || "").slice(0, 10);
+  const raw = (s || "").trim();
+  if (!raw) return "";
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : raw.slice(0, 10);
 }
 
 /** Get OHLC slice for a single trade - entry to exit + context bars before/after */

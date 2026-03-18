@@ -49,6 +49,17 @@ def load_strategy(strategy_path: str):
     raise ValueError("No bt.Strategy subclass found in strategy file")
 
 
+def _filter_params_for_strategy(strategy_cls, params: dict) -> dict:
+    """Keep only params that the strategy class accepts (avoids unexpected keyword errors)."""
+    if not params:
+        return {}
+    try:
+        accepted = {x[0] for x in strategy_cls.params._getitems()}
+    except Exception:
+        return params
+    return {k: v for k, v in params.items() if k in accepted}
+
+
 def load_data(
     data_path: str,
     instrument: str,
@@ -166,6 +177,26 @@ def run_backtest(
                     print(f"PROGRESS:{pct}", file=sys.stderr, flush=True)
                     self._last_pct = pct
 
+    _recorded_trade_ids = set()
+
+    def _get_executed_price(order, default):
+        """Get actual fill price from order.executed (not limit/stop price)."""
+        ex = getattr(order, "executed", None)
+        if ex is not None:
+            p = getattr(ex, "price", None)
+            if p is not None and p != 0:
+                return float(p)
+        return default
+
+    def _get_price_from_history_entry(histentry, default):
+        """TradeHistory.event.price = execution price (not Order object)."""
+        ev = getattr(histentry, "event", None)
+        if ev is not None:
+            p = getattr(ev, "price", None)
+            if p is not None and p != 0:
+                return float(p)
+        return default
+
     class TradeRecordingStrategy(strategy_cls):
         """Wraps user strategy to record closed trades via notify_trade and notify_order."""
 
@@ -179,9 +210,13 @@ def run_backtest(
                 _record_trade(order.trade)
 
     def _record_trade(trade):
-        """Record a closed trade to trades_list."""
+        """Record a closed trade to trades_list. Deduplicated (notify_trade + notify_order both fire)."""
         if not trade.isclosed:
             return
+        tid = id(trade)
+        if tid in _recorded_trade_ids:
+            return
+        _recorded_trade_ids.add(tid)
         try:
             dt_open = trade.open_datetime() if hasattr(trade, "open_datetime") else None
             dt_close = trade.close_datetime() if hasattr(trade, "close_datetime") else None
@@ -189,15 +224,26 @@ def run_backtest(
             entry_price = trade.price
             exit_price = trade.price
             if hasattr(trade, "history") and trade.history:
-                op = trade.history[0]
-                size = abs(getattr(op, "size", 1)) or 1
-                is_long = getattr(op, "size", 1) > 0
-                entry_price = float(getattr(op, "price", trade.price))
-                exit_price = float(getattr(trade.history[-1], "price", trade.price))
+                h_open = trade.history[0]
+                h_close = trade.history[-1]
+                ev_open = getattr(h_open, "event", None)
+                ev_close = getattr(h_close, "event", None)
+                if ev_open is not None:
+                    exec_size = getattr(ev_open, "size", None)
+                    size = abs(exec_size) if exec_size is not None else 1
+                    is_long = (exec_size or 0) > 0
+                entry_price = _get_price_from_history_entry(h_open, trade.price)
+                exit_price = _get_price_from_history_entry(h_close, trade.price)
+            def _format_date(dt):
+                if dt is None:
+                    return ""
+                s = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+                return s[:10] if len(s) >= 10 else s
+
             trades_list.append({
-                "date": dt_close.isoformat() if dt_close else "",
-                "entryDate": dt_open.isoformat() if dt_open else "",
-                "exitDate": dt_close.isoformat() if dt_close else "",
+                "date": _format_date(dt_close),
+                "entryDate": _format_date(dt_open),
+                "exitDate": _format_date(dt_close),
                 "type": "buy" if is_long else "sell",
                 "size": size,
                 "pnl": round(trade.pnlcomm, 2),
@@ -256,7 +302,7 @@ def run_backtest(
     )
     cerebro.adddata(data_bt)
     cerebro.addstrategy(EquityRecorder, total_bars=total_bars)
-    params = strategy_params or {}
+    params = _filter_params_for_strategy(strategy_cls, strategy_params or {})
     cerebro.addstrategy(TradeRecordingStrategy, **params)
 
     initial_capital = float(os.environ.get("INITIAL_CAPITAL", "100000"))
@@ -268,7 +314,7 @@ def run_backtest(
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
 
-    results = cerebro.run()
+    results = cerebro.run(tradehistory=True)
     strat = results[1]  # User strategy (0=EquityRecorder)
 
     # Fallback: if notify_trade/notify_order didn't capture trades, try strategy's _trades

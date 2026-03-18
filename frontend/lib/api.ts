@@ -86,6 +86,15 @@ export interface ViewLine {
   data: { date: string; value: number }[];
 }
 
+/** Inducement point (pasivní likvidita) */
+export interface ViewInducement {
+  date: string;
+  value: number;
+  type: string;
+  /** Bar index pro přesné umístění na grafu (intraday data) */
+  index?: number;
+}
+
 /** Zone/box for View chart */
 export interface ViewZone {
   date_start: string;
@@ -99,6 +108,15 @@ export interface ViewZone {
   touches?: number;
   strength?: number;
   has_touch?: boolean;
+  inducements?: ViewInducement[];
+  inducement_count?: number;
+  inducement_points?: number;
+  /** Gap přímo u zóny (mezi pivotem a následující svíčkou) */
+  has_gap?: boolean;
+  gap_type?: "up" | "down";
+  gap_date?: string;
+  gap_value_low?: number;
+  gap_value_high?: number;
 }
 
 /** Fetch OHLC + optional module markers/lines/zones for View chart. */

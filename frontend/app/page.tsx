@@ -356,7 +356,10 @@ export default function Home() {
 
     const allFiles: Record<string, string> = {};
     for (const f of files) {
-      const content = await getFileContent(openItem.type, openItem.id, f.fileName);
+      const content =
+        f.fileName === "main.py" && selectedFile === "main.py" && fileContent
+          ? fileContent
+          : await getFileContent(openItem.type, openItem.id, f.fileName);
       if (content != null) allFiles[f.fileName] = content;
     }
     const toModuleName = (n: string) =>
@@ -382,6 +385,22 @@ export default function Home() {
       addLog("Chyba: žádné soubory k spuštění");
       return;
     }
+
+    // Params z aktuálního main.py (ne z cache) – odpovídá kódu, který posíláme
+    const mainContent = allFiles["main.py"];
+    const runStrategyParams = mainContent ? parseStrategyParams(mainContent) : strategyParams;
+    const runParams = (() => {
+      const flat: Record<string, unknown> = { ...runStrategyParams };
+      const mods: Record<string, Record<string, number | boolean | string>> = {};
+      for (const modId of selectedModuleIds) {
+        const mod = modules.find((m) => m.id === modId);
+        if (!mod) continue;
+        const p = moduleParams[mod.name];
+        if (p && Object.keys(p).length > 0) mods[mod.name] = p;
+      }
+      if (Object.keys(mods).length > 0) flat.module_params = mods;
+      return Object.keys(flat).length > 0 ? flat : undefined;
+    })();
 
     const controller = new AbortController();
     setAbortController(controller);
@@ -420,7 +439,7 @@ export default function Home() {
           lot_size: backtestParams.lotSize,
           pip_size: backtestParams.pipSize,
           pip_value: backtestParams.pipValue,
-          params: buildMergedParams(),
+          params: runParams,
           applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
         },
         controller.signal,

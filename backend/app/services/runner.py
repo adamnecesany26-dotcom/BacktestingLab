@@ -6,6 +6,7 @@ Uses subprocess.Popen (not asyncio) - Python 3.14 on Windows has NotImplementedE
 
 import asyncio
 import json
+import re
 import subprocess
 import threading
 from pathlib import Path
@@ -14,6 +15,20 @@ from typing import AsyncGenerator, Awaitable, Callable, Union
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 
 RUN_TIMEOUT = 180  # 3 minutes
+
+
+def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[str]:
+    """Parse Strategy.params tuple from Python code to get accepted param names."""
+    content = ""
+    if files:
+        content = files.get("main.py") or files.get("strategy.py") or (next(iter(files.values())) if files else "")
+    if not content and code:
+        content = code
+    if not content:
+        return set()
+    # Match ("param_name", or ('param_name', inside params = ( ... )
+    matches = re.findall(r'\(\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']\s*[,\)]', content)
+    return set(matches)
 
 
 def _read_stream_sync(
@@ -279,6 +294,25 @@ def _run_module_outputs(
                                 zone["base_length"] = int(item["base_length"])
                             if "impulse_score" in item:
                                 zone["impulse_score"] = int(item["impulse_score"])
+                            if "has_gap" in item:
+                                zone["has_gap"] = bool(item["has_gap"])
+                            if "gap_type" in item:
+                                zone["gap_type"] = str(item["gap_type"])
+                            if "gap_date" in item:
+                                zone["gap_date"] = str(item["gap_date"])[:10]
+                            if "gap_value_low" in item:
+                                zone["gap_value_low"] = float(item["gap_value_low"])
+                            if "gap_value_high" in item:
+                                zone["gap_value_high"] = float(item["gap_value_high"])
+                            if "inducements" in item and isinstance(item["inducements"], list):
+                                zone["inducements"] = [
+                                    {"date": str(x.get("date", ""))[:10], "value": float(x.get("value", 0)), "type": str(x.get("type", ""))}
+                                    for x in item["inducements"] if isinstance(x, dict)
+                                ]
+                            if "inducement_count" in item:
+                                zone["inducement_count"] = int(item["inducement_count"])
+                            if "inducement_points" in item:
+                                zone["inducement_points"] = int(item["inducement_points"])
                             zones.append(zone)
 
             outputs[name] = {"markers": markers, "lines": lines, "zones": zones}
@@ -326,6 +360,12 @@ async def run_strategy_streaming(
     entry_file = _prepare_strategy_files(run_dir, code, files)
     strategy_path = run_dir / entry_file
 
+    # Filter params to only those the strategy accepts (avoids "unexpected keyword argument")
+    accepted_params = _extract_strategy_param_names(files, code)
+    filtered_params = strategy_params
+    if accepted_params:
+        filtered_params = {k: v for k, v in (strategy_params or {}).items() if k in accepted_params}
+
     try:
         if not data_dir.exists():
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -356,7 +396,7 @@ async def run_strategy_streaming(
             "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
             "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
             "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
-            "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(strategy_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
+            "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
             "backtest-engine",
         ]
 

@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { EquityChart } from "@/components/charts/EquityChart";
 import { TradesChart } from "@/components/charts/TradesChart";
-import { DetailedChart } from "@/components/charts/DetailedChart";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { TradeHighlight } from "@/components/results/TradeHighlight";
 import { RunHistory } from "@/components/results/RunHistory";
@@ -12,7 +11,7 @@ import { TradesTable } from "@/components/results/TradesTable";
 import type { RunResponse } from "@shared/types";
 import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "trades" | "highlight" | "detailed" | "modules" | "runHistory";
+type TabId = "equity" | "trades" | "highlight" | "detailed" | "runHistory";
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -51,12 +50,21 @@ export function ResultsView({
   }
 
   const hasModuleOutputs = !!results.moduleOutputs && Object.keys(results.moduleOutputs).length > 0;
+  const mergedOutput = hasModuleOutputs
+    ? {
+        markers: Object.values(results.moduleOutputs!).flatMap((o) => o.markers ?? []),
+        lines: Object.entries(results.moduleOutputs!).flatMap(([mod, o]) =>
+          (o.lines ?? []).map((l) => ({ ...l, name: `${mod}: ${l.name ?? "line"}` }))
+        ),
+        zones: Object.values(results.moduleOutputs!).flatMap((o) => o.zones ?? []),
+      }
+    : { markers: [] as any[], lines: [] as any[], zones: [] as any[] };
+
   const tabs: { id: TabId; label: string }[] = [
     { id: "equity", label: "Equity" },
     { id: "trades", label: "Trades" },
     { id: "highlight", label: "Highlight" },
     { id: "detailed", label: "Detailed" },
-    ...(hasModuleOutputs ? [{ id: "modules" as TabId, label: "Moduly" }] : []),
     { id: "runHistory", label: "Run history" },
   ];
 
@@ -95,7 +103,7 @@ export function ResultsView({
 
       <div
         className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
-          activeTab === "highlight" || activeTab === "detailed" || activeTab === "modules" || activeTab === "runHistory"
+          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory"
             ? "min-h-[560px]"
             : "min-h-[480px]"
         }`}
@@ -133,22 +141,17 @@ export function ResultsView({
         {activeTab === "highlight" && (
           <TradeHighlight ohlc={results.ohlc ?? []} trades={results.trades} chartHeight={360} />
         )}
-        {activeTab === "detailed" && (
+        {activeTab === "detailed" && results.ohlc && (
           <div className="py-4 h-full overflow-auto">
-            <DetailedChart ohlc={results.ohlc ?? []} trades={results.trades} height={520} />
-          </div>
-        )}
-        {activeTab === "modules" && hasModuleOutputs && results.ohlc && (
-          <div className="py-4 h-full overflow-auto space-y-4">
-            {Object.entries(results.moduleOutputs!).map(([modName, modOut]) => (
+            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
               <ModuleOutputChart
-                key={modName}
-                ohlc={results.ohlc!}
-                moduleName={modName}
-                output={modOut}
-                height={420}
+                ohlc={results.ohlc}
+                moduleName="Detailed"
+                output={mergedOutput}
+                trades={results.trades}
+                height={520}
               />
-            ))}
+            </div>
           </div>
         )}
         {activeTab === "runHistory" && (

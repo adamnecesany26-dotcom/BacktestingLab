@@ -15,8 +15,12 @@ function parseDate(s: string): number {
   return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
+/** Normalize date to YYYY-MM-DD for matching. */
 function toDateKey(s: string): string {
-  return (s || "").slice(0, 10);
+  const raw = (s || "").trim();
+  if (!raw) return "";
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${match[1]}-${match[2]}-${match[3]}` : raw.slice(0, 10);
 }
 
 /** Find OHLC bar date that matches the given trade date (by day). */

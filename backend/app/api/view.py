@@ -196,6 +196,22 @@ def _run_view_code(
                             zone["strength"] = int(item["strength"])
                         if "has_touch" in item:
                             zone["has_touch"] = bool(item["has_touch"])
+                        if "inducements" in item and isinstance(item["inducements"], list):
+                            zone["inducements"] = item["inducements"]
+                        if "inducement_count" in item:
+                            zone["inducement_count"] = int(item["inducement_count"])
+                        if "inducement_points" in item:
+                            zone["inducement_points"] = int(item["inducement_points"])
+                        if "has_gap" in item:
+                            zone["has_gap"] = bool(item["has_gap"])
+                        if "gap_type" in item:
+                            zone["gap_type"] = str(item["gap_type"])
+                        if "gap_date" in item:
+                            zone["gap_date"] = str(item["gap_date"])[:10]
+                        if "gap_value_low" in item:
+                            zone["gap_value_low"] = float(item["gap_value_low"])
+                        if "gap_value_high" in item:
+                            zone["gap_value_high"] = float(item["gap_value_high"])
                         zones.append(zone)
 
         # Pro moduly se zónami (S/D): doplnit Major Swing HL z dependency, pokud chybí
