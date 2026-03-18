@@ -120,6 +120,61 @@ export function toModuleParamPrefix(name: string): string {
     .toLowerCase() || "module";
 }
 
+/** Normalize Python module token to comparable format. */
+export function normalizePythonModuleToken(name: string): string {
+  return (name || "")
+    .trim()
+    .replace(/\.py$/i, "")
+    .replace(/[^a-zA-Z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .toLowerCase();
+}
+
+export interface StrategyImportDependencies {
+  indicators: string[];
+  modules: string[];
+}
+
+/**
+ * Parse indicator/module imports from strategy code.
+ * Examples:
+ *  - from indicators.EMA_20 import ...
+ *  - import modules.Swing_HL as sh
+ */
+export function parseStrategyImportDependencies(code: string): StrategyImportDependencies {
+  if (!code || typeof code !== "string") {
+    return { indicators: [], modules: [] };
+  }
+
+  const indicators = new Set<string>();
+  const modules = new Set<string>();
+
+  const fromRegex = /^\s*from\s+(indicators|modules)\.([a-zA-Z_][a-zA-Z0-9_]*)\s+import\s+/gm;
+  const importRegex = /^\s*import\s+(indicators|modules)\.([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+as\s+[a-zA-Z_][a-zA-Z0-9_]*)?/gm;
+
+  let match: RegExpExecArray | null;
+  while ((match = fromRegex.exec(code)) !== null) {
+    const group = match[1];
+    const token = normalizePythonModuleToken(match[2]);
+    if (!token) continue;
+    if (group === "indicators") indicators.add(token);
+    if (group === "modules") modules.add(token);
+  }
+
+  while ((match = importRegex.exec(code)) !== null) {
+    const group = match[1];
+    const token = normalizePythonModuleToken(match[2]);
+    if (!token) continue;
+    if (group === "indicators") indicators.add(token);
+    if (group === "modules") modules.add(token);
+  }
+
+  return {
+    indicators: Array.from(indicators),
+    modules: Array.from(modules),
+  };
+}
+
 /**
  * Parse VIEW_PARAMS = {...} from Python code for View mode.
  * Same format as PARAMS - used when building modules/indicators/strategies

@@ -44,7 +44,7 @@ async function resolveModuleDependencies(
     if (!mod) continue;
     usedIds.add(mod.id);
     const content = await getFileContent("modules", mod.id, "main.py");
-    if (content) out["Swing_HL"] = content;
+    if (content) out[toModuleName(name)] = content;
   }
   return out;
 }
@@ -194,6 +194,7 @@ export function StrategyViewChart({
       setError(e instanceof Error ? e.message : String(e));
       setOhlc([]);
       setMarkers([]);
+      setLines([]);
       setZones([]);
     } finally {
       setLoading(false);
@@ -276,6 +277,10 @@ export function StrategyViewChart({
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      setOhlc([]);
+      setMarkers([]);
+      setLines([]);
+      setZones([]);
     } finally {
       setLoading(false);
     }
@@ -301,7 +306,8 @@ export function StrategyViewChart({
 
   const n = ohlc.length;
   const indices = Array.from({ length: n }, (_, i) => i);
-  const dateToIndex = new Map(ohlc.map((b, i) => [b.date.slice(0, 10), i]));
+  const dateToIndex = new Map(ohlc.map((b, i) => [b.date, i]));
+  const dayToIndex = new Map(ohlc.map((b, i) => [b.date.slice(0, 10), i]));
   const opens = ohlc.map((b) => b.open);
   const highs = ohlc.map((b) => b.high);
   const lows = ohlc.map((b) => b.low);
@@ -343,7 +349,7 @@ export function StrategyViewChart({
   );
 
   const mapMarkerToIndex = (m: ViewMarker) => {
-    const idx = dateToIndex.get(m.date.slice(0, 10));
+    const idx = dateToIndex.get(m.date) ?? dayToIndex.get(m.date.slice(0, 10));
     return idx ?? -1;
   };
 
@@ -366,7 +372,7 @@ export function StrategyViewChart({
       if (typeof rawIndex === "number" && !Number.isNaN(rawIndex)) {
         idx = Math.max(0, Math.min(rawIndex, n - 1));
       } else {
-        idx = dateToIndex.get((ind.date ?? "").slice(0, 10)) ?? -1;
+        idx = dateToIndex.get(ind.date ?? "") ?? dayToIndex.get((ind.date ?? "").slice(0, 10)) ?? -1;
       }
       return { idx, val: ind.value, zoneName: z.name };
     })
@@ -556,7 +562,7 @@ export function StrategyViewChart({
   const lineTraces = lines
     .map((line, i) => {
       const pts = line.data
-        .map((p) => ({ idx: dateToIndex.get(p.date.slice(0, 10)) ?? -1, val: p.value }))
+        .map((p) => ({ idx: dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1, val: p.value }))
         .filter((p) => p.idx >= 0)
         .sort((a, b) => a.idx - b.idx);
       const color = (line as { color?: string }).color ?? lineColors[i % lineColors.length];
@@ -586,9 +592,10 @@ export function StrategyViewChart({
     if (isBosZone(z.name) && !visibility.bos_levels) continue;
     if (isDemandSupplyZone(z.name) && !visibility.demand_supply_zones) continue;
     if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
+    if ((z.name === "Discount" || z.name === "Mid" || z.name === "Premium") && !visibility.premium_discount_zones) continue;
 
-    const idxStart = dateToIndex.get(z.date_start.slice(0, 10)) ?? 0;
-    const idxEnd = dateToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
+    const idxStart = dateToIndex.get(z.date_start) ?? dayToIndex.get(z.date_start.slice(0, 10)) ?? 0;
+    const idxEnd = dateToIndex.get(z.date_end) ?? dayToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
     const isLine = z.value_low === z.value_high;
     const lineColor =

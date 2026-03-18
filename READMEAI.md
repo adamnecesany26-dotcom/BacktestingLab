@@ -97,9 +97,9 @@ Backtesting_app/
 │   ├── components/
 │   │   ├── Sidebar.tsx           # Left panel: type selector, items, files
 │   │   ├── MainView.tsx          # List of strategies/indicators/modules
-│   │   ├── BacktestSettings.tsx  # Right panel: Instrument, Params, Run
+│   │   ├── BacktestSettings.tsx  # Right panel: collapsible Basic/Instrument config/Simulation/Indicators&Modules/Parameters/Run
 │   │   ├── editor/StrategyEditor.tsx
-│   │   ├── results/ResultsView.tsx, StatBlocks, TradesTable, TradeHighlight, RunHistory
+│   │   ├── results/ResultsView.tsx, StatBlocks, TradeHighlight, RunHistory, AnalyticsView
 │   │   ├── charts/DetailedChart, EquityChart, ModuleOutputChart, ...
 │   │   ├── StrategyViewChart.tsx # View mode chart
 │   │   ├── FaqModal.tsx
@@ -135,7 +135,7 @@ Backtesting_app/
 | `indicators`, `modules` | From Firestore listItems |
 | `selectedIndicatorIds`, `selectedModuleIds` | Checkbox selection |
 | `appliedIndicatorIds`, `appliedModuleIds` | After "Potvrdit" (Confirm) |
-| `backtestParams` | instrumentType, tickSize, valuePerTick, initialCapital, slippagePerc, ... |
+| `backtestParams` | instrumentType, tickSize, valuePerTick, initialCapital, slippagePerc, commissionPerc, ... |
 | `strategyParams`, `moduleParams` | From PARAMS/VIEW_PARAMS parsing |
 | `results` | RunResponse after backtest |
 | `runHistory` | SavedBacktestRun[] from Firestore |
@@ -151,11 +151,12 @@ Backtesting_app/
 
 **Flow: Run backtest**
 1. `handleRun` checks: openItem?.type === "strategies", main.py exists, selectedInstrument
-2. Builds `allFiles`: strategy files + `indicators/{Name}.py` for applied indicators + `modules/{Name}.py` for applied modules
-3. `runBacktestStreaming(request, abortSignal, onEvent)` → SSE
-4. On `result` event: `setResults(data)`, `setShowResults(true)`
-5. `saveBacktestResult(strategyId, strategyName, payload)` → Firestore
-6. `listBacktestResults(strategyId)` → `setRunHistory`
+2. Auto-detects imports from `main.py` (`from indicators.X`, `from modules.Y`) and preselects matching items (user can still edit checkboxes)
+3. Builds `allFiles`: strategy files + `indicators/{Name}.py` for selected indicators + `modules/{Name}.py` for selected modules
+4. `runBacktestStreaming(request, abortSignal, onEvent)` → SSE
+5. On `result` event: `setResults(data)`, `setShowResults(true)`
+6. `saveBacktestResult(strategyId, strategyName, payload)` → Firestore
+7. `listBacktestResults(strategyId)` → `setRunHistory`
 
 **Flow: View mode**
 1. User toggles View → `setViewMode(true)`
@@ -188,11 +189,31 @@ Backtesting_app/
   "data_file": "mock/NQ_5Y.csv",
   "initial_capital": 100000,
   "slippage_perc": 0.001,
+  "commission_perc": 0.0002,
   "instrument_type": "futures",
   "tick_size": 0.25,
   "value_per_tick": 5,
   "params": { "sma_fast": 20, "module_params": { "Swing HL": { "timeframe": "1d" } } },
-  "applied_modules": [{ "id": "...", "name": "Swing HL", "params": { "timeframe": "1d" } }]
+  "applied_modules": [{ "id": "...", "name": "Swing HL", "params": { "timeframe": "1d" } }],
+  "run_id": "run_20260318_abc123",
+  "validation_mode": "walk_forward",
+  "validation_config": { "folds": 4, "test_ratio": 0.2 },
+  "quality_gates": { "min_trades": 30, "max_dd": 25, "min_pf": 1.2, "min_sortino": 0.5 },
+  "sweep_mode": "random",
+  "sweep_config": { "max_samples": 24, "param_ranges": { "risk_pct": { "min": 0.5, "max": 2.0 } } },
+  "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50 },
+  "regime_config": { "enabled": true },
+  "portfolio_config": { "instruments": [] },
+  "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0 },
+  "experiment": {
+    "hypothesis": "edge-test",
+    "tags": ["manual-run"],
+    "runDiff": {
+      "totalReturnUsd": { "current": 1500, "baseline": 900, "delta": 600, "deltaPct": 66.6667 }
+    },
+    "promoteEvidence": { "gatePassed": true, "promoteRequested": true, "stabilityScore": 0.61, "promote": true },
+    "promoteDecision": "candidate_for_promote"
+  }
 }
 ```
 
@@ -200,9 +221,9 @@ Backtesting_app/
 ```json
 {
   "equity": [100000, 100500, ...],
-  "equityCurve": [{ "date": "2024-01-01", "value": 100000 }, ...],
-  "metrics": { "finalEquity", "sharpeRatio", "maxDrawdown", "tradeCount", "winRate", ... },
-  "trades": [{ "entryDate", "exitDate", "type", "size", "pnl", "entryPrice", "exitPrice" }, ...],
+  "equityCurve": [{ "date": "2024-01-01T00:00:00", "value": 100000 }, ...],
+  "metrics": { "finalEquity", "maxEquity", "sharpeRatio", "maxDrawdown", "maxDrawdownPct", "maxDrawdownUsd", "commissionPerc", "tradeCount", "winRate", ... },
+  "trades": [{ "entryDate", "exitDate", "type", "size", "pnl", "entryPrice", "exitPrice", "mfe", "mae", "mfePct", "maePct" }, ...],
   "ohlc": [{ "date", "open", "high", "low", "close" }, ...],
   "moduleOutputs": {
     "Swing HL": {
@@ -210,7 +231,15 @@ Backtesting_app/
       "lines": [{ "name", "data": [{ "date", "value" }], "color"?: string }, ...],
       "zones": [{ "date_start", "date_end", "value_low", "value_high", "fillcolor"?, "name"? }, ...]
     }
-  }
+  },
+  "validation": { "mode": "walk_forward", "folds": [], "summary": {} },
+  "robustness": { "mode": "random", "tested": 24, "stabilityScore": 0.62, "results": [], "heatmap": {} },
+  "monteCarlo": { "simulations": 300, "drawdownPct": {}, "endingEquity": {}, "riskOfRuin": 0.12 },
+  "regimeAnalysis": { "regimes": {}, "sessions": {} },
+  "portfolio": null,
+  "executionSummary": { "enabled": true, "spreadBps": 0.5, "latencyBars": 0, "totalFees": 123.4, "totalSlippageCost": 89.1, "forwardBridge": { "mode": "paper_shadow", "driftPct": 1.2 } },
+  "qualityGate": { "passed": true, "checks": [] },
+  "experiment": { "hypothesis": "edge-test", "tags": ["manual-run"] }
 }
 ```
 

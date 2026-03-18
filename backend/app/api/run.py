@@ -45,6 +45,7 @@ async def run_backtest(request: RunRequest, req: Request):
                     data_file=request.data_file or "",
                     initial_capital=request.initial_capital,
                     slippage_perc=request.slippage_perc,
+                    commission_perc=request.commission_perc,
                     instrument_type=request.instrument_type,
                     tick_size=request.tick_size,
                     value_per_tick=request.value_per_tick,
@@ -54,6 +55,17 @@ async def run_backtest(request: RunRequest, req: Request):
                     pip_value=request.pip_value,
                     strategy_params=request.params,
                     applied_modules=request.applied_modules,
+                    run_id=request.run_id,
+                    validation_mode=request.validation_mode,
+                    validation_config=request.validation_config,
+                    quality_gates=request.quality_gates,
+                    sweep_mode=request.sweep_mode,
+                    sweep_config=request.sweep_config,
+                    monte_carlo=request.monte_carlo,
+                    regime_config=request.regime_config,
+                    portfolio_config=request.portfolio_config,
+                    execution_model=request.execution_model,
+                    experiment=request.experiment,
                     is_client_connected=is_connected,
                 ):
                     _debug_log.append(f"{ev.get('type')}: {str(ev)[:300]}")
@@ -75,9 +87,6 @@ async def run_backtest(request: RunRequest, req: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
         )
 
-    if not request.code and not request.files:
-        raise HTTPException(status_code=400, detail="Either code or files must be provided")
-
     try:
         result = await run_strategy(
             code=request.code,
@@ -88,6 +97,7 @@ async def run_backtest(request: RunRequest, req: Request):
             data_file=request.data_file or "",
             initial_capital=request.initial_capital,
             slippage_perc=request.slippage_perc,
+            commission_perc=request.commission_perc,
             instrument_type=request.instrument_type,
             tick_size=request.tick_size,
             value_per_tick=request.value_per_tick,
@@ -97,6 +107,17 @@ async def run_backtest(request: RunRequest, req: Request):
             pip_value=request.pip_value,
             strategy_params=request.params,
             applied_modules=request.applied_modules,
+            run_id=request.run_id,
+            validation_mode=request.validation_mode,
+            validation_config=request.validation_config,
+            quality_gates=request.quality_gates,
+            sweep_mode=request.sweep_mode,
+            sweep_config=request.sweep_config,
+            monte_carlo=request.monte_carlo,
+            regime_config=request.regime_config,
+            portfolio_config=request.portfolio_config,
+            execution_model=request.execution_model,
+            experiment=request.experiment,
         )
         return result
     except Exception as e:

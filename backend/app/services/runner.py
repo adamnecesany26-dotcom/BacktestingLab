@@ -5,16 +5,21 @@ Uses subprocess.Popen (not asyncio) - Python 3.14 on Windows has NotImplementedE
 """
 
 import asyncio
+import datetime as dt
 import json
+import os
 import re
+import shutil
 import subprocess
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Union
 
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 
-RUN_TIMEOUT = 180  # 3 minutes
+RUN_TIMEOUT = 0  # disabled by default (set RUN_TIMEOUT_SEC to enable)
 
 
 def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[str]:
@@ -125,6 +130,34 @@ def _merge_strategy_params(
     return merged
 
 
+def _resolve_run_timeout_seconds() -> int:
+    """
+    Resolve run timeout from env.
+    - RUN_TIMEOUT_SEC <= 0: disabled
+    - invalid value: fallback to default RUN_TIMEOUT
+    """
+    raw = os.environ.get("RUN_TIMEOUT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return RUN_TIMEOUT
+    try:
+        parsed = int(float(raw))
+    except ValueError:
+        return RUN_TIMEOUT
+    return parsed
+
+
+def _safe_join_run_path(run_dir: Path, file_path: str) -> Path:
+    """Join and validate user file path to prevent traversal outside run_dir."""
+    normalized = file_path.replace("\\", "/").lstrip("/")
+    if not normalized or normalized.startswith("../") or "/../" in normalized:
+        raise ValueError(f"Unsafe file path: {file_path}")
+    target = (run_dir / normalized).resolve()
+    run_root = run_dir.resolve()
+    if run_root != target and run_root not in target.parents:
+        raise ValueError(f"Unsafe file path: {file_path}")
+    return target
+
+
 def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, str] | None) -> str:
     """
     Write strategy files to run_dir. Returns the entry point filename (main.py or strategy.py).
@@ -137,7 +170,7 @@ def _prepare_strategy_files(run_dir: Path, code: str | None, files: dict[str, st
             pkg_dir.mkdir(parents=True, exist_ok=True)
             (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
         for file_path, content in files.items():
-            full_path = run_dir / file_path
+            full_path = _safe_join_run_path(run_dir, file_path)
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content, encoding="utf-8")
         if "main.py" in files:
@@ -336,6 +369,7 @@ async def run_strategy_streaming(
     data_file: str = "",
     initial_capital: float = 100000.0,
     slippage_perc: float = 0.001,
+    commission_perc: float = 0.0,
     instrument_type: str = "futures",
     tick_size: float | None = None,
     value_per_tick: float | None = None,
@@ -345,6 +379,17 @@ async def run_strategy_streaming(
     pip_value: float | None = None,
     strategy_params: dict | None = None,
     applied_modules: list | None = None,
+    run_id: str | None = None,
+    validation_mode: str = "single",
+    validation_config: dict | None = None,
+    quality_gates: dict | None = None,
+    sweep_mode: str | None = None,
+    sweep_config: dict | None = None,
+    monte_carlo: dict | None = None,
+    regime_config: dict | None = None,
+    portfolio_config: dict | None = None,
+    execution_model: dict | None = None,
+    experiment: dict | None = None,
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -354,7 +399,12 @@ async def run_strategy_streaming(
     backend_root = Path(__file__).resolve().parent.parent.parent
     project_root = backend_root.parent
     data_dir = project_root / "data"
-    run_dir = project_root / ".backtest_run"
+    cache_dir = project_root / ".backtest_cache"
+    run_root = project_root / ".backtest_run"
+    run_root.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    resolved_run_id = (run_id or "").strip() or f"run_{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:10]}"
+    run_dir = run_root / resolved_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     entry_file = _prepare_strategy_files(run_dir, code, files)
@@ -366,29 +416,57 @@ async def run_strategy_streaming(
     if accepted_params:
         filtered_params = {k: v for k, v in (strategy_params or {}).items() if k in accepted_params}
 
+    run_started = time.perf_counter()
     try:
         if not data_dir.exists():
             data_dir.mkdir(parents=True, exist_ok=True)
 
         run_path = str(run_dir.absolute()).replace("\\", "/")
         data_path = str(data_dir.absolute()).replace("\\", "/")
-        print(f"[runner] run_dir={run_path} data_dir={data_path}", flush=True)
+        cache_path = str(cache_dir.absolute()).replace("\\", "/")
+        print(f"[runner] run_dir={run_path} data_dir={data_path} run_id={resolved_run_id}", flush=True)
+        applied_modules_payload = [
+            {
+                "id": str(getattr(m, "id", "") if not isinstance(m, dict) else m.get("id", "")),
+                "name": str(getattr(m, "name", "") if not isinstance(m, dict) else m.get("name", "")),
+                "params": (getattr(m, "params", None) if not isinstance(m, dict) else m.get("params")) or {},
+            }
+            for m in (applied_modules or [])
+        ]
+        analysis_payload = {
+            "validation_mode": validation_mode,
+            "validation_config": validation_config or {},
+            "quality_gates": quality_gates or {},
+            "sweep_mode": sweep_mode,
+            "sweep_config": sweep_config or {},
+            "monte_carlo": monte_carlo or {},
+            "regime_config": regime_config or {},
+            "portfolio_config": portfolio_config or {},
+            "execution_model": execution_model or {},
+            "experiment": experiment or {},
+        }
         cmd = [
             "docker", "run",
             "--rm",
             "--memory=1g",
             "--cpus=1",
+            "--pids-limit=256",
             "--network", "none",
+            "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL",
             "-v", f"{run_path}:/app/strategy:rw",
             "-v", f"{data_path}:/app/data:ro",
+            "-v", f"{cache_path}:/app/cache:rw",
             "-e", f"STRATEGY_PATH=/app/strategy/{entry_file}",
             "-e", f"DATA_PATH=/app/data",
+            "-e", "DATA_CACHE_PATH=/app/cache",
             "-e", f"INSTRUMENT={instrument}",
             "-e", f"TIMEFRAME={timeframe}",
             "-e", f"YEARS={years}",
             "-e", f"DATA_FILE={data_file}",
             "-e", f"INITIAL_CAPITAL={initial_capital}",
             "-e", f"SLIPPAGE_PERC={slippage_perc}",
+            "-e", f"COMMISSION_PERC={commission_perc}",
             "-e", f"INSTRUMENT_TYPE={instrument_type}",
             "-e", f"TICK_SIZE={tick_size if tick_size is not None else ''}",
             "-e", f"VALUE_PER_TICK={value_per_tick if value_per_tick is not None else ''}",
@@ -396,7 +474,11 @@ async def run_strategy_streaming(
             "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
             "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
             "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
+            "-e", "PYTHONDONTWRITEBYTECODE=1",
+            "-e", f"RUN_ID={resolved_run_id}",
             "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
+            "-e", f"APPLIED_MODULES={json.dumps(applied_modules_payload)}",
+            "-e", f"ANALYSIS_CONFIG={json.dumps(analysis_payload)}",
             "backtest-engine",
         ]
 
@@ -412,13 +494,18 @@ async def run_strategy_streaming(
         stderr_buffer: list[str] = []
         loop = asyncio.get_event_loop()
         _read_stream_sync(proc, queue, loop, stdout_buffer, stderr_buffer)
+        run_timeout_sec = _resolve_run_timeout_seconds()
 
         async def kill_after_timeout():
-            await asyncio.sleep(RUN_TIMEOUT)
+            await asyncio.sleep(run_timeout_sec)
             if proc.poll() is None:
                 proc.kill()
 
-        timeout_task = asyncio.create_task(kill_after_timeout())
+        timeout_task = (
+            asyncio.create_task(kill_after_timeout())
+            if run_timeout_sec > 0
+            else None
+        )
 
         done_count = 0
         result_data = None
@@ -440,19 +527,27 @@ async def run_strategy_streaming(
                 continue
             if ev.get("type") == "result":
                 result_data = ev.get("data")
-                if result_data and applied_modules:
-                    ohlc_raw = result_data.get("ohlc", [])
-                    mods = [
-                        {"id": getattr(m, "id", ""), "name": getattr(m, "name", ""), "params": getattr(m, "params", None) or {}}
-                        for m in applied_modules
-                    ]
-                    try:
-                        mo = _run_module_outputs(run_dir, ohlc_raw, mods)
-                        if mo:
-                            result_data["moduleOutputs"] = mo
-                            ev = {"type": "result", "data": result_data}
-                    except Exception as ex:
-                        print(f"[runner] moduleOutputs error: {ex}", flush=True)
+                if result_data:
+                    result_data["runId"] = resolved_run_id
+                    result_data.setdefault("manifest", {})
+                    result_data["manifest"].update({
+                        "runId": resolved_run_id,
+                        "instrument": instrument,
+                        "timeframe": timeframe,
+                        "years": years,
+                        "dataFile": data_file,
+                        "instrumentType": instrument_type,
+                        "initialCapital": initial_capital,
+                        "slippagePerc": slippage_perc,
+                        "commissionPerc": commission_perc,
+                        "validationMode": validation_mode,
+                        "sweepMode": sweep_mode,
+                        "executionModel": execution_model or {},
+                        "experiment": experiment or {},
+                        "generatedAt": dt.datetime.utcnow().isoformat() + "Z",
+                        "runnerDurationMs": int((time.perf_counter() - run_started) * 1000),
+                    })
+                    ev = {"type": "result", "data": result_data}
             if ev.get("type") == "error":
                 error_msg = ev.get("message")
                 preview = (error_msg or "")[:800]
@@ -466,10 +561,11 @@ async def run_strategy_streaming(
                 proc.kill()
                 break
 
-        try:
-            timeout_task.cancel()
-        except asyncio.CancelledError:
-            pass
+        if timeout_task is not None:
+            try:
+                timeout_task.cancel()
+            except asyncio.CancelledError:
+                pass
 
         try:
             proc.wait(timeout=10)
@@ -486,18 +582,10 @@ async def run_strategy_streaming(
             )
             yield {"type": "error", "message": msg}
     finally:
-        for f in run_dir.glob("*.py"):
-            try:
-                f.unlink(missing_ok=True)
-            except Exception:
-                pass
-        for d in run_dir.iterdir():
-            if d.is_dir():
-                for f in d.rglob("*.py"):
-                    try:
-                        f.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+        try:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 async def run_strategy(
@@ -509,6 +597,7 @@ async def run_strategy(
     data_file: str = "",
     initial_capital: float = 100000.0,
     slippage_perc: float = 0.001,
+    commission_perc: float = 0.0,
     instrument_type: str = "futures",
     tick_size: float | None = None,
     value_per_tick: float | None = None,
@@ -518,6 +607,17 @@ async def run_strategy(
     pip_value: float | None = None,
     strategy_params: dict | None = None,
     applied_modules: list | None = None,
+    run_id: str | None = None,
+    validation_mode: str = "single",
+    validation_config: dict | None = None,
+    quality_gates: dict | None = None,
+    sweep_mode: str | None = None,
+    sweep_config: dict | None = None,
+    monte_carlo: dict | None = None,
+    regime_config: dict | None = None,
+    portfolio_config: dict | None = None,
+    execution_model: dict | None = None,
+    experiment: dict | None = None,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -530,6 +630,7 @@ async def run_strategy(
         data_file=data_file,
         initial_capital=initial_capital,
         slippage_perc=slippage_perc,
+        commission_perc=commission_perc,
         instrument_type=instrument_type,
         tick_size=tick_size,
         value_per_tick=value_per_tick,
@@ -539,6 +640,17 @@ async def run_strategy(
         pip_value=pip_value,
         strategy_params=strategy_params,
         applied_modules=applied_modules,
+        run_id=run_id,
+        validation_mode=validation_mode,
+        validation_config=validation_config,
+        quality_gates=quality_gates,
+        sweep_mode=sweep_mode,
+        sweep_config=sweep_config,
+        monte_carlo=monte_carlo,
+        regime_config=regime_config,
+        portfolio_config=portfolio_config,
+        execution_model=execution_model,
+        experiment=experiment,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")
@@ -551,6 +663,7 @@ async def run_strategy(
 
     ohlc_raw = result_data.get("ohlc", [])
     equity_curve_raw = result_data.get("equityCurve", [])
+    module_outputs = result_data.get("moduleOutputs")
     return RunResponse(
         equity=result_data.get("equity", []),
         equityCurve=[EquityPoint(**p) for p in equity_curve_raw] if equity_curve_raw else None,
@@ -558,4 +671,14 @@ async def run_strategy(
         trades=[Trade(**t) for t in result_data.get("trades", [])],
         ohlc=[OhlcBar(**b) for b in ohlc_raw] if ohlc_raw else None,
         moduleOutputs=module_outputs,
+        runId=result_data.get("runId"),
+        manifest=result_data.get("manifest"),
+        validation=result_data.get("validation"),
+        robustness=result_data.get("robustness"),
+        monteCarlo=result_data.get("monteCarlo"),
+        regimeAnalysis=result_data.get("regimeAnalysis"),
+        portfolio=result_data.get("portfolio"),
+        executionSummary=result_data.get("executionSummary"),
+        qualityGate=result_data.get("qualityGate"),
+        experiment=result_data.get("experiment"),
     )

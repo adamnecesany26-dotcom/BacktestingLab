@@ -285,19 +285,35 @@ export async function getMainStrategyCode(type: ItemType, itemId: string): Promi
 /** Saved backtest run - minimal shape for run history */
 export interface SavedBacktestRun {
   id: string;
+  runId?: string | null;
+  manifest?: Record<string, unknown> | null;
   strategyName: string;
   savedAt: { seconds: number; nanoseconds: number } | null;
   equityCurve?: { date: string; value: number }[];
   metrics: {
+    finalEquity?: number;
+    maxDrawdown?: number;
+    maxDrawdownPct?: number;
     sharpeRatio?: number;
     totalReturnUsd?: number;
     profitFactor?: number;
     expectancyUsd?: number;
     winRate?: number;
     rMultiple?: number;
+    sortinoRatio?: number;
+    calmarRatio?: number;
+    tradeCount?: number;
     [key: string]: unknown;
   };
   trades: unknown[];
+  validation?: Record<string, unknown> | null;
+  robustness?: Record<string, unknown> | null;
+  monteCarlo?: Record<string, unknown> | null;
+  regimeAnalysis?: Record<string, unknown> | null;
+  portfolio?: Record<string, unknown> | null;
+  executionSummary?: Record<string, unknown> | null;
+  qualityGate?: Record<string, unknown> | null;
+  experiment?: Record<string, unknown> | null;
 }
 
 /** Save backtest result under strategy. Path: /strategies/{strategyId}/results/{backtestId} */
@@ -306,7 +322,11 @@ export async function saveBacktestResult(
   strategyName: string,
   result: Record<string, unknown>
 ): Promise<string> {
-  const id = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const randomPart =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  const id = `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomPart}`;
   const ref = doc(getDb(), "strategies", strategyId, "results", id);
   await setDoc(ref, {
     strategyName,

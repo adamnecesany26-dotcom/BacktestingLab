@@ -12,7 +12,7 @@ const STAT_ITEMS = [
   { key: "rMultiple", label: "R-multiple", format: (v: number) => v.toFixed(2) },
   { key: "maxDrawdown", label: "Max Drawdown", format: (v: number) => `${v.toFixed(2)}%` },
   { key: "tradeCount", label: "Trade Count", format: (v: number) => String(v) },
-  { key: "longShort", label: "Longs / Shorts", format: (_: unknown, m: Record<string, unknown>) => `${m.longCount ?? 0} / ${m.shortCount ?? 0}` },
+  { key: "longShort", label: "Longs / Shorts", format: (_: number) => "" },
   { key: "winRate", label: "Win Rate", format: (v: number) => `${v}%` },
   { key: "totalReturn", label: "Total Return %", format: (v: number) => `${v}%` },
   { key: "totalReturnUsd", label: "Total Return USD", format: (v: number) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` },
@@ -24,17 +24,17 @@ const STAT_ITEMS = [
 export function StatBlocks({ results }: StatBlocksProps) {
   if (!results) return null;
 
-  const m = results.metrics as Record<string, unknown>;
+  const m = results.metrics as unknown as Record<string, unknown>;
 
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
       {STAT_ITEMS.map(({ key, label, format }) => {
         let value: string;
         if (key === "longShort") {
-          value = format(0, m);
+          value = `${m.longCount ?? 0} / ${m.shortCount ?? 0}`;
         } else {
           const v = m[key] as number | undefined;
-          value = v != null ? format(v, m) : "—";
+          value = v != null ? format(v) : "—";
         }
         return (
           <div

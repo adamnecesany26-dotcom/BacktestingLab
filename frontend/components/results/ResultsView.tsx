@@ -2,16 +2,15 @@
 
 import { useState } from "react";
 import { EquityChart } from "@/components/charts/EquityChart";
-import { TradesChart } from "@/components/charts/TradesChart";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { TradeHighlight } from "@/components/results/TradeHighlight";
 import { RunHistory } from "@/components/results/RunHistory";
 import { StatBlocks } from "@/components/results/StatBlocks";
-import { TradesTable } from "@/components/results/TradesTable";
+import { AnalyticsView } from "@/components/results/AnalyticsView";
 import type { RunResponse } from "@shared/types";
 import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "trades" | "highlight" | "detailed" | "runHistory";
+type TabId = "equity" | "highlight" | "detailed" | "analytics" | "runHistory";
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -62,9 +61,9 @@ export function ResultsView({
 
   const tabs: { id: TabId; label: string }[] = [
     { id: "equity", label: "Equity" },
-    { id: "trades", label: "Trades" },
     { id: "highlight", label: "Highlight" },
     { id: "detailed", label: "Detailed" },
+    { id: "analytics", label: "Analytics" },
     { id: "runHistory", label: "Run history" },
   ];
 
@@ -101,9 +100,13 @@ export function ResultsView({
         ))}
       </div>
 
+      <div className="px-6 pt-3 pb-2 shrink-0 border-b border-zinc-800">
+        <StatBlocks results={results} />
+      </div>
+
       <div
         className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
-          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory"
+          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory" || activeTab === "analytics"
             ? "min-h-[560px]"
             : "min-h-[480px]"
         }`}
@@ -127,33 +130,27 @@ export function ResultsView({
             }
           />
         )}
-        {activeTab === "trades" && (
-          <div className="flex flex-col gap-4 h-full min-h-0 overflow-auto py-4">
-            <div className="shrink-0">
-              <TradesChart trades={results.trades} height={280} />
-            </div>
-            <div className="shrink-0">
-              <h3 className="text-sm font-medium text-zinc-400 mb-2">Všechny obchody</h3>
-              <TradesTable trades={results.trades} />
-            </div>
-          </div>
-        )}
         {activeTab === "highlight" && (
           <TradeHighlight ohlc={results.ohlc ?? []} trades={results.trades} chartHeight={360} />
         )}
-        {activeTab === "detailed" && results.ohlc && (
-          <div className="py-4 h-full overflow-auto">
-            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
-              <ModuleOutputChart
-                ohlc={results.ohlc}
-                moduleName="Detailed"
-                output={mergedOutput}
-                trades={results.trades}
-                height={520}
-              />
+        {activeTab === "detailed" &&
+          (results.ohlc ? (
+            <div className="py-4 h-full overflow-auto">
+              <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
+                <ModuleOutputChart
+                  ohlc={results.ohlc}
+                  moduleName="Detailed"
+                  output={mergedOutput}
+                  trades={results.trades}
+                  height={520}
+                />
+              </div>
             </div>
-          </div>
-        )}
+          ) : (
+            <div className="h-full flex items-center justify-center text-sm text-zinc-500">
+              Detailed view není dostupný, protože run nevrátil OHLC data.
+            </div>
+          ))}
         {activeTab === "runHistory" && (
           <div className="py-4 h-full overflow-auto">
             <RunHistory
@@ -163,10 +160,11 @@ export function ResultsView({
             />
           </div>
         )}
-      </div>
-
-      <div className="mt-4 p-6 shrink-0">
-        <StatBlocks results={results} />
+        {activeTab === "analytics" && (
+          <div className="h-full overflow-auto">
+            <AnalyticsView results={results} />
+          </div>
+        )}
       </div>
     </div>
   );

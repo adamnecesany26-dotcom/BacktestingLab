@@ -27,6 +27,7 @@ export interface RunRequest {
   /** Realistic simulation params */
   initial_capital?: number;
   slippage_perc?: number;
+  commission_perc?: number;
   /** Instrument type and type-specific params */
   instrument_type?: InstrumentType;
   /** Futures: tick size, value per tick */
@@ -42,6 +43,19 @@ export interface RunRequest {
   params?: Record<string, number | boolean | string | Record<string, unknown>>;
   /** Applied modules for module outputs (markers, lines) after backtest */
   applied_modules?: { id: string; name: string; params?: Record<string, number | boolean | string> }[];
+  /** Optional client-provided run correlation id */
+  run_id?: string;
+  /** Validation mode for edge-finding workflow */
+  validation_mode?: "single" | "oos_split" | "walk_forward";
+  validation_config?: Record<string, unknown>;
+  quality_gates?: Record<string, unknown>;
+  sweep_mode?: "grid" | "random";
+  sweep_config?: Record<string, unknown>;
+  monte_carlo?: Record<string, unknown>;
+  regime_config?: Record<string, unknown>;
+  portfolio_config?: Record<string, unknown>;
+  execution_model?: Record<string, unknown>;
+  experiment?: Record<string, unknown>;
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -78,6 +92,16 @@ export interface Trade {
   pnl?: number;
   entryPrice?: number;
   exitPrice?: number;
+  mfe?: number;
+  mae?: number;
+  mfePct?: number;
+  maePct?: number;
+  fees?: number;
+  slippageCost?: number;
+  barsHeld?: number;
+  holdingMinutes?: number;
+  entryReason?: string;
+  exitReason?: string;
 }
 
 /** Equity point with date */
@@ -89,8 +113,12 @@ export interface EquityPoint {
 /** Backtest metrics */
 export interface BacktestMetrics {
   finalEquity: number;
+  maxEquity?: number;
   sharpeRatio: number;
   maxDrawdown: number;
+  maxDrawdownPct?: number;
+  maxDrawdownUsd?: number;
+  commissionPerc?: number;
   tradeCount: number;
   longCount?: number;
   shortCount?: number;
@@ -101,6 +129,11 @@ export interface BacktestMetrics {
   expectancyUsd?: number;
   expectancyR?: number;
   rMultiple?: number;
+  sortinoRatio?: number;
+  calmarRatio?: number;
+  marRatio?: number;
+  ulcerIndex?: number;
+  cagr?: number;
 }
 
 /** OHLC bar for chart */
@@ -148,6 +181,18 @@ export interface RunResponse {
   ohlc?: OhlcBar[];
   /** Outputs from applied modules (detect, get_line) - keyed by module name */
   moduleOutputs?: Record<string, ModuleOutput>;
+  /** Backend generated run id for audit trail */
+  runId?: string;
+  /** Snapshot metadata for reproducibility */
+  manifest?: Record<string, unknown>;
+  validation?: Record<string, unknown>;
+  robustness?: Record<string, unknown>;
+  monteCarlo?: Record<string, unknown>;
+  regimeAnalysis?: Record<string, unknown>;
+  portfolio?: Record<string, unknown>;
+  executionSummary?: Record<string, unknown>;
+  qualityGate?: Record<string, unknown>;
+  experiment?: Record<string, unknown>;
 }
 
 /** Project structure for file tree */

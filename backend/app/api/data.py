@@ -10,6 +10,7 @@ import json
 import pandas as pd
 
 router = APIRouter()
+_DATA_CACHE: dict[str, object] = {"signature": None, "payload": None}
 
 
 def _load_broker_config() -> dict:
@@ -75,6 +76,11 @@ def _process_csv_to_instrument(
         return None
 
 
+def _build_data_signature(mock_dir: Path) -> tuple:
+    files = sorted(mock_dir.rglob("*.csv"))
+    return tuple((str(f.relative_to(mock_dir)), int(f.stat().st_mtime_ns)) for f in files)
+
+
 @router.get("/data/debug")
 async def get_data_debug():
     """Diagnostic: returns data path and whether mock dir exists."""
@@ -105,6 +111,9 @@ async def get_available_data():
     mock_dir = data_dir / "mock"
     if not mock_dir.exists():
         return {"instruments": results}
+    signature = _build_data_signature(mock_dir)
+    if _DATA_CACHE.get("signature") == signature and _DATA_CACHE.get("payload") is not None:
+        return _DATA_CACHE["payload"]
 
     # Scan subfolders by type: mock/futures/, mock/stocks/, mock/forex/
     for subdir, inst_type in [("futures", "futures"), ("stocks", "stocks"), ("forex", "forex")]:
@@ -128,4 +137,7 @@ async def get_available_data():
             seen_files.add(f.name)
             results.append(item)
 
-    return {"instruments": results}
+    payload = {"instruments": results}
+    _DATA_CACHE["signature"] = signature
+    _DATA_CACHE["payload"] = payload
+    return payload

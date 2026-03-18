@@ -94,11 +94,13 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll }: RunHistoryProps) 
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-zinc-800 bg-zinc-800/50">
+              <th className="px-4 py-2 text-left font-medium text-zinc-400">Run ID</th>
               <th className="px-4 py-2 text-left font-medium text-zinc-400">Datum</th>
               <th className="px-4 py-2 text-right font-medium text-zinc-400">Total P/L</th>
               <th className="px-4 py-2 text-right font-medium text-zinc-400">Sharpe</th>
               <th className="px-4 py-2 text-right font-medium text-zinc-400">R-multiple</th>
               <th className="px-4 py-2 text-right font-medium text-zinc-400">WR %</th>
+              <th className="px-4 py-2 text-left font-medium text-zinc-400">Promote</th>
               <th className="px-4 py-2 w-10 text-center font-medium text-zinc-400"></th>
             </tr>
           </thead>
@@ -107,11 +109,25 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll }: RunHistoryProps) 
               const m = r.metrics ?? {};
               const pnl = m.totalReturnUsd ?? 0;
               const isWin = pnl >= 0;
+              const decisionRaw =
+                r.experiment && typeof r.experiment === "object"
+                  ? (r.experiment as Record<string, unknown>).promoteDecision
+                  : undefined;
+              const promoteDecision = String(decisionRaw ?? "n/a");
+              const promoteColor =
+                promoteDecision === "candidate_for_promote"
+                  ? "text-emerald-400"
+                  : promoteDecision === "hold"
+                    ? "text-amber-300"
+                    : "text-zinc-500";
               return (
                 <tr
                   key={r.id}
                   className="border-b border-zinc-800/80 hover:bg-zinc-800/30 transition-colors"
                 >
+                  <td className="px-4 py-2 text-zinc-400 font-mono text-xs">
+                    {(r.runId ?? r.id).slice(0, 22)}
+                  </td>
                   <td className="px-4 py-2 text-zinc-300">{formatDate(r.savedAt as { seconds: number } | null)}</td>
                   <td
                     className={`px-4 py-2 text-right font-mono ${
@@ -128,6 +144,9 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll }: RunHistoryProps) 
                   </td>
                   <td className="px-4 py-2 text-right font-mono text-zinc-300">
                     {formatNum(m.winRate)}%
+                  </td>
+                  <td className={`px-4 py-2 text-xs ${promoteColor}`}>
+                    {promoteDecision}
                   </td>
                   <td className="px-4 py-2 text-center">
                     <button

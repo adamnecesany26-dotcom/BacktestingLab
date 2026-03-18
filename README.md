@@ -13,8 +13,9 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 1. **Strategie** – uživatel vytváří a upravuje obchodní strategie v Pythonu (Backtrader API)
 2. **Indikátory a moduly** – znovupoužitelné komponenty (indikátory jako `bt.Indicator`, moduly jako utility funkce)
 3. **Parameter Panel** – dynamické parametry z `PARAMS = {...}` strategie a `VIEW_PARAMS` modulů – záložky Strategie | Modul1 | Modul2, úprava bez editace kódu
-4. **Backtest** – spuštění strategie na historických OHLCV datech v izolovaném prostředí
-5. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, win rate), seznam obchodů, candlestick grafy, záložka **Moduly** s výstupy modulů (markery, čáry)
+4. **Auto-detekce importů** – systém podle importů ve strategii předvybere indikátory/moduly (ruční úprava zůstává možná)
+5. **Backtest** – spuštění strategie na historických OHLCV datech v izolovaném prostředí
+6. **Výsledky** – equity křivka, metriky (Sharpe, drawdown, max equity, MFE/MAE), seznam obchodů, candlestick grafy, záložka **Moduly** s výstupy modulů (markery, čáry)
 6. **Trade Highlight** – detail jednoho obchodu (okno entry–exit + kontext) s interaktivním výběrem
 7. **Run history** – automatické ukládání každého runu do Firestore, tabulka + grafy metrik napříč runy
 8. **View mode** – svíčkový graf s markery/čáry z modulu/indikátoru bez backtestu; **View params drawer** – ikona vedle Obnovit otevře panel pro úpravu `VIEW_PARAMS` (period, barva, …)
@@ -27,9 +28,9 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  FRONTEND (Next.js, React)                                                   │
 │  - page.tsx: hlavní stav, orchestrace, handleRun, saveBacktestResult          │
-│  - BacktestSettings: Instrument Type, Instrument, Parameter Panel, Run      │
+│  - BacktestSettings: collapsible sekce (Basic, Instrument config, Simulation, Indicators&Modules, Parameters, Run)      │
 │  - StrategyEditor: Monaco editor (kód)                                       │
-│  - ResultsView: záložky Equity | Trades | Highlight | Detailed | Moduly | Run history│
+│  - ResultsView: záložky Equity | Highlight | Detailed | Analytics | Run history│
 │  - TradeHighlight: graf jednoho obchodu + seznam obchodů                     │
 │  - RunHistory: tabulka runů + grafy metrik (Sharpe, R-multiple, P/L, …)       │
 │  - Firebase Firestore: strategie, indikátory, moduly, results (Run history)   │
@@ -79,14 +80,14 @@ Backtesting_app/
 │   ├── components/
 │   │   ├── Sidebar.tsx          # Levý panel – Strategie/Indikátory/Moduly, soubory, Zpět
 │   │   ├── MainView.tsx         # Strategie / Indikátory / Moduly – seznam + vytvoření
-│   │   ├── BacktestSettings.tsx # Pravý panel – Instrument Type, Instrument, Parameter Panel, Run
+│   │   ├── BacktestSettings.tsx # Pravý panel – collapsible sekce Basic/Instrument config/Simulation/Indicators&Modules/Parameters/Run
 │   │   ├── BacktestResults.tsx  # (legacy) Statistiky
 │   │   ├── editor/
 │   │   │   └── StrategyEditor.tsx # Monaco editor
 │   │   ├── results/
-│   │   │   ├── ResultsView.tsx  # Kontejner výsledků – záložky Equity, Trades, Highlight, Detailed, Run history
+│   │   │   ├── ResultsView.tsx  # Kontejner výsledků – záložky Equity, Highlight, Detailed, Analytics, Run history
 │   │   │   ├── StatBlocks.tsx   # Metriky (equity, Sharpe, drawdown, win rate, …)
-│   │   │   ├── TradesTable.tsx  # Tabulka obchodů
+│   │   │   ├── AnalyticsView.tsx # Souhrnná analytika backtestu (MVP)
 │   │   │   ├── TradeHighlight.tsx # Graf jednoho obchodu + seznam obchodů (klik pro detail)
 │   │   │   └── RunHistory.tsx   # Historie runů – tabulka + grafy metrik
 │   │   ├── charts/
@@ -165,7 +166,7 @@ Backtesting_app/
 | 5 | Klikne na `main.py` | `getFileContent("strategies", id, "main.py")` → obsah do editoru |
 | 6 | Upraví kód | Monaco editor (lokální stav) |
 | 7 | Klikne **Uložit** | `saveFile("strategies", id, "main.py", content)` → Firestore |
-| 8 | (Volitelně) Vybere indikátory/moduly | Checkboxy v BacktestSettings, `onConfirmSelection` |
+| 8 | (Volitelně) Auto-detekce + ruční výběr indikátorů/modulů | Import parser (`from indicators...`, `from modules...`) předvybere checkboxy; `onConfirmSelection` pro potvrzení |
 | 9 | Vybere **Instrument Type** (Futures/Stocks/Forex) | `backtestParams.instrumentType` |
 | 10 | Vybere **Instrument** | Filtrováno podle `instrumentType` – pouze relevantní instrumenty |
 | 11 | (Volitelně) Upraví **Strategy Parameters** | `parseStrategyParams(main.py)` → dynamické inputy v Parameter Panel |
@@ -179,16 +180,17 @@ Backtesting_app/
 **Frontend (`handleRun` v `page.tsx`):**
 
 1. Ověří: otevřená strategie, `main.py` existuje, vybraný instrument
-2. Sestaví `allFiles`:
+2. Auto-detekuje importy z `main.py` a předvybere odpovídající indikátory/moduly
+3. Sestaví `allFiles`:
    - Všechny soubory strategie (main.py, utils.py, …)
    - Vybrané indikátory → `indicators/{Název}.py`
    - Vybrané moduly → `modules/{Název}.py`
-3. Vytvoří `AbortController` pro možnost zastavení
-4. Zavolá `runBacktestStreaming(request, signal, onEvent)`
-5. `onEvent`: `log` → přidá do LogPanelu, `progress` → aktualizuje progress bar
-6. Po `result` → `setResults(data)`, `setShowResults(true)`
-7. **Automatické uložení:** `saveBacktestResult(strategyId, strategyName, payload)` → Firestore `/strategies/{id}/results/{backtestId}`
-8. `listBacktestResults(strategyId)` → aktualizace `runHistory` pro záložku Run history
+4. Vytvoří `AbortController` pro možnost zastavení
+5. Zavolá `runBacktestStreaming(request, signal, onEvent)`
+6. `onEvent`: `log` → přidá do LogPanelu, `progress` → aktualizuje progress bar
+7. Po `result` → `setResults(data)`, `setShowResults(true)`
+8. **Automatické uložení:** `saveBacktestResult(strategyId, strategyName, payload)` → Firestore `/strategies/{id}/results/{backtestId}`
+9. `listBacktestResults(strategyId)` → aktualizace `runHistory` pro záložku Run history
 
 **Request payload (`RunRequest`):**
 
@@ -201,6 +203,7 @@ Backtesting_app/
   "data_file": "mock/NQ_5Y.csv",
   "initial_capital": 100000,
   "slippage_perc": 0.001,
+  "commission_perc": 0.0002,
   "instrument_type": "futures",
   "tick_size": 0.25,
   "value_per_tick": 5,
@@ -209,7 +212,17 @@ Backtesting_app/
   "pip_size": null,
   "pip_value": null,
   "params": { "sma_fast": 20, "sma_slow": 50, "module_params": { "Swing HL": { "timeframe": "1d", "atr_period": 10 } } },
-  "applied_modules": [{ "id": "abc123", "name": "Swing HL", "params": { "timeframe": "1d", "atr_period": 10 } }]
+  "applied_modules": [{ "id": "abc123", "name": "Swing HL", "params": { "timeframe": "1d", "atr_period": 10 } }],
+  "run_id": "run_20260318_abc123",
+  "validation_mode": "oos_split",
+  "validation_config": { "oos_ratio": 0.25 },
+  "quality_gates": { "min_trades": 30, "max_dd": 25, "min_pf": 1.2 },
+  "sweep_mode": "random",
+  "sweep_config": { "max_samples": 24 },
+  "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50 },
+  "regime_config": { "enabled": true },
+  "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0 },
+  "experiment": { "hypothesis": "sd-trend-breakout", "tags": ["manual-run"] }
 }
 ```
 
@@ -276,8 +289,12 @@ Backtesting_app/
   "equityCurve": [{"date": "2024-01-01", "value": 100000}, ...],
   "metrics": {
     "finalEquity": 105000,
+    "maxEquity": 108200,
     "sharpeRatio": 1.2,
     "maxDrawdown": 5.5,
+    "maxDrawdownPct": 5.5,
+    "maxDrawdownUsd": 6200,
+    "commissionPerc": 0.0002,
     "tradeCount": 42,
     "longCount": 25,
     "shortCount": 17,
@@ -290,7 +307,7 @@ Backtesting_app/
     "rMultiple": 0.5
   },
   "trades": [
-    {"date": "...", "entryDate": "...", "exitDate": "...", "type": "buy", "size": 1, "pnl": 150, "entryPrice": 20000, "exitPrice": 20150}
+    {"date": "...", "entryDate": "...", "exitDate": "...", "type": "buy", "size": 1, "pnl": 150, "entryPrice": 20000, "exitPrice": 20150, "mfe": 220, "mae": 80, "mfePct": 1.1, "maePct": 0.4}
   ],
   "ohlc": [{"date": "...", "open": 20000, "high": 20100, "low": 19950, "close": 20050}],
   "moduleOutputs": {
@@ -309,9 +326,9 @@ Backtesting_app/
 | Záložka | Obsah |
 |---------|-------|
 | **Equity** | EquityChart – křivka equity v čase |
-| **Trades** | TradesChart (P/L po obchodech) + TradesTable (všechny obchody) |
 | **Highlight** | TradeHighlight – graf jednoho obchodu (entry–exit + kontext) + seznam obchodů (klik pro detail) |
-| **Detailed** | DetailedChart – candlestick graf s entry/exit značkami pro celé období |
+| **Detailed** | Plotly candlestick graf s markery entry/exit + rectangle mezi entry/exit (zisk = zelená, ztráta = červená) |
+| **Analytics** | Edge-finding analytika: validation, gates, robustness heatmap, Monte Carlo, regime/portfolio, execution costs, forward bridge, run diff vs baseline, promote evidence |
 | **Moduly** | Pro každý použitý modul: Plotly graf OHLC + markery/čáry z `detect`/`get_line` (zobrazí se jen pokud backtest vrací `moduleOutputs`) |
 | **Run history** | RunHistory – tabulka runů + grafy metrik napříč runy |
 
@@ -323,13 +340,13 @@ Backtesting_app/
 
 **Run history:**
 
-- Tabulka: Datum, Total P/L, Sharpe, R-multiple, ikona smazání
+- Tabulka: Run ID, Datum, Total P/L, Sharpe, R-multiple, WR %, Promote status, ikona smazání
 - Tlačítko „Smazat vše“ s potvrzením
 - Grafy metrik: Sharpe ratio, R-multiple, Total P/L ($), Win %, Profit factor, Expectancy ($)
 - Osa X: čísla runů (1, 2, 3…), osa Y: hodnoty
 - Layout: 2 grafy na řádek (`grid-cols-2`)
 
-**StatBlocks:** zobrazí metriky aktuálního runu pod záložkami.
+**StatBlocks:** zobrazí metriky aktuálního runu konzistentně napříč taby.
 
 **Export:** JSON výsledků ke stažení (equityCurve, metrics, trades).
 
@@ -576,9 +593,9 @@ Spustí backtest.
 
 **Query:** `?stream=1` – SSE stream (log, progress, result)
 
-**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů)
+**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `commission_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů), `run_id`, `validation_mode`, `validation_config`, `quality_gates`, `sweep_mode`, `sweep_config`, `monte_carlo`, `regime_config`, `portfolio_config`, `execution_model`, `experiment`
 
-**Response (non-stream):** RunResponse (equity, equityCurve, metrics, trades, ohlc, moduleOutputs)
+**Response (non-stream):** RunResponse (equity, equityCurve, metrics incl. `maxEquity`/`maxDrawdownPct`/`maxDrawdownUsd` + `sortinoRatio`/`calmarRatio`/`marRatio`/`ulcerIndex`/`cagr`, trades incl. `mfe`/`mae`/`fees`/`slippageCost`, ohlc, moduleOutputs, `validation`, `robustness`, `monteCarlo`, `regimeAnalysis`, `portfolio`, `executionSummary` incl. `totalFees`/`totalSlippageCost`/`forwardBridge`, `qualityGate`, `experiment` incl. `runDiff`/`promoteEvidence`/`promoteDecision`)
 
 **SSE events (stream=1):**
 - `{"type": "log", "line": "..."}`
@@ -675,7 +692,7 @@ Modul **Swing HL** (`examples/swing_hl_detector.py`) vrací:
 
 ### Runner
 
-- Timeout: 180 s
+- Timeout: default **disabled** (`RUN_TIMEOUT_SEC <= 0`), optional env override
 - Docker: `--memory=1g`, `--cpus=1`, `--network none`
 
 ---

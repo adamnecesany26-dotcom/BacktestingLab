@@ -6,6 +6,7 @@ import { StrategyEditor } from "@/components/editor/StrategyEditor";
 import { CreateModal } from "@/components/CreateModal";
 import { AddFileModal } from "@/components/AddFileModal";
 import { BacktestSettings } from "@/components/BacktestSettings";
+import type { EdgeFindingSettings } from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
@@ -29,9 +30,16 @@ import {
   type FirestoreItem,
 } from "@/lib/firestore";
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
-import { parseStrategyParams, parseViewParams, type StrategyParams } from "@/lib/strategyParams";
+import {
+  parseStrategyParams,
+  parseViewParams,
+  parseStrategyImportDependencies,
+  normalizePythonModuleToken,
+  type StrategyParams,
+} from "@/lib/strategyParams";
 import {
   filterInstrumentsByType,
+  type RunRequest,
   type RunResponse,
   type DataInstrument,
   type InstrumentType,
@@ -63,6 +71,7 @@ export default function Home() {
   const [backtestParams, setBacktestParams] = useState<{
     initialCapital: number;
     slippagePerc: number;
+    commissionPerc: number;
     instrumentType: InstrumentType;
     tickSize?: number;
     valuePerTick?: number;
@@ -73,6 +82,7 @@ export default function Home() {
   }>({
     initialCapital: 100000,
     slippagePerc: 0.001,
+    commissionPerc: 0.0,
     instrumentType: "futures",
     tickSize: 0.25,
     valuePerTick: 5,
@@ -84,6 +94,33 @@ export default function Home() {
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
   const [moduleParams, setModuleParams] = useState<Record<string, StrategyParams>>({});
+  const [edgeSettings, setEdgeSettings] = useState<EdgeFindingSettings>({
+    validationMode: "single",
+    oosRatio: 0.25,
+    wfFolds: 4,
+    wfTestRatio: 0.2,
+    minTradesGate: 30,
+    maxDdGate: 25,
+    minPfGate: 1.2,
+    sweepMode: "none",
+    sweepSamples: 24,
+    monteCarloEnabled: false,
+    monteCarloSims: 300,
+    regimeEnabled: false,
+    portfolioEnabled: false,
+    portfolioInstrumentsJson:
+      '[{"instrument":"NQ","timeframe":"1d","years":1,"weight":1},{"instrument":"ES","timeframe":"1d","years":1,"weight":1}]',
+    executionEnabled: false,
+    spreadBps: 0.5,
+    slippageVolMult: 1.0,
+    latencyBars: 0,
+    forwardBridgeEnabled: false,
+    forwardBridgeMode: "paper_shadow",
+    forwardBridgeBaselineEquity: 100000,
+    experimentHypothesis: "sd-edge-hypothesis",
+    experimentTagsCsv: "manual-run",
+    promoteOnPass: false,
+  });
   const [results, setResults] = useState<RunResponse | null>(null);
   const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
@@ -94,6 +131,7 @@ export default function Home() {
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   const [viewMode, setViewMode] = useState(false);
   const [strategiesForView, setStrategiesForView] = useState<FirestoreItem[]>([]);
+  const [autoDetectedForStrategy, setAutoDetectedForStrategy] = useState<string | null>(null);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
@@ -182,6 +220,7 @@ export default function Home() {
   useEffect(() => {
     if (!openItem || openItem.type !== "strategies") {
       setStrategyParams({});
+      setAutoDetectedForStrategy(null);
       return;
     }
     getFileContent(openItem.type, openItem.id, "main.py").then((c) => {
@@ -189,15 +228,24 @@ export default function Home() {
     });
   }, [openItem?.type, openItem?.id]);
 
-  /** Load VIEW_PARAMS for selected modules */
   useEffect(() => {
-    if (!openItem || openItem.type !== "strategies" || selectedModuleIds.length === 0) {
+    if (openItem?.type !== "strategies" || !openItem?.id) return;
+    setSelectedIndicatorIds([]);
+    setAppliedIndicatorIds([]);
+    setSelectedModuleIds([]);
+    setAppliedModuleIds([]);
+    setAutoDetectedForStrategy(null);
+  }, [openItem?.type, openItem?.id]);
+
+  /** Load VIEW_PARAMS for applied modules */
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies" || appliedModuleIds.length === 0) {
       setModuleParams({});
       return;
     }
     const load = async () => {
       const next: Record<string, StrategyParams> = {};
-      for (const modId of selectedModuleIds) {
+      for (const modId of appliedModuleIds) {
         const mod = modules.find((m) => m.id === modId);
         if (!mod) continue;
         const content = await getFileContent("modules", modId, "main.py");
@@ -209,7 +257,54 @@ export default function Home() {
       setModuleParams(next);
     };
     load();
-  }, [openItem?.type, openItem?.id, selectedModuleIds, modules]);
+  }, [openItem?.type, openItem?.id, appliedModuleIds, modules]);
+
+  useEffect(() => {
+    if (
+      openItem?.type !== "strategies" ||
+      !openItem?.id ||
+      autoDetectedForStrategy === openItem.id ||
+      (indicators.length === 0 && modules.length === 0)
+    ) {
+      return;
+    }
+
+    const toModuleName = (n: string) =>
+      normalizePythonModuleToken((n || "module").replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_]/g, "_"));
+
+    const detect = async () => {
+      const code =
+        selectedFile === "main.py" && fileContent
+          ? fileContent
+          : (await getFileContent("strategies", openItem.id, "main.py")) ?? "";
+      const deps = parseStrategyImportDependencies(code);
+      const detectedIndicatorIds = indicators
+        .filter((ind) => deps.indicators.includes(toModuleName(ind.name)))
+        .map((ind) => ind.id);
+      const detectedModuleIds = modules
+        .filter((mod) => deps.modules.includes(toModuleName(mod.name)))
+        .map((mod) => mod.id);
+
+      setSelectedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
+      setSelectedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
+      setAppliedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
+      setAppliedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
+      setAutoDetectedForStrategy(openItem.id);
+      if (detectedIndicatorIds.length > 0 || detectedModuleIds.length > 0) {
+        addLog(`Auto-detect importů: ${detectedIndicatorIds.length} indikátorů, ${detectedModuleIds.length} modulů`);
+      }
+    };
+    detect();
+  }, [
+    openItem?.type,
+    openItem?.id,
+    autoDetectedForStrategy,
+    indicators,
+    modules,
+    selectedFile,
+    fileContent,
+    addLog,
+  ]);
 
   useEffect(() => {
     getAvailableData()
@@ -229,10 +324,10 @@ export default function Home() {
   }, []);
 
   /** Merge strategy params + module_params for run request */
-  const buildMergedParams = useCallback((): Record<string, unknown> | undefined => {
-    const flat: Record<string, unknown> = { ...strategyParams };
+  const buildMergedParams = useCallback((): RunRequest["params"] => {
+    const flat: Record<string, number | boolean | string | Record<string, unknown>> = { ...strategyParams };
     const mods: Record<string, Record<string, number | boolean | string>> = {};
-    for (const modId of selectedModuleIds) {
+    for (const modId of appliedModuleIds) {
       const mod = modules.find((m) => m.id === modId);
       if (!mod) continue;
       const p = moduleParams[mod.name];
@@ -245,7 +340,7 @@ export default function Home() {
     }
     if (Object.keys(flat).length === 0) return undefined;
     return flat;
-  }, [strategyParams, selectedModuleIds, modules, moduleParams]);
+  }, [strategyParams, appliedModuleIds, modules, moduleParams]);
 
   const handleSelectInstrument = (inv: DataInstrument) => {
     setSelectedInstrument(inv);
@@ -365,7 +460,7 @@ export default function Home() {
     const toModuleName = (n: string) =>
       (n || "module").replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_]/g, "_") || "module";
 
-    for (const indId of selectedIndicatorIds) {
+    for (const indId of appliedIndicatorIds) {
       const ind = indicators.find((i) => i.id === indId);
       if (!ind) continue;
       const content = await getFileContent("indicators", indId, "main.py");
@@ -373,7 +468,7 @@ export default function Home() {
         allFiles[`indicators/${toModuleName(ind.name)}.py`] = content;
       }
     }
-    for (const modId of selectedModuleIds) {
+    for (const modId of appliedModuleIds) {
       const mod = modules.find((m) => m.id === modId);
       if (!mod) continue;
       const content = await getFileContent("modules", modId, "main.py");
@@ -390,9 +485,9 @@ export default function Home() {
     const mainContent = allFiles["main.py"];
     const runStrategyParams = mainContent ? parseStrategyParams(mainContent) : strategyParams;
     const runParams = (() => {
-      const flat: Record<string, unknown> = { ...runStrategyParams };
+      const flat: Record<string, number | boolean | string | Record<string, unknown>> = { ...runStrategyParams };
       const mods: Record<string, Record<string, number | boolean | string>> = {};
-      for (const modId of selectedModuleIds) {
+      for (const modId of appliedModuleIds) {
         const mod = modules.find((m) => m.id === modId);
         if (!mod) continue;
         const p = moduleParams[mod.name];
@@ -410,38 +505,121 @@ export default function Home() {
     addLog("Spouštím backtest...");
 
     try {
-      const appliedModules: { id: string; name: string; params?: Record<string, number | boolean | string> }[] =
-        selectedModuleIds
-          .map((id) => {
-            const mod = modules.find((m) => m.id === id);
-            if (!mod) return null;
-            return {
-              id: mod.id,
-              name: mod.name,
-              params: moduleParams[mod.name],
-            };
-          })
-          .filter((m): m is { id: string; name: string; params?: StrategyParams } => m !== null);
+      const appliedModules = appliedModuleIds.reduce<
+        { id: string; name: string; params?: Record<string, number | boolean | string> }[]
+      >((acc, id) => {
+        const mod = modules.find((m) => m.id === id);
+        if (!mod) return acc;
+        acc.push({
+          id: mod.id,
+          name: mod.name,
+          params: moduleParams[mod.name],
+        });
+        return acc;
+      }, []);
 
-      const data = await runBacktestStreaming(
-        {
-          files: allFiles,
-          instrument: selectedInstrument.instrument,
-          timeframe: selectedInstrument.timeframe,
-          years,
-          data_file: selectedInstrument.file,
-          initial_capital: backtestParams.initialCapital,
-          slippage_perc: backtestParams.slippagePerc,
-          instrument_type: backtestParams.instrumentType,
-          tick_size: backtestParams.tickSize,
-          value_per_tick: backtestParams.valuePerTick,
-          share_size: backtestParams.shareSize,
-          lot_size: backtestParams.lotSize,
-          pip_size: backtestParams.pipSize,
-          pip_value: backtestParams.pipValue,
-          params: runParams,
-          applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
+      const requestRunId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      const latestRun = runHistory[0];
+      const baselineMetrics = latestRun?.metrics
+        ? {
+            finalEquity: Number(latestRun.metrics.finalEquity ?? 0),
+            totalReturnUsd: Number(latestRun.metrics.totalReturnUsd ?? 0),
+            maxDrawdownPct: Number(latestRun.metrics.maxDrawdownPct ?? latestRun.metrics.maxDrawdown ?? 0),
+            profitFactor: Number(latestRun.metrics.profitFactor ?? 0),
+            winRate: Number(latestRun.metrics.winRate ?? 0),
+            sortinoRatio: Number(latestRun.metrics.sortinoRatio ?? 0),
+            calmarRatio: Number(latestRun.metrics.calmarRatio ?? 0),
+            tradeCount: Number(latestRun.metrics.tradeCount ?? 0),
+          }
+        : undefined;
+      let portfolioConfig: Record<string, unknown> | undefined = undefined;
+      if (edgeSettings.portfolioEnabled) {
+        try {
+          const parsed = JSON.parse(edgeSettings.portfolioInstrumentsJson);
+          if (!Array.isArray(parsed) || parsed.length < 2) {
+            addLog("Portfolio config musí být JSON pole alespoň se 2 instrumenty.");
+            return;
+          }
+          portfolioConfig = { instruments: parsed };
+        } catch {
+          addLog("Portfolio JSON je neplatný. Oprav formát v Edge finding sekci.");
+          return;
+        }
+      }
+      const runRequest: RunRequest = {
+        files: allFiles,
+        instrument: selectedInstrument.instrument,
+        timeframe: selectedInstrument.timeframe,
+        years,
+        data_file: selectedInstrument.file,
+        initial_capital: backtestParams.initialCapital,
+        slippage_perc: backtestParams.slippagePerc,
+        commission_perc: backtestParams.commissionPerc,
+        instrument_type: backtestParams.instrumentType,
+        tick_size: backtestParams.tickSize,
+        value_per_tick: backtestParams.valuePerTick,
+        share_size: backtestParams.shareSize,
+        lot_size: backtestParams.lotSize,
+        pip_size: backtestParams.pipSize,
+        pip_value: backtestParams.pipValue,
+        params: runParams,
+        applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
+        run_id: requestRunId,
+        validation_mode: edgeSettings.validationMode,
+        validation_config:
+          edgeSettings.validationMode === "oos_split"
+            ? { oos_ratio: edgeSettings.oosRatio }
+            : edgeSettings.validationMode === "walk_forward"
+              ? { folds: edgeSettings.wfFolds, test_ratio: edgeSettings.wfTestRatio }
+              : undefined,
+        quality_gates: {
+          min_trades: edgeSettings.minTradesGate,
+          max_dd: edgeSettings.maxDdGate,
+          min_pf: edgeSettings.minPfGate,
         },
+        sweep_mode: edgeSettings.sweepMode === "none" ? undefined : edgeSettings.sweepMode,
+        sweep_config:
+          edgeSettings.sweepMode === "none"
+            ? undefined
+            : {
+                max_samples: edgeSettings.sweepSamples,
+              },
+        monte_carlo: edgeSettings.monteCarloEnabled
+          ? {
+              simulations: edgeSettings.monteCarloSims,
+              ruin_dd_pct: 50,
+            }
+          : undefined,
+        regime_config: edgeSettings.regimeEnabled ? { enabled: true } : undefined,
+        portfolio_config: portfolioConfig,
+        execution_model: edgeSettings.executionEnabled
+          ? {
+              enabled: true,
+              spread_bps: edgeSettings.spreadBps,
+              slippage_vol_mult: edgeSettings.slippageVolMult,
+              latency_bars: edgeSettings.latencyBars,
+              forward_bridge: edgeSettings.forwardBridgeEnabled
+                ? {
+                    mode: edgeSettings.forwardBridgeMode,
+                    baseline_final_equity: edgeSettings.forwardBridgeBaselineEquity,
+                  }
+                : undefined,
+            }
+          : undefined,
+        experiment: {
+          hypothesis: edgeSettings.experimentHypothesis || openItem.name,
+          tags: edgeSettings.experimentTagsCsv
+            .split(",")
+            .map((x) => x.trim())
+            .filter((x) => x.length > 0),
+          baseline: "latest",
+          baseline_run_id: latestRun?.runId ?? null,
+          baseline_metrics: baselineMetrics,
+          promote_on_pass: edgeSettings.promoteOnPass,
+        },
+      };
+      const data = await runBacktestStreaming(
+        runRequest,
         controller.signal,
         (ev) => {
           if (ev.type === "log") {
@@ -456,7 +634,7 @@ export default function Home() {
       setShowResults(true);
       addLog(`Hotovo. ${data.metrics.tradeCount} obchodů, equity: ${data.metrics.finalEquity.toFixed(2)}`);
       if (openItem) {
-        const payload = buildSavePayload(data);
+        const payload = buildSavePayload(data, runRequest);
         try {
           await saveBacktestResult(openItem.id, openItem.name, payload);
           const history = await listBacktestResults(openItem.id);
@@ -492,7 +670,7 @@ export default function Home() {
     abortController?.abort();
   };
 
-  function buildSavePayload(data: RunResponse) {
+  function buildSavePayload(data: RunResponse, request?: RunRequest) {
     let equityCurve = data.equityCurve;
     if (!equityCurve?.length && data.equity?.length && data.ohlc?.length) {
       const first = data.ohlc[0]?.date?.slice(0, 10);
@@ -507,9 +685,22 @@ export default function Home() {
       equityCurve = data.equity.map((v, i) => ({ date: String(i), value: v }));
     }
     return {
+      runId: data.runId ?? null,
+      manifest: {
+        ...(data.manifest ?? {}),
+        request: request ?? null,
+      },
       equityCurve: equityCurve ?? [],
       metrics: data.metrics,
       trades: data.trades,
+      validation: data.validation ?? null,
+      robustness: data.robustness ?? null,
+      monteCarlo: data.monteCarlo ?? null,
+      regimeAnalysis: data.regimeAnalysis ?? null,
+      portfolio: data.portfolio ?? null,
+      executionSummary: data.executionSummary ?? null,
+      qualityGate: data.qualityGate ?? null,
+      experiment: data.experiment ?? null,
     };
   }
 
@@ -743,9 +934,11 @@ export default function Home() {
               onModuleParamsChange={(name, params) =>
                 setModuleParams((prev) => ({ ...prev, [name]: params }))
               }
-              moduleNamesForParams={selectedModuleIds
+              moduleNamesForParams={appliedModuleIds
                 .map((id) => modules.find((m) => m.id === id)?.name)
                 .filter((n): n is string => !!n)}
+              edgeSettings={edgeSettings}
+              onEdgeSettingsChange={setEdgeSettings}
             />
           </div>
         </div>

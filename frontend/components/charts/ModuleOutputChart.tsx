@@ -39,6 +39,11 @@ function toDateKey(s: string): string {
 
 function findBarDate(ohlc: OhlcBar[], tradeDate: string): string | null {
   if (!tradeDate) return null;
+  const exact = tradeDate.trim();
+  if (exact) {
+    const exactMatch = ohlc.find((bar) => bar.date === exact);
+    if (exactMatch) return exactMatch.date;
+  }
   const key = toDateKey(tradeDate);
   for (const bar of ohlc) {
     if (toDateKey(bar.date) === key) return bar.date;
@@ -126,11 +131,13 @@ export function ModuleOutputChart({
   const entryY: number[] = [];
   const exitX: string[] = [];
   const exitY: number[] = [];
+  const tradeShapes: any[] = [];
   for (const t of trades) {
     const entryDate = t.entryDate ?? t.date ?? "";
     const exitDate = t.exitDate ?? t.date ?? "";
     const entryPrice = t.entryPrice ?? t.price;
     const exitPrice = t.exitPrice ?? t.price;
+    if (!Number.isFinite(entryPrice) || !Number.isFinite(exitPrice)) continue;
     const entryBarDate = findBarDate(ohlc, entryDate);
     const exitBarDate = findBarDate(ohlc, exitDate);
     if (entryBarDate) {
@@ -141,6 +148,26 @@ export function ModuleOutputChart({
       exitX.push(exitBarDate);
       exitY.push(exitPrice);
     }
+    if (!entryBarDate || !exitBarDate) continue;
+
+    const entryTs = new Date(entryBarDate).getTime();
+    const exitTs = new Date(exitBarDate).getTime();
+    if (!Number.isFinite(entryTs) || !Number.isFinite(exitTs)) continue;
+
+    const x0 = entryTs <= exitTs ? entryBarDate : exitBarDate;
+    const x1 = entryTs <= exitTs ? exitBarDate : entryBarDate;
+    const y0 = Math.min(entryPrice, exitPrice);
+    const y1 = Math.max(entryPrice, exitPrice);
+    tradeShapes.push({
+      type: "rect",
+      x0,
+      x1,
+      y0,
+      y1,
+      fillcolor: (t.pnl ?? 0) >= 0 ? "rgba(34, 197, 94, 0.20)" : "rgba(239, 68, 68, 0.20)",
+      line: { width: 0 },
+      layer: "below",
+    });
   }
   if (visibility.entry_markers && entryX.length > 0) {
     traces.push({
@@ -180,7 +207,7 @@ export function ModuleOutputChart({
   if (visibility.swing_hl && highMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: highMarkers.map((m) => m.date.slice(0, 10)),
+      x: highMarkers.map((m) => m.date),
       y: highMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 10, color: MARKER_COLORS.high, symbol: "circle", line: { color: "#fff", width: 1 } },
@@ -191,7 +218,7 @@ export function ModuleOutputChart({
   if (visibility.swing_hl && lowMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: lowMarkers.map((m) => m.date.slice(0, 10)),
+      x: lowMarkers.map((m) => m.date),
       y: lowMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 10, color: MARKER_COLORS.low, symbol: "circle", line: { color: "#fff", width: 1 } },
@@ -202,7 +229,7 @@ export function ModuleOutputChart({
   if (visibility.major_hl && majorHighMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: majorHighMarkers.map((m) => m.date.slice(0, 10)),
+      x: majorHighMarkers.map((m) => m.date),
       y: majorHighMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 14, color: MARKER_COLORS.major_high, symbol: "diamond", line: { color: "#fff", width: 1.5 } },
@@ -213,7 +240,7 @@ export function ModuleOutputChart({
   if (visibility.major_hl && majorLowMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: majorLowMarkers.map((m) => m.date.slice(0, 10)),
+      x: majorLowMarkers.map((m) => m.date),
       y: majorLowMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 14, color: MARKER_COLORS.major_low, symbol: "diamond", line: { color: "#fff", width: 1.5 } },
@@ -224,7 +251,7 @@ export function ModuleOutputChart({
   if (visibility.internal_hl && internalHighMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: internalHighMarkers.map((m) => m.date.slice(0, 10)),
+      x: internalHighMarkers.map((m) => m.date),
       y: internalHighMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 4, color: MARKER_COLORS.internal_high, symbol: "circle", line: { color: "#10b981", width: 0.5 } },
@@ -235,7 +262,7 @@ export function ModuleOutputChart({
   if (visibility.internal_hl && internalLowMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: internalLowMarkers.map((m) => m.date.slice(0, 10)),
+      x: internalLowMarkers.map((m) => m.date),
       y: internalLowMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 4, color: MARKER_COLORS.internal_low, symbol: "circle", line: { color: "#ef4444", width: 0.5 } },
@@ -246,7 +273,7 @@ export function ModuleOutputChart({
   if (otherMarkers.length > 0) {
     traces.push({
       type: "scatter",
-      x: otherMarkers.map((m) => m.date.slice(0, 10)),
+      x: otherMarkers.map((m) => m.date),
       y: otherMarkers.map((m) => m.value),
       mode: "markers",
       marker: { size: 10, color: "#3b82f6", symbol: "diamond", line: { color: "#fff", width: 1 } },
@@ -258,7 +285,7 @@ export function ModuleOutputChart({
   const zones = output.zones ?? [];
   const inducementPointsByZone = zones.flatMap((z) =>
     (z.inducements ?? []).map((ind) => ({
-      date: ind.date?.slice(0, 10) ?? "",
+      date: ind.date ?? "",
       value: ind.value,
       zoneName: z.name ?? "",
     }))
@@ -309,7 +336,7 @@ export function ModuleOutputChart({
       if (pts.length > 0) {
         traces.push({
           type: "scatter",
-          x: pts.map((p: { date: string }) => p.date?.slice(0, 10)),
+          x: pts.map((p: { date: string }) => p.date),
           y: pts.map((p: { value: number }) => p.value),
           mode: "lines",
           line: { color: line.color ?? lineColors[i % lineColors.length], width: 2 },
@@ -382,7 +409,7 @@ export function ModuleOutputChart({
       if (hasIp) label += ` IP:${ipCount},${ipPoints}`;
       const t1 = new Date(z.date_start).getTime();
       const t2 = new Date(z.date_end).getTime();
-      const midDate = new Date((t1 + t2) / 2).toISOString().slice(0, 10);
+      const midDate = new Date((t1 + t2) / 2).toISOString();
       const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
       zoneAnnotations.push({
         x: midDate,
@@ -431,7 +458,7 @@ export function ModuleOutputChart({
     dragmode: "zoom",
     showlegend: traces.length > 1,
     legend: { x: 0, y: 1.02, orientation: "h" },
-    shapes: zoneShapes,
+    shapes: [...zoneShapes, ...tradeShapes],
     annotations: zoneAnnotations,
   };
 

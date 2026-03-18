@@ -12,6 +12,20 @@ from pydantic import BaseModel
 router = APIRouter()
 
 
+def _to_iso(value) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    try:
+        return pd.Timestamp(value).isoformat()
+    except Exception:
+        return str(value)
+
+
 def _get_data_dir() -> Path:
     backend_root = Path(__file__).resolve().parent.parent.parent
     primary = backend_root.parent / "data"
@@ -129,7 +143,7 @@ def _run_view_code(
                 for item in result:
                     if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
                         markers.append({
-                            "date": str(item["date"])[:10],
+                            "date": _to_iso(item["date"]),
                             "type": str(item["type"]).lower(),
                             "value": float(item["value"]),
                         })
@@ -143,9 +157,9 @@ def _run_view_code(
                     color = None
                     segments = None
                     if isinstance(data, list):
-                        pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
+                        pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
                     elif isinstance(data, dict) and "data" in data:
-                        pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in data["data"] if isinstance(p, dict)]
+                        pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data["data"] if isinstance(p, dict)]
                         color = data.get("color")
                         segments = data.get("segments")
                     if pts:
@@ -162,7 +176,7 @@ def _run_view_code(
                                 line_obj["color"] = str(color)
                             lines.append(line_obj)
             elif isinstance(result, list):
-                pts = [{"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))} for p in result if isinstance(p, dict)]
+                pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in result if isinstance(p, dict)]
                 if pts:
                     lines.append({"name": "line", "data": pts})
 
@@ -179,8 +193,8 @@ def _run_view_code(
                         and "value_high" in item
                     ):
                         zone = {
-                            "date_start": str(item["date_start"])[:10],
-                            "date_end": str(item["date_end"])[:10],
+                            "date_start": _to_iso(item["date_start"]),
+                            "date_end": _to_iso(item["date_end"]),
                             "value_low": float(item["value_low"]),
                             "value_high": float(item["value_high"]),
                             "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
@@ -207,7 +221,7 @@ def _run_view_code(
                         if "gap_type" in item:
                             zone["gap_type"] = str(item["gap_type"])
                         if "gap_date" in item:
-                            zone["gap_date"] = str(item["gap_date"])[:10]
+                            zone["gap_date"] = _to_iso(item["gap_date"])
                         if "gap_value_low" in item:
                             zone["gap_value_low"] = float(item["gap_value_low"])
                         if "gap_value_high" in item:
@@ -298,7 +312,7 @@ def _merge_major_markers_from_deps(
                 t = str(item["type"]).lower()
                 if t not in ("major_high", "major_low"):
                     continue
-                key = (str(item["date"])[:10], t)
+                key = (_to_iso(item["date"]), t)
                 if key not in existing:
                     markers.append({
                         "date": key[0],
@@ -324,7 +338,7 @@ async def get_view_data(req: ViewRequest):
 
     ohlc = []
     for i, (ts, row) in enumerate(df.iterrows()):
-        date_str = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+        date_str = _to_iso(ts)
         ohlc.append({
             "date": date_str,
             "open": float(row.get("open", row.get("Open", 0))),
