@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import Link from "next/link";
 import { Sidebar } from "@/components/Sidebar";
 import { StrategyEditor } from "@/components/editor/StrategyEditor";
 import { CreateModal } from "@/components/CreateModal";
@@ -11,12 +12,12 @@ import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
-import { FaqModal } from "@/components/FaqModal";
 import {
   saveBacktestResult,
   listBacktestResults,
   deleteBacktestResult,
   deleteAllBacktestResults,
+  updateBacktestRunGovernance,
   type SavedBacktestRun,
 } from "@/lib/firestore";
 import {
@@ -32,10 +33,12 @@ import {
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
 import {
   parseStrategyParams,
-  parseViewParams,
+  parseStrategyParamBundle,
+  parseViewParamBundle,
   parseStrategyImportDependencies,
   normalizePythonModuleToken,
   type StrategyParams,
+  type StrategyParamsMeta,
 } from "@/lib/strategyParams";
 import {
   filterInstrumentsByType,
@@ -46,6 +49,7 @@ import {
 } from "@shared/types";
 
 export default function Home() {
+  const runLockRef = useRef(false);
   const [selectedType, setSelectedType] = useState<ItemType | null>(null);
   const [items, setItems] = useState<FirestoreItem[]>([]);
   const [openItem, setOpenItem] = useState<{ type: ItemType; id: string; name: string } | null>(null);
@@ -56,10 +60,10 @@ export default function Home() {
   const [isSaving, setIsSaving] = useState(false);
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [isAddFileModalOpen, setIsAddFileModalOpen] = useState(false);
-  const [isFaqOpen, setIsFaqOpen] = useState(false);
 
   const [instruments, setInstruments] = useState<DataInstrument[]>([]);
   const [instrumentsLoaded, setInstrumentsLoaded] = useState(false);
+  const [dataLoadError, setDataLoadError] = useState<string | null>(null);
   const [selectedInstrument, setSelectedInstrument] = useState<DataInstrument | null>(null);
   const [indicators, setIndicators] = useState<FirestoreItem[]>([]);
   const [selectedIndicatorIds, setSelectedIndicatorIds] = useState<string[]>([]);
@@ -93,7 +97,9 @@ export default function Home() {
   });
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
+  const [strategyParamMeta, setStrategyParamMeta] = useState<StrategyParamsMeta>({});
   const [moduleParams, setModuleParams] = useState<Record<string, StrategyParams>>({});
+  const [moduleParamMeta, setModuleParamMeta] = useState<Record<string, StrategyParamsMeta>>({});
   const [edgeSettings, setEdgeSettings] = useState<EdgeFindingSettings>({
     validationMode: "single",
     oosRatio: 0.25,
@@ -119,6 +125,7 @@ export default function Home() {
     forwardBridgeBaselineEquity: 100000,
     experimentHypothesis: "sd-edge-hypothesis",
     experimentTagsCsv: "manual-run",
+    experimentBranch: "main",
     promoteOnPass: false,
   });
   const [results, setResults] = useState<RunResponse | null>(null);
@@ -220,11 +227,14 @@ export default function Home() {
   useEffect(() => {
     if (!openItem || openItem.type !== "strategies") {
       setStrategyParams({});
+      setStrategyParamMeta({});
       setAutoDetectedForStrategy(null);
       return;
     }
     getFileContent(openItem.type, openItem.id, "main.py").then((c) => {
-      setStrategyParams(parseStrategyParams(c ?? ""));
+      const bundle = parseStrategyParamBundle(c ?? "");
+      setStrategyParams(bundle.params);
+      setStrategyParamMeta(bundle.meta);
     });
   }, [openItem?.type, openItem?.id]);
 
@@ -241,20 +251,26 @@ export default function Home() {
   useEffect(() => {
     if (!openItem || openItem.type !== "strategies" || appliedModuleIds.length === 0) {
       setModuleParams({});
+      setModuleParamMeta({});
       return;
     }
     const load = async () => {
       const next: Record<string, StrategyParams> = {};
+      const nextMeta: Record<string, StrategyParamsMeta> = {};
       for (const modId of appliedModuleIds) {
         const mod = modules.find((m) => m.id === modId);
         if (!mod) continue;
         const content = await getFileContent("modules", modId, "main.py");
-        const params = parseViewParams(content ?? "");
-        if (Object.keys(params).length > 0) {
-          next[mod.name] = params;
+        const bundle = parseViewParamBundle(content ?? "");
+        if (Object.keys(bundle.params).length > 0) {
+          next[mod.name] = bundle.params;
+        }
+        if (Object.keys(bundle.meta).length > 0) {
+          nextMeta[mod.name] = bundle.meta;
         }
       }
       setModuleParams(next);
+      setModuleParamMeta(nextMeta);
     };
     load();
   }, [openItem?.type, openItem?.id, appliedModuleIds, modules]);
@@ -287,11 +303,11 @@ export default function Home() {
 
       setSelectedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
       setSelectedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
-      setAppliedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
-      setAppliedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
       setAutoDetectedForStrategy(openItem.id);
       if (detectedIndicatorIds.length > 0 || detectedModuleIds.length > 0) {
-        addLog(`Auto-detect importů: ${detectedIndicatorIds.length} indikátorů, ${detectedModuleIds.length} modulů`);
+        addLog(
+          `Auto-detect importů: ${detectedIndicatorIds.length} indikátorů, ${detectedModuleIds.length} modulů. Pro run je ještě potvrďte.`
+        );
       }
     };
     detect();
@@ -306,22 +322,38 @@ export default function Home() {
     addLog,
   ]);
 
+  const applyInstrumentSelection = useCallback((inv: DataInstrument) => {
+    setSelectedInstrument(inv);
+    setYears((y) => Math.min(y, inv.yearsAvailable));
+    if (backtestParams.instrumentType === "futures" && inv.brokerConfig) {
+      setBacktestParams((prev) => ({
+        ...prev,
+        tickSize: inv.brokerConfig?.tick_size ?? prev.tickSize,
+        valuePerTick: inv.brokerConfig?.tick_value ?? prev.valuePerTick,
+      }));
+    }
+  }, [backtestParams.instrumentType]);
+
   useEffect(() => {
     getAvailableData()
       .then((d) => {
         setInstruments(d.instruments);
         setInstrumentsLoaded(true);
+        setDataLoadError(null);
         if (d.instruments.length > 0 && !selectedInstrument) {
           const inv = d.instruments[0];
-          setSelectedInstrument(inv);
+          applyInstrumentSelection(inv);
           setYears(Math.min(1, inv.yearsAvailable));
         }
       })
-      .catch(() => {
+      .catch((error) => {
         setInstruments([]);
         setInstrumentsLoaded(true);
+        const message = error instanceof Error ? error.message : String(error);
+        setDataLoadError(message);
+        addLog(`Načtení dat selhalo: ${message}`);
       });
-  }, []);
+  }, [addLog]);
 
   /** Merge strategy params + module_params for run request */
   const buildMergedParams = useCallback((): RunRequest["params"] => {
@@ -343,8 +375,7 @@ export default function Home() {
   }, [strategyParams, appliedModuleIds, modules, moduleParams]);
 
   const handleSelectInstrument = (inv: DataInstrument) => {
-    setSelectedInstrument(inv);
-    setYears((y) => Math.min(y, inv.yearsAvailable));
+    applyInstrumentSelection(inv);
   };
 
   /** Instruments filtered by selected instrument type */
@@ -360,8 +391,16 @@ export default function Home() {
       (i) => i.file === selectedInstrument.file && i.instrument === selectedInstrument.instrument
     );
     if (!isInFiltered) {
-      setSelectedInstrument(filteredInstruments[0] ?? null);
+      const next = filteredInstruments[0] ?? null;
+      setSelectedInstrument(next);
       if (filteredInstruments[0]) {
+        if (backtestParams.instrumentType === "futures" && filteredInstruments[0].brokerConfig) {
+          setBacktestParams((prev) => ({
+            ...prev,
+            tickSize: filteredInstruments[0].brokerConfig?.tick_size ?? prev.tickSize,
+            valuePerTick: filteredInstruments[0].brokerConfig?.tick_value ?? prev.valuePerTick,
+          }));
+        }
         setYears((y) => Math.min(y, filteredInstruments[0].yearsAvailable));
       }
     }
@@ -438,23 +477,41 @@ export default function Home() {
   };
 
   const handleRun = async () => {
+    if (runLockRef.current || isRunning) return;
     if (!openItem || openItem.type !== "strategies") return;
-    const mainCode = await getFileContent(openItem.type, openItem.id, "main.py");
+
+    const strategyContext = { id: openItem.id, name: openItem.name, type: openItem.type };
+    runLockRef.current = true;
+    const mainCode = await getFileContent(strategyContext.type, strategyContext.id, "main.py");
     if (!mainCode) {
       addLog("Chyba: main.py nenalezen");
+      runLockRef.current = false;
       return;
     }
     if (!selectedInstrument) {
       addLog("Vyberte instrument");
+      runLockRef.current = false;
       return;
+    }
+    if (edgeSettings.validationMode === "single") {
+      addLog("WARNING: běžíte pouze single run. Pro první edge doporučeno OOS split nebo walk-forward.");
+    }
+    if (edgeSettings.sweepMode !== "none" && edgeSettings.validationMode === "single") {
+      addLog("WARNING: sweep bez OOS/WF může vést k overfittingu.");
+    }
+    if (edgeSettings.minTradesGate < 20) {
+      addLog("WARNING: min trades gate < 20 může dělat metriky nestabilní.");
+    }
+    if (!edgeSettings.monteCarloEnabled) {
+      addLog("TIP: zapněte Monte Carlo pro odhad tail-risk/risk of ruin.");
     }
 
     const allFiles: Record<string, string> = {};
     for (const f of files) {
       const content =
-        f.fileName === "main.py" && selectedFile === "main.py" && fileContent
+        selectedFile === f.fileName
           ? fileContent
-          : await getFileContent(openItem.type, openItem.id, f.fileName);
+          : await getFileContent(strategyContext.type, strategyContext.id, f.fileName);
       if (content != null) allFiles[f.fileName] = content;
     }
     const toModuleName = (n: string) =>
@@ -478,6 +535,7 @@ export default function Home() {
     }
     if (Object.keys(allFiles).length === 0) {
       addLog("Chyba: žádné soubory k spuštění");
+      runLockRef.current = false;
       return;
     }
 
@@ -505,6 +563,32 @@ export default function Home() {
     addLog("Spouštím backtest...");
 
     try {
+      const normalizeBranchId = (name: string): string => {
+        const cleaned = (name || "main")
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, "-")
+          .replace(/[^a-z0-9_-]/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "");
+        return cleaned || "main";
+      };
+      const branchName = (edgeSettings.experimentBranch || "main").trim() || "main";
+      const branchId = normalizeBranchId(branchName);
+      const getRunBranchId = (r: SavedBacktestRun): string => {
+        const exp = r.experiment && typeof r.experiment === "object" ? (r.experiment as Record<string, unknown>) : null;
+        const id = exp?.branch_id ?? exp?.branchId;
+        if (typeof id === "string" && id.trim()) return id.trim();
+        return "main";
+      };
+      const branchRuns = runHistory.filter((r) => getRunBranchId(r) === branchId);
+      const latestRun = branchRuns[0] ?? runHistory[0];
+      const parentRunId =
+        branchRuns[0]?.runId ??
+        branchRuns[0]?.id ??
+        null;
+      const branchSeq = branchRuns.length + 1;
+
       const appliedModules = appliedModuleIds.reduce<
         { id: string; name: string; params?: Record<string, number | boolean | string> }[]
       >((acc, id) => {
@@ -519,7 +603,6 @@ export default function Home() {
       }, []);
 
       const requestRunId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-      const latestRun = runHistory[0];
       const baselineMetrics = latestRun?.metrics
         ? {
             finalEquity: Number(latestRun.metrics.finalEquity ?? 0),
@@ -538,11 +621,13 @@ export default function Home() {
           const parsed = JSON.parse(edgeSettings.portfolioInstrumentsJson);
           if (!Array.isArray(parsed) || parsed.length < 2) {
             addLog("Portfolio config musí být JSON pole alespoň se 2 instrumenty.");
+            runLockRef.current = false;
             return;
           }
           portfolioConfig = { instruments: parsed };
         } catch {
           addLog("Portfolio JSON je neplatný. Oprav formát v Edge finding sekci.");
+          runLockRef.current = false;
           return;
         }
       }
@@ -607,7 +692,7 @@ export default function Home() {
             }
           : undefined,
         experiment: {
-          hypothesis: edgeSettings.experimentHypothesis || openItem.name,
+          hypothesis: edgeSettings.experimentHypothesis || strategyContext.name,
           tags: edgeSettings.experimentTagsCsv
             .split(",")
             .map((x) => x.trim())
@@ -615,7 +700,15 @@ export default function Home() {
           baseline: "latest",
           baseline_run_id: latestRun?.runId ?? null,
           baseline_metrics: baselineMetrics,
+          branch_name: branchName,
+          branch_id: branchId,
+          parent_run_id: parentRunId,
+          branch_seq: branchSeq,
           promote_on_pass: edgeSettings.promoteOnPass,
+          seed: Date.now() % 1_000_000_000,
+          lifecycleStatus: "draft",
+          reviewerApproved: false,
+          approvalRequired: true,
         },
       };
       const data = await runBacktestStreaming(
@@ -633,12 +726,14 @@ export default function Home() {
       setResults(data);
       setShowResults(true);
       addLog(`Hotovo. ${data.metrics.tradeCount} obchodů, equity: ${data.metrics.finalEquity.toFixed(2)}`);
-      if (openItem) {
+      if (strategyContext) {
         const payload = buildSavePayload(data, runRequest);
         try {
-          await saveBacktestResult(openItem.id, openItem.name, payload);
-          const history = await listBacktestResults(openItem.id);
-          setRunHistory(history);
+          await saveBacktestResult(strategyContext.id, strategyContext.name, payload);
+          const history = await listBacktestResults(strategyContext.id);
+          if (openItem?.id === strategyContext.id) {
+            setRunHistory(history);
+          }
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           addLog(`Uložení výsledků selhalo: ${msg}`);
@@ -660,6 +755,7 @@ export default function Home() {
       }
       setResults(null);
     } finally {
+      runLockRef.current = false;
       setIsRunning(false);
       setRunProgress(0);
       setAbortController(null);
@@ -673,13 +769,13 @@ export default function Home() {
   function buildSavePayload(data: RunResponse, request?: RunRequest) {
     let equityCurve = data.equityCurve;
     if (!equityCurve?.length && data.equity?.length && data.ohlc?.length) {
-      const first = data.ohlc[0]?.date?.slice(0, 10);
+      const first = data.ohlc[0]?.date;
       const d = first ? new Date(first) : null;
       if (d) d.setDate(d.getDate() - 1);
-      const dayBefore = d?.toISOString().slice(0, 10) ?? "0";
+      const dayBefore = d?.toISOString() ?? "0";
       equityCurve = [
         { date: dayBefore, value: data.equity[0] ?? 0 },
-        ...data.ohlc.map((o, i) => ({ date: o.date.slice(0, 10), value: data.equity![i + 1] ?? 0 })),
+        ...data.ohlc.map((o, i) => ({ date: o.date, value: data.equity![i + 1] ?? 0 })),
       ];
     } else if (!equityCurve?.length && data.equity?.length) {
       equityCurve = data.equity.map((v, i) => ({ date: String(i), value: v }));
@@ -735,6 +831,14 @@ export default function Home() {
   }, [openItem?.type, openItem?.id]);
 
   useEffect(() => {
+    if (openItem?.type === "strategies") {
+      loadRunHistory();
+      return;
+    }
+    setRunHistory([]);
+  }, [openItem?.type, openItem?.id, loadRunHistory]);
+
+  useEffect(() => {
     if (showResults && openItem?.type === "strategies") {
       loadRunHistory();
     }
@@ -760,6 +864,16 @@ export default function Home() {
     }
   };
 
+  const handleUpdateRunLifecycle = async (runDocId: string, patch: Record<string, unknown>) => {
+    if (!openItem) return;
+    try {
+      await updateBacktestRunGovernance(openItem.id, runDocId, patch);
+      await loadRunHistory();
+    } catch (e) {
+      addLog(`Chyba governance update: ${(e as Error).message}`);
+    }
+  };
+
   const centerContent = showResults ? (
     <ResultsView
       results={results}
@@ -769,6 +883,7 @@ export default function Home() {
       onExport={handleExport}
       onDeleteRun={handleDeleteRun}
       onDeleteAllRuns={handleDeleteAllRuns}
+      onUpdateLifecycle={handleUpdateRunLifecycle}
       strategyName={openItem?.name}
     />
   ) : (
@@ -912,6 +1027,7 @@ export default function Home() {
             <BacktestSettings
               instruments={filteredInstruments}
               instrumentsLoaded={instrumentsLoaded}
+              dataLoadError={dataLoadError}
               selectedInstrument={selectedInstrument}
               onSelectInstrument={handleSelectInstrument}
               years={years}
@@ -929,8 +1045,10 @@ export default function Home() {
               isRunning={isRunning}
               canRun={openItem?.type === "strategies"}
               strategyParams={strategyParams}
+              strategyParamMeta={strategyParamMeta}
               onStrategyParamsChange={setStrategyParams}
               moduleParams={moduleParams}
+              moduleParamMeta={moduleParamMeta}
               onModuleParamsChange={(name, params) =>
                 setModuleParams((prev) => ({ ...prev, [name]: params }))
               }
@@ -948,17 +1066,16 @@ export default function Home() {
           onToggleMinimize={() => setTerminalMinimized((v) => !v)}
         />
       </div>
-      <button
-        type="button"
-        onClick={() => setIsFaqOpen(true)}
+      <Link
+        href="/guide"
         className="fixed bottom-6 right-6 w-10 h-10 rounded-full bg-zinc-700 hover:bg-zinc-600 border border-zinc-600 flex items-center justify-center text-zinc-300 hover:text-white shadow-lg transition-colors z-40"
-        aria-label="Časté otázky"
+        aria-label="Průvodce aplikací"
+        title="Otevřít průvodce aplikací"
       >
         <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
           <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z" />
         </svg>
-      </button>
-      {isFaqOpen && <FaqModal onClose={() => setIsFaqOpen(false)} />}
+      </Link>
     </div>
   );
 }

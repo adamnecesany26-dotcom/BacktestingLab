@@ -79,8 +79,14 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
         borderDownColor: "#ef4444",
       });
 
-      const candleData = windowOhlc.map((bar) => ({
-        time: bar.date.slice(0, 10) as `${number}-${number}-${number}`,
+      const toUtcSeconds = (value: string, fallbackIndex: number): number => {
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+        return Math.floor(Date.UTC(2020, 0, 1 + fallbackIndex) / 1000);
+      };
+
+      const candleData = windowOhlc.map((bar, i) => ({
+        time: toUtcSeconds(bar.date, i) as import("lightweight-charts").UTCTimestamp,
         open: bar.open,
         high: bar.high,
         low: bar.low,
@@ -94,11 +100,17 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
         const entryBar = windowOhlc.find((b) => toYmd(b.date) === entryYmd);
         const exitBar = windowOhlc.find((b) => toYmd(b.date) === exitYmd);
 
-        type Marker = { time: string; position: "belowBar" | "aboveBar"; color: string; shape: "arrowUp" | "arrowDown"; text: string };
+        type Marker = {
+          time: import("lightweight-charts").UTCTimestamp;
+          position: "belowBar" | "aboveBar";
+          color: string;
+          shape: "arrowUp" | "arrowDown";
+          text: string;
+        };
         const markers: Marker[] = [];
         if (entryBar) {
           markers.push({
-            time: entryBar.date.slice(0, 10) as `${number}-${number}-${number}`,
+            time: toUtcSeconds(entryBar.date, 0) as import("lightweight-charts").UTCTimestamp,
             position: trade.type === "buy" ? "belowBar" : "aboveBar",
             color: trade.type === "buy" ? "#10b981" : "#ef4444",
             shape: trade.type === "buy" ? "arrowUp" : "arrowDown",
@@ -107,7 +119,7 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
         }
         if (exitBar && exitBar.date !== entryBar?.date) {
           markers.push({
-            time: exitBar.date.slice(0, 10) as `${number}-${number}-${number}`,
+            time: toUtcSeconds(exitBar.date, 0) as import("lightweight-charts").UTCTimestamp,
             position: trade.type === "buy" ? "aboveBar" : "belowBar",
             color: "#a1a1aa",
             shape: trade.type === "buy" ? "arrowDown" : "arrowUp",

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import hashlib
 import subprocess
 import threading
 import time
@@ -19,7 +20,9 @@ from typing import AsyncGenerator, Awaitable, Callable, Union
 
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 
-RUN_TIMEOUT = 0  # disabled by default (set RUN_TIMEOUT_SEC to enable)
+RUN_TIMEOUT = 300  # seconds (override with RUN_TIMEOUT_SEC)
+RUN_STREAM_IDLE_TIMEOUT = 120  # seconds (override with RUN_STREAM_IDLE_TIMEOUT_SEC)
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[str]:
@@ -34,6 +37,21 @@ def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[s
     # Match ("param_name", or ('param_name', inside params = ( ... )
     matches = re.findall(r'\(\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']\s*[,\)]', content)
     return set(matches)
+
+
+def _compute_code_digest(files: dict[str, str] | None, code: str | None) -> str:
+    hasher = hashlib.sha256()
+    if files:
+        for key in sorted(files.keys()):
+            hasher.update(key.encode("utf-8", errors="ignore"))
+            hasher.update(b"\x00")
+            hasher.update((files.get(key) or "").encode("utf-8", errors="ignore"))
+            hasher.update(b"\x00")
+    elif code:
+        hasher.update((code or "").encode("utf-8", errors="ignore"))
+    else:
+        hasher.update(b"empty")
+    return hasher.hexdigest()
 
 
 def _read_stream_sync(
@@ -144,6 +162,85 @@ def _resolve_run_timeout_seconds() -> int:
     except ValueError:
         return RUN_TIMEOUT
     return parsed
+
+
+def _resolve_safe_run_dir(run_root: Path, run_id: str | None) -> tuple[str, Path]:
+    """Build run_dir from run_id and keep it constrained under run_root."""
+    resolved_run_id = (run_id or "").strip() or f"run_{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:10]}"
+    if not RUN_ID_RE.fullmatch(resolved_run_id):
+        raise ValueError("Invalid run_id format. Use only letters, numbers, '_' and '-' (max 80 chars).")
+    run_root_resolved = run_root.resolve()
+    run_dir = (run_root_resolved / resolved_run_id).resolve()
+    if run_root_resolved != run_dir and run_root_resolved not in run_dir.parents:
+        raise ValueError("Unsafe run_id path.")
+    return resolved_run_id, run_dir
+
+
+def _resolve_stream_idle_timeout_seconds() -> int:
+    raw = os.environ.get("RUN_STREAM_IDLE_TIMEOUT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return RUN_STREAM_IDLE_TIMEOUT
+    try:
+        parsed = int(float(raw))
+    except ValueError:
+        return RUN_STREAM_IDLE_TIMEOUT
+    return max(0, parsed)
+
+
+def _normalize_result_payload(
+    result_data: dict | None,
+    *,
+    run_id: str,
+    instrument: str,
+    timeframe: str,
+    years: float,
+    data_file: str,
+    instrument_type: str,
+    initial_capital: float,
+    slippage_perc: float,
+    commission_perc: float,
+    validation_mode: str,
+    sweep_mode: str | None,
+    execution_model: dict | None,
+    experiment: dict | None,
+    runner_duration_ms: int,
+) -> dict:
+    normalized = dict(result_data or {})
+    normalized.setdefault("equity", [])
+    normalized.setdefault("trades", [])
+    normalized.setdefault("ohlc", [])
+    normalized.setdefault("moduleOutputs", None)
+    normalized.setdefault("validation", None)
+    normalized.setdefault("robustness", None)
+    normalized.setdefault("monteCarlo", None)
+    normalized.setdefault("regimeAnalysis", None)
+    normalized.setdefault("portfolio", None)
+    normalized.setdefault("executionSummary", None)
+    normalized.setdefault("qualityGate", None)
+    normalized.setdefault("experiment", None)
+
+    normalized["runId"] = run_id
+    normalized.setdefault("manifest", {})
+    if not isinstance(normalized["manifest"], dict):
+        normalized["manifest"] = {}
+    normalized["manifest"].update({
+        "runId": run_id,
+        "instrument": instrument,
+        "timeframe": timeframe,
+        "years": years,
+        "dataFile": data_file,
+        "instrumentType": instrument_type,
+        "initialCapital": initial_capital,
+        "slippagePerc": slippage_perc,
+        "commissionPerc": commission_perc,
+        "validationMode": validation_mode,
+        "sweepMode": sweep_mode,
+        "executionModel": execution_model or {},
+        "experiment": experiment or {},
+        "generatedAt": dt.datetime.utcnow().isoformat() + "Z",
+        "runnerDurationMs": runner_duration_ms,
+    })
+    return normalized
 
 
 def _safe_join_run_path(run_dir: Path, file_path: str) -> Path:
@@ -390,6 +487,7 @@ async def run_strategy_streaming(
     portfolio_config: dict | None = None,
     execution_model: dict | None = None,
     experiment: dict | None = None,
+    actor_id: str = "unknown",
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
 ) -> AsyncGenerator[dict, None]:
     """
@@ -403,8 +501,7 @@ async def run_strategy_streaming(
     run_root = project_root / ".backtest_run"
     run_root.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    resolved_run_id = (run_id or "").strip() or f"run_{dt.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:10]}"
-    run_dir = run_root / resolved_run_id
+    resolved_run_id, run_dir = _resolve_safe_run_dir(run_root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
     entry_file = _prepare_strategy_files(run_dir, code, files)
@@ -445,6 +542,15 @@ async def run_strategy_streaming(
             "execution_model": execution_model or {},
             "experiment": experiment or {},
         }
+        seed = None
+        try:
+            if isinstance(experiment, dict) and experiment.get("seed") is not None:
+                seed = int(experiment.get("seed"))
+        except Exception:
+            seed = None
+        if seed is None:
+            seed = int(uuid.uuid4().int % 1_000_000_000)
+        code_digest = _compute_code_digest(files, code)
         cmd = [
             "docker", "run",
             "--rm",
@@ -479,6 +585,11 @@ async def run_strategy_streaming(
             "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
             "-e", f"APPLIED_MODULES={json.dumps(applied_modules_payload)}",
             "-e", f"ANALYSIS_CONFIG={json.dumps(analysis_payload)}",
+            "-e", f"EXECUTION_MODEL_JSON={json.dumps(execution_model or {})}",
+            "-e", f"ACTOR_ID={actor_id}",
+            "-e", f"RUN_SEED={seed}",
+            "-e", f"CODE_DIGEST={code_digest}",
+            "-e", f"ENGINE_IMAGE_DIGEST={os.environ.get('BACKTEST_ENGINE_IMAGE_DIGEST', '')}",
             "backtest-engine",
         ]
 
@@ -495,10 +606,17 @@ async def run_strategy_streaming(
         loop = asyncio.get_event_loop()
         _read_stream_sync(proc, queue, loop, stdout_buffer, stderr_buffer)
         run_timeout_sec = _resolve_run_timeout_seconds()
+        stream_idle_timeout_sec = _resolve_stream_idle_timeout_seconds()
+
+        timeout_triggered = False
+        stream_stall_triggered = False
+        stream_stall_message = ""
 
         async def kill_after_timeout():
+            nonlocal timeout_triggered
             await asyncio.sleep(run_timeout_sec)
             if proc.poll() is None:
+                timeout_triggered = True
                 proc.kill()
 
         timeout_task = (
@@ -510,6 +628,8 @@ async def run_strategy_streaming(
         done_count = 0
         result_data = None
         error_msg = None
+        last_queue_event_at = time.perf_counter()
+        proc_exit_observed_at: float | None = None
 
         while done_count < 2:
             conn = is_client_connected()
@@ -521,32 +641,48 @@ async def run_strategy_streaming(
             try:
                 ev = await asyncio.wait_for(queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                now = time.perf_counter()
+                if proc.poll() is not None:
+                    if proc_exit_observed_at is None:
+                        proc_exit_observed_at = now
+                    elif now - proc_exit_observed_at >= 2.0:
+                        break
+                if (
+                    stream_idle_timeout_sec > 0
+                    and proc.poll() is None
+                    and (now - last_queue_event_at) >= stream_idle_timeout_sec
+                    and not result_data
+                    and not error_msg
+                ):
+                    stream_stall_triggered = True
+                    stream_stall_message = f"Run stream stalled for {stream_idle_timeout_sec} seconds."
+                    proc.kill()
+                    break
                 continue
+            last_queue_event_at = time.perf_counter()
             if ev.get("type") == "done":
                 done_count += 1
                 continue
             if ev.get("type") == "result":
                 result_data = ev.get("data")
                 if result_data:
-                    result_data["runId"] = resolved_run_id
-                    result_data.setdefault("manifest", {})
-                    result_data["manifest"].update({
-                        "runId": resolved_run_id,
-                        "instrument": instrument,
-                        "timeframe": timeframe,
-                        "years": years,
-                        "dataFile": data_file,
-                        "instrumentType": instrument_type,
-                        "initialCapital": initial_capital,
-                        "slippagePerc": slippage_perc,
-                        "commissionPerc": commission_perc,
-                        "validationMode": validation_mode,
-                        "sweepMode": sweep_mode,
-                        "executionModel": execution_model or {},
-                        "experiment": experiment or {},
-                        "generatedAt": dt.datetime.utcnow().isoformat() + "Z",
-                        "runnerDurationMs": int((time.perf_counter() - run_started) * 1000),
-                    })
+                    result_data = _normalize_result_payload(
+                        result_data,
+                        run_id=resolved_run_id,
+                        instrument=instrument,
+                        timeframe=timeframe,
+                        years=years,
+                        data_file=data_file,
+                        instrument_type=instrument_type,
+                        initial_capital=initial_capital,
+                        slippage_perc=slippage_perc,
+                        commission_perc=commission_perc,
+                        validation_mode=validation_mode,
+                        sweep_mode=sweep_mode,
+                        execution_model=execution_model,
+                        experiment=experiment,
+                        runner_duration_ms=int((time.perf_counter() - run_started) * 1000),
+                    )
                     ev = {"type": "result", "data": result_data}
             if ev.get("type") == "error":
                 error_msg = ev.get("message")
@@ -573,7 +709,12 @@ async def run_strategy_streaming(
             proc.kill()
             proc.wait()
 
-        if not result_data and not error_msg and proc.returncode != 0:
+        if timeout_triggered and not result_data:
+            timeout_msg = f"Run timed out after {run_timeout_sec} seconds."
+            yield {"type": "error", "message": timeout_msg}
+        elif stream_stall_triggered and not result_data and not error_msg:
+            yield {"type": "error", "message": stream_stall_message}
+        elif not result_data and not error_msg and proc.returncode != 0:
             err = "\n".join(stderr_buffer) or "Unknown error"
             msg = f"Docker failed (exit {proc.returncode}): {err}"
             print(f"[runner] DOCKER FAILED:\n{msg[:1500]}", flush=True)
@@ -618,6 +759,7 @@ async def run_strategy(
     portfolio_config: dict | None = None,
     execution_model: dict | None = None,
     experiment: dict | None = None,
+    actor_id: str = "unknown",
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -651,6 +793,7 @@ async def run_strategy(
         portfolio_config=portfolio_config,
         execution_model=execution_model,
         experiment=experiment,
+        actor_id=actor_id,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")

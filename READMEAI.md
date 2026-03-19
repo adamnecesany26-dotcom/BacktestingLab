@@ -4,6 +4,8 @@
 
 **Language:** Czech and English mixed (matches codebase). Key terms are consistent.
 
+> **Important update (2026-03):** System now includes API auth/rate-limit, sandboxed `/api/view`, append-only audit events, deterministic run fingerprinting in manifest, Firestore owner/role rules with soft-delete, and compare/lifecycle governance in Run history.
+
 ---
 
 ## 1. Quick Reference for AI
@@ -14,6 +16,7 @@
 - **Strategies, Indicators, Modules** – stored in Firebase Firestore. Strategies can import indicators and modules.
 - **View mode** – preview module/indicator output (markers, lines, zones) on a chart without running backtest.
 - **Run history** – each successful Run is auto-saved to Firestore under the strategy.
+- **Governance layer** – experiment lifecycle (`draft/review/approved/promoted`), reviewer sign-off, compare workspace.
 
 ### 1.2 Key Entry Points
 
@@ -34,7 +37,7 @@
 User → page.tsx (state) → Firestore (strategies/indicators/modules)
                        → API (run, view, data, chart)
 Backend → runner.py → Docker (engine.py) → stdout JSON
-Runner → _run_module_outputs() → moduleOutputs in response
+Docker engine (`engine.py`) → _run_module_outputs_in_engine() → moduleOutputs in response
 Frontend ← SSE events (log, progress, result) → setResults, showResults
 ```
 
@@ -49,7 +52,7 @@ Frontend ← SSE events (log, progress, result) → setResults, showResults
 │ FRONTEND (Next.js 14, React, TailwindCSS)                        │
 │ - page.tsx: central state, handleRun, handleSaveFile, ...        │
 │ - Components: Sidebar, BacktestSettings, StrategyEditor,         │
-│   ResultsView, StrategyViewChart, LogPanel, FaqModal, ...         │
+│   ResultsView, StrategyViewChart, LogPanel, FieldHelpPopover, ... │
 │ - lib/api.ts: HTTP/SSE to backend                                │
 │ - lib/firestore.ts: Firestore CRUD                               │
 │ - lib/strategyParams.ts: parseStrategyParams, parseViewParams    │
@@ -60,10 +63,12 @@ Frontend ← SSE events (log, progress, result) → setResults, showResults
 ┌─────────────────────────────────────────────────────────────────┐
 │ BACKEND (FastAPI, Python 3.11+)                                  │
 │ - api/run.py: POST /api/run (streaming)                          │
-│ - api/view.py: POST /api/view (OHLC + markers/lines/zones)        │
+│ - api/view.py: POST /api/view (Docker-sandboxed execution)        │
 │ - api/data.py: GET /api/data (instruments)                        │
 │ - api/chart.py: POST /api/chart (PNG)                             │
-│ - services/runner.py: Docker orchestration, _run_module_outputs  │
+│ - services/runner.py: Docker orchestration, streaming            │
+│ - security.py: auth + rate limiting dependency                    │
+│ - services/audit.py: append-only audit log                        │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ docker run (--network none, -v mounts)
@@ -94,6 +99,7 @@ Frontend ← SSE events (log, progress, result) → setResults, showResults
 Backtesting_app/
 ├── frontend/
 │   ├── app/page.tsx              # Main page, state, handleRun, handleSaveFile
+│   ├── app/guide/page.tsx        # A-Z user guide page
 │   ├── components/
 │   │   ├── Sidebar.tsx           # Left panel: type selector, items, files
 │   │   ├── MainView.tsx          # List of strategies/indicators/modules
@@ -102,18 +108,21 @@ Backtesting_app/
 │   │   ├── results/ResultsView.tsx, StatBlocks, TradeHighlight, RunHistory, AnalyticsView
 │   │   ├── charts/DetailedChart, EquityChart, ModuleOutputChart, ...
 │   │   ├── StrategyViewChart.tsx # View mode chart
-│   │   ├── FaqModal.tsx
+│   │   ├── FieldHelpPopover.tsx
 │   │   └── ...
 │   └── lib/
 │       ├── api.ts                # runBacktestStreaming, getViewData, getAvailableData
-│       ├── firestore.ts          # listItems, createItem, getFiles, saveFile, saveBacktestResult
+│       ├── firestore.ts          # CRUD + soft-delete + run governance update
 │       ├── firebase.ts
 │       └── strategyParams.ts     # parseStrategyParams, parseViewParams
 ├── backend/
 │   ├── app/main.py
+│   ├── app/security.py
 │   ├── app/api/run.py, view.py, data.py, chart.py
-│   ├── app/services/runner.py    # run_strategy_streaming, _run_module_outputs
-│   └── docker/engine.py          # Runs inside container
+│   ├── app/services/runner.py    # run_strategy_streaming, _run_module_outputs, manifest metadata
+│   ├── app/services/audit.py     # append-only audit events
+│   ├── docker/engine.py          # Runs inside container
+│   └── docker/view_engine.py     # sandbox execution for /api/view
 ├── shared/types/index.ts         # RunRequest, RunResponse, DataInstrument, Trade, ...
 └── data/mock/                    # OHLC CSV/parquet files
 ```
@@ -168,7 +177,7 @@ Backtesting_app/
 
 **Flow: Module outputs in Results**
 1. Run request includes `applied_modules: [{ id, name, params }]`
-2. Runner after engine completes: `_run_module_outputs(run_dir, ohlc, applied_modules)`
+2. Engine computes `moduleOutputs` in-container via `_run_module_outputs_in_engine(...)`
 3. For each module: import from `modules/{Name}.py`, call `detect`/`get_line`/`get_zones` on OHLC DataFrame
 4. Returns `moduleOutputs: { "ModuleName": { markers, lines, zones } }`
 5. Frontend `ResultsView` → `ModuleOutputChart` for each module
@@ -176,6 +185,13 @@ Backtesting_app/
 ---
 
 ## 5. API Contracts
+
+### 5.0 Security contract (all `/api/*`)
+
+- Client sends `X-API-Key` (or Bearer) for authenticated calls.
+- Optional `X-Actor-Id` is forwarded for lineage/audit.
+- Backend applies in-memory rate limiting per client key.
+- Relevant envs: `API_AUTH_REQUIRED`, `API_AUTH_KEY`, `API_ALLOW_DEV_BYPASS`, `API_RATE_LIMIT_MAX_REQUESTS`, `API_RATE_LIMIT_WINDOW_SEC`.
 
 ### 5.1 POST /api/run
 
@@ -267,7 +283,7 @@ Backtesting_app/
 }
 ```
 
-Backend executes `module_code` in temp file, checks `hasattr(mod, "detect")`, `hasattr(mod, "get_line")`, `hasattr(mod, "get_zones")`, calls with `(df, params)` if signature has 2+ params.
+Backend executes `module_code` in Docker sandbox (`view_engine.py`), checks `hasattr(mod, "detect")`, `hasattr(mod, "get_line")`, `hasattr(mod, "get_zones")`, calls with `(df, params)` if signature has 2+ params.
 
 ### 5.3 GET /api/data
 
@@ -331,9 +347,9 @@ Strategy passes `params.module_params["Swing HL"]` to module functions.
 
 ```
 /strategies/{strategyId}
-  - name, tag, createdAt
+  - name, tag, createdAt, ownerUid
   /files/{fileName}  → fileName, content
-  /results/{backtestId}  → strategyName, savedAt, equityCurve, metrics, trades
+  /results/{backtestId}  → strategyName, savedAt, equityCurve, metrics, trades, deletedAt?, deletedBy?, deleteReason?
 
 /indicators/{indicatorId}
   - name, tag, createdAt
@@ -344,7 +360,7 @@ Strategy passes `params.module_params["Swing HL"]` to module functions.
   /files/main.py
 ```
 
-**Key functions:** `listItems`, `createItem`, `getFiles`, `getFileContent`, `saveFile`, `createFile`, `saveBacktestResult`, `listBacktestResults`, `deleteBacktestResult`, `deleteAllBacktestResults`
+**Key functions:** `listItems`, `createItem`, `getFiles`, `getFileContent`, `saveFile`, `createFile`, `saveBacktestResult`, `listBacktestResults`, `deleteBacktestResult` (soft-delete), `deleteAllBacktestResults` (soft-delete), `updateBacktestRunGovernance`
 
 ---
 
@@ -354,7 +370,7 @@ Strategy passes `params.module_params["Swing HL"]` to module functions.
 2. `_prepare_strategy_files`: write files to `.backtest_run/`, create `indicators/__init__.py`, `modules/__init__.py`
 3. `subprocess` Docker: mount `.backtest_run` → `/app/strategy`, `data` → `/app/data`
 4. Read stdout (JSON result), stderr (PROGRESS:X)
-5. If `applied_modules`: `_run_module_outputs` – for each module, import from `modules/{Name}.py`, call detect/get_line/get_zones on OHLC, merge into `moduleOutputs`
+5. If `applied_modules`: `engine.py` runs `_run_module_outputs_in_engine` and merges `moduleOutputs` into the final result
 6. Stream events to client
 7. Cleanup `.backtest_run/*.py`
 
@@ -388,11 +404,13 @@ Used in `createItem` when creating new strategy/indicator/module.
 | Add new API endpoint | `backend/app/main.py`, new file in `api/` |
 | Change Run request/response | `shared/types/index.ts`, `backend/app/models/run.py` |
 | Change View logic | `backend/app/api/view.py` |
+| Change auth/rate limiting | `backend/app/security.py`, `backend/app/main.py` |
+| Change audit events | `backend/app/services/audit.py`, `backend/app/api/run.py`, `backend/app/api/view.py` |
 | Change module output format | `backend/app/services/runner.py` `_run_module_outputs`, `view.py` |
 | Add UI component | `frontend/components/` |
 | Change default strategy/indicator/module content | `frontend/lib/firestore.ts` |
 | Change param parsing | `frontend/lib/strategyParams.ts` |
-| Add FAQ item | `frontend/components/FaqModal.tsx` |
+| Change guide content | `frontend/data/guideContent.ts`, `frontend/app/guide/page.tsx` |
 
 ---
 
@@ -411,6 +429,8 @@ Used in `createItem` when creating new strategy/indicator/module.
 ## 13. Error Handling
 
 - **AbortError:** User clicked Stop → `handleStopRun` aborts fetch
+- **401 Unauthorized:** missing/invalid API key or bearer token
+- **429 Too Many Requests:** rate limit exceeded
 - **Backend error:** SSE `{"type":"error","message":"..."}` → thrown, caught, logged
 - **Firestore permission:** "Missing or insufficient permissions" → check firestore.rules, deploy
 - **Docker not running:** Run fails, log shows connection error
@@ -427,7 +447,7 @@ page.tsx
   ├── ResultsView (results, runHistory, ...)
   ├── StrategyViewChart (when viewMode)
   ├── LogPanel (logs)
-  ├── FaqModal (isFaqOpen)
+  ├── Link to /guide (help entrypoint)
   └── LoadingOverlay (when isRunning)
 
 BacktestSettings

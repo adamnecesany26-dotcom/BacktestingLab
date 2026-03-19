@@ -11,11 +11,12 @@ import {
   getDoc,
   addDoc,
   setDoc,
+  updateDoc,
   deleteDoc,
   serverTimestamp,
   type CollectionReference,
 } from "firebase/firestore";
-import { getFirebaseApp } from "./firebase";
+import { getFirebaseApp, getFirebaseAuth } from "./firebase";
 
 export type ItemType = "strategies" | "indicators" | "modules";
 
@@ -25,6 +26,7 @@ export interface FirestoreItem {
   id: string;
   name: string;
   tag?: string;
+  ownerUid?: string;
   createdAt: ReturnType<typeof serverTimestamp>;
 }
 
@@ -40,6 +42,18 @@ PARAMS = {
     "sma_slow": 50,
     "risk_per_trade": 0.01,
     "use_trailing_stop": True,
+}
+
+PARAMS_META = {
+    "sma_fast": {
+        "title": "SMA Fast",
+        "whatItMeans": "Rychla perioda pro signalni klouzavy prumer.",
+        "whyItMatters": "Nizsi perioda reaguje rychleji, ale muze zvysit sum.",
+        "howToUse": ["Lad po malych krocich.", "Vysledek kontroluj proti OOS/WF validaci."],
+        "recommendedDefault": "20",
+        "withoutIt": "Bez porozumeni periodam je tuning casto nahodny.",
+        "bestPractices": ["Nemeň vice period najednou bez baseline runu."],
+    },
 }
 
 class Strategy(bt.Strategy):
@@ -77,6 +91,10 @@ Indikátor – používá se ve strategii (backtrader) i ve View (vizualizace).
 
 2. VIEW_PARAMS – dynamické parametry ve View:
    VIEW_PARAMS = {"period": 20}  → ve View lze měnit bez úpravy kódu
+   + volitelně VIEW_PARAMS_META pro detailní wiki nápovědu v UI:
+   VIEW_PARAMS_META = {
+       "period": {"title":"Period", "whatItMeans":"...", "whyItMatters":"...", ...}
+   }
 
 3. STRATEGIE – import v strategii:
    from indicators.{Název} import MyIndicator
@@ -88,6 +106,17 @@ Indikátor – používá se ve strategii (backtrader) i ve View (vizualizace).
 import backtrader as bt
 
 VIEW_PARAMS = {"period": 20}
+VIEW_PARAMS_META = {
+    "period": {
+        "title": "EMA period",
+        "whatItMeans": "Delka periody EMA cary.",
+        "whyItMatters": "Kratsi perioda zrychli reakci, delsi perioda vyhladi sum.",
+        "howToUse": ["Zacni na 20.", "Lad po mensich krocich a sleduj stabilitu edge."],
+        "recommendedDefault": "20",
+        "withoutIt": "Nastaveni periody bude bez kontextu a muze vest k overfittingu.",
+        "bestPractices": ["Stejny period testuj napric vice trznimi useky."],
+    }
+}
 
 
 class MyIndicator(bt.Indicator):
@@ -135,6 +164,7 @@ Modul – pomocné funkce pro strategie (detekce swingů, zón, …) + vizualiza
 
 2. VIEW_PARAMS – dynamické parametry ve View:
    VIEW_PARAMS = {"period": 10}  → ve View lze měnit bez úpravy kódu
+   + volitelně VIEW_PARAMS_META pro detailní wiki nápovědu v UI.
 
 3. STRATEGIE – import v strategii:
    from modules.{Název} import detect, get_swings  (Název = název modulu bez mezer)
@@ -144,6 +174,17 @@ Modul – pomocné funkce pro strategie (detekce swingů, zón, …) + vizualiza
 """
 
 VIEW_PARAMS = {"period": 5}
+VIEW_PARAMS_META = {
+    "period": {
+        "title": "Pivot period",
+        "whatItMeans": "Citlivost detekce pivotu/swingu.",
+        "whyItMatters": "Nizsi perioda da vice markeru, vyssi perioda filtruje sum.",
+        "howToUse": ["Lad podle timeframe trhu.", "Porovnej stabilitu markeru ve View."],
+        "recommendedDefault": "5",
+        "withoutIt": "Upravujes citlivost bez jasneho vysvetleni dopadu.",
+        "bestPractices": ["Nejdriv over ve View, pak teprve robustni backtest."],
+    }
+}
 
 
 def detect(ohlc, params=None):
@@ -186,6 +227,16 @@ function getCollection(type: ItemType): CollectionReference {
   return collection(getDb(), type);
 }
 
+async function getActorUid(): Promise<string> {
+  try {
+    const auth = getFirebaseAuth();
+    if (auth.currentUser?.uid) return auth.currentUser.uid;
+  } catch {
+    // no-op
+  }
+  throw new Error("Authentication required. Please sign in before data operations.");
+}
+
 export async function listItems(type: ItemType): Promise<FirestoreItem[]> {
   const snap = await getDocs(getCollection(type));
   const items = snap.docs.map((d) => ({ id: d.id, ...d.data() } as FirestoreItem));
@@ -208,10 +259,12 @@ export async function createItem(
   name: string,
   tag?: string
 ): Promise<{ id: string }> {
+  const ownerUid = await getActorUid();
   const col = getCollection(type);
   const docRef = await addDoc(col, {
     name,
     tag: tag ?? "",
+    ownerUid,
     createdAt: serverTimestamp(),
   });
 
@@ -298,6 +351,7 @@ export interface SavedBacktestRun {
     totalReturnUsd?: number;
     profitFactor?: number;
     expectancyUsd?: number;
+    expectancyR?: number;
     winRate?: number;
     rMultiple?: number;
     sortinoRatio?: number;
@@ -314,6 +368,9 @@ export interface SavedBacktestRun {
   executionSummary?: Record<string, unknown> | null;
   qualityGate?: Record<string, unknown> | null;
   experiment?: Record<string, unknown> | null;
+  deletedAt?: { seconds?: number; nanoseconds?: number } | null;
+  deletedBy?: string | null;
+  deleteReason?: string | null;
 }
 
 /** Save backtest result under strategy. Path: /strategies/{strategyId}/results/{backtestId} */
@@ -322,6 +379,7 @@ export async function saveBacktestResult(
   strategyName: string,
   result: Record<string, unknown>
 ): Promise<string> {
+  const ownerUid = await getActorUid();
   const randomPart =
     typeof crypto !== "undefined" && "randomUUID" in crypto
       ? crypto.randomUUID()
@@ -330,7 +388,11 @@ export async function saveBacktestResult(
   const ref = doc(getDb(), "strategies", strategyId, "results", id);
   await setDoc(ref, {
     strategyName,
+    ownerUid,
     savedAt: serverTimestamp(),
+    deletedAt: null,
+    deletedBy: null,
+    deleteReason: null,
     ...result,
   });
   return id;
@@ -342,22 +404,79 @@ export async function listBacktestResults(strategyId: string): Promise<SavedBack
   const snap = await getDocs(resultsRef);
   return snap.docs
     .map((d) => ({ id: d.id, ...d.data() } as SavedBacktestRun))
+    .filter((r) => !r.deletedAt)
     .sort((a, b) => {
-      const aT = (a.savedAt as { seconds: number })?.seconds ?? 0;
-      const bT = (b.savedAt as { seconds: number })?.seconds ?? 0;
-      return bT - aT;
+      const aSaved = a.savedAt as { seconds?: number; nanoseconds?: number } | null;
+      const bSaved = b.savedAt as { seconds?: number; nanoseconds?: number } | null;
+      const aSec = aSaved?.seconds ?? 0;
+      const bSec = bSaved?.seconds ?? 0;
+      if (aSec !== bSec) return bSec - aSec;
+      const aNano = aSaved?.nanoseconds ?? 0;
+      const bNano = bSaved?.nanoseconds ?? 0;
+      if (aNano !== bNano) return bNano - aNano;
+      return (b.runId ?? b.id).localeCompare(a.runId ?? a.id);
     });
 }
 
 /** Delete a single backtest result */
 export async function deleteBacktestResult(strategyId: string, resultId: string): Promise<void> {
+  const actorUid = await getActorUid();
   const ref = doc(getDb(), "strategies", strategyId, "results", resultId);
-  await deleteDoc(ref);
+  await updateDoc(ref, {
+    deletedAt: serverTimestamp(),
+    deletedBy: actorUid,
+    deleteReason: "user_delete_single",
+  });
 }
 
 /** Delete all backtest results for a strategy */
 export async function deleteAllBacktestResults(strategyId: string): Promise<void> {
+  const actorUid = await getActorUid();
   const resultsRef = collection(getDb(), "strategies", strategyId, "results");
   const snap = await getDocs(resultsRef);
-  await Promise.all(snap.docs.map((d) => deleteDoc(d.ref)));
+  await Promise.all(
+    snap.docs.map((d) =>
+      updateDoc(d.ref, {
+        deletedAt: serverTimestamp(),
+        deletedBy: actorUid,
+        deleteReason: "user_delete_all",
+      })
+    )
+  );
+}
+
+function flattenExperimentPatch(
+  value: Record<string, unknown>,
+  prefix: string = "experiment"
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const path = `${prefix}.${key}`;
+    const isPlainObject =
+      entry != null &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      !(entry instanceof Date);
+    if (isPlainObject) {
+      Object.assign(out, flattenExperimentPatch(entry as Record<string, unknown>, path));
+    } else {
+      out[path] = entry;
+    }
+  }
+  return out;
+}
+
+export async function updateBacktestRunGovernance(
+  strategyId: string,
+  resultId: string,
+  governancePatch: Record<string, unknown>
+): Promise<void> {
+  const actorUid = await getActorUid();
+  const ref = doc(getDb(), "strategies", strategyId, "results", resultId);
+  const flattenedPatch = flattenExperimentPatch(governancePatch);
+  await updateDoc(ref, {
+    ...flattenedPatch,
+    governanceUpdatedAt: serverTimestamp(),
+    governanceUpdatedBy: actorUid,
+  });
 }

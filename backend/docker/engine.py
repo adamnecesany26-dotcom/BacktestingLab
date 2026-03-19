@@ -261,6 +261,23 @@ def _parse_analysis_config() -> dict:
         return {}
 
 
+def _estimate_periods_per_year(equity_curve_with_dates: list[dict]) -> float:
+    if len(equity_curve_with_dates) < 3:
+        return 252.0
+    try:
+        stamps = pd.to_datetime([x.get("date") for x in equity_curve_with_dates], errors="coerce")
+        series = pd.Series(stamps).dropna().drop_duplicates().sort_values()
+        if len(series) < 3:
+            return 252.0
+        diffs = series.diff().dropna()
+        if len(diffs) == 0:
+            return 252.0
+        median_minutes = max(diffs.median().total_seconds() / 60.0, 1.0)
+        return float(max(1.0, (365.25 * 24.0 * 60.0) / median_minutes))
+    except Exception:
+        return 252.0
+
+
 def _compute_advanced_risk_metrics(
     equity_curve_with_dates: list[dict],
     max_drawdown_pct: float,
@@ -275,7 +292,8 @@ def _compute_advanced_risk_metrics(
     mean_ret = float(rets.mean())
     down = rets[rets < 0]
     downside_std = float(down.std()) if len(down) > 1 else 0.0
-    sortino = (mean_ret / downside_std * math.sqrt(252.0)) if downside_std > 0 else 0.0
+    periods_per_year = _estimate_periods_per_year(equity_curve_with_dates)
+    sortino = (mean_ret / downside_std * math.sqrt(periods_per_year)) if downside_std > 0 else 0.0
 
     start_v = float(vals[0]) if vals else 0.0
     end_v = float(vals[-1]) if vals else 0.0
@@ -339,10 +357,11 @@ def _evaluate_quality_gates(metrics: dict, gates_cfg: dict | None) -> dict:
 
 def _safe_metrics_snapshot(result: dict) -> dict:
     m = result.get("metrics", {}) if isinstance(result, dict) else {}
+    profit_factor_raw = float(m.get("profitFactor", 0.0) or 0.0)
     return {
         "finalEquity": float(m.get("finalEquity", 0.0) or 0.0),
         "maxDrawdownPct": float(m.get("maxDrawdownPct", m.get("maxDrawdown", 0.0)) or 0.0),
-        "profitFactor": float(m.get("profitFactor", 0.0) or 0.0),
+        "profitFactor": 5.0 if profit_factor_raw >= 999.0 else min(max(profit_factor_raw, 0.0), 5.0),
         "tradeCount": int(m.get("tradeCount", 0) or 0),
         "winRate": float(m.get("winRate", 0.0) or 0.0),
         "sortinoRatio": float(m.get("sortinoRatio", 0.0) or 0.0),
@@ -586,11 +605,24 @@ def _compute_path_max_dd(equity_vals: list[float]) -> float:
     return max_dd
 
 
+def _compute_profit_factor(gross_profit: float, gross_loss: float) -> float:
+    if gross_loss > 0:
+        return gross_profit / gross_loss
+    return 999.0 if gross_profit > 0 else 0.0
+
+
 def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | None) -> dict:
     cfg = cfg or {}
     pnl = [float(t.get("pnl", 0.0) or 0.0) for t in trades]
     if not pnl:
-        return {"simulations": 0, "drawdownPct": {}, "endingEquity": {}, "riskOfRuin": 0.0}
+        return {
+            "simulations": 0,
+            "drawdownPct": {},
+            "endingEquity": {},
+            "riskOfRuin": 0.0,
+            "method": "iid_trade_bootstrap",
+            "note": "Monte Carlo uses bootstrap resampling of historical trade PnL.",
+        }
     sims = int(cfg.get("simulations", 300) or 300)
     sims = min(max(sims, 50), 2000)
     ruin_dd = float(cfg.get("ruin_dd_pct", 50.0) or 50.0)
@@ -631,6 +663,8 @@ def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | Non
             "p90": round(pctile(end_vals, 0.90), 2),
         },
         "riskOfRuin": round(ruin_count / sims, 6),
+        "method": "iid_trade_bootstrap",
+        "note": "Monte Carlo uses bootstrap resampling of historical trade PnL.",
     }
 
 
@@ -685,7 +719,7 @@ def _run_regime_analysis(ohlc: list[dict], trades: list[dict], cfg: dict | None 
         losses = [x for x in pnls if x < 0]
         gross_p = sum(wins)
         gross_l = abs(sum(losses))
-        pf = gross_p / gross_l if gross_l > 0 else (999.0 if gross_p > 0 else 0.0)
+        pf = _compute_profit_factor(gross_p, gross_l)
         return {
             "trades": len(pnls),
             "expectancyUsd": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,
@@ -1092,7 +1126,7 @@ def load_data(
 
     # Explicit file path (e.g. mock/NQ_5Y.csv)
     if data_file:
-        p = base / data_file
+        p = _resolve_safe_data_path(base, data_file)
         if p.exists():
             return _load_file(p, years, timeframe, cache_dir)
 
@@ -1100,6 +1134,7 @@ def load_data(
     candidates = [
         base / "mock" / f"{instrument}_5Y.csv",
         base / "mock" / f"{instrument}.csv",
+        base / "futures_30m" / f"{instrument}.txt",
         base / f"{instrument}_{timeframe}.parquet",
         base / f"{instrument}.parquet",
     ]
@@ -1164,6 +1199,44 @@ def _build_cache_key(path: Path, years: float, target_tf: str | None) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_safe_data_path(data_dir: Path, data_file: str) -> Path:
+    normalized = (data_file or "").replace("\\", "/").lstrip("/")
+    if not normalized or normalized.startswith("../") or "/../" in normalized:
+        raise ValueError("Unsafe data_file path")
+    root = data_dir.resolve()
+    path = (root / normalized).resolve()
+    if root != path and root not in path.parents:
+        raise ValueError("Unsafe data_file path")
+    return path
+
+
+def _read_market_data_file(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".txt":
+        df = pd.read_csv(
+            path,
+            header=None,
+            names=["Date", "Time", "open", "high", "low", "close", "volume"],
+        )
+        df["datetime"] = pd.to_datetime(
+            df["Date"].astype(str).str.strip() + " " + df["Time"].astype(str).str.strip(),
+            format="%m/%d/%Y %H:%M",
+            errors="coerce",
+        )
+        return df.drop(columns=["Date", "Time"], errors="ignore")
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    return pd.read_parquet(path)
+
+
 def _load_file(
     path: Path,
     years: float,
@@ -1191,10 +1264,7 @@ def _load_file(
             pass
 
     load_start = time.perf_counter()
-    if path.suffix.lower() == ".csv":
-        df = pd.read_csv(path)
-    else:
-        df = pd.read_parquet(path)
+    df = _read_market_data_file(path)
     df = _normalize_ohlcv_columns(df)
     df = _apply_years_filter(df, years)
     load_ms = int((time.perf_counter() - load_start) * 1000)
@@ -1213,6 +1283,7 @@ def _load_file(
     meta = {
         "cacheHit": cache_hit,
         "cacheKey": cache_key,
+        "datasetFingerprint": _file_sha256(path),
         "dataLoadMs": load_ms,
         "resampleMs": resample_ms,
         "sourceTimeframe": source_tf,
@@ -1442,6 +1513,26 @@ def run_backtest(
 
     initial_capital = float(os.environ.get("INITIAL_CAPITAL", "100000"))
     slippage_perc = float(os.environ.get("SLIPPAGE_PERC", "0.001"))
+    execution_cfg_raw = os.environ.get("EXECUTION_MODEL_JSON", "{}")
+    execution_cfg = {}
+    try:
+        execution_cfg = json.loads(execution_cfg_raw) if execution_cfg_raw else {}
+        if not isinstance(execution_cfg, dict):
+            execution_cfg = {}
+    except Exception:
+        execution_cfg = {}
+    if bool(execution_cfg.get("enabled", False)):
+        close = pd.to_numeric(data.get("close"), errors="coerce").dropna()
+        volatility = float(close.pct_change().dropna().std()) if len(close) > 2 else 0.0
+        spread_bps = float(execution_cfg.get("spread_bps", 0.0) or 0.0)
+        slippage_mult = float(execution_cfg.get("slippage_vol_mult", 0.0) or 0.0)
+        latency_bars = int(execution_cfg.get("latency_bars", 0) or 0)
+        mean_abs_ret = float(close.pct_change().abs().dropna().mean()) if len(close) > 2 else 0.0
+        latency_penalty = mean_abs_ret * max(0, latency_bars)
+        extra_slippage_perc = (spread_bps / 10000.0) + (volatility * slippage_mult) + latency_penalty
+        slippage_perc = max(0.0, slippage_perc + extra_slippage_perc)
+        execution_cfg["applied_effective_slippage_perc"] = float(round(slippage_perc, 10))
+        execution_cfg["applied_extra_slippage_perc"] = float(round(extra_slippage_perc, 10))
 
     cerebro.broker.setcash(initial_capital)
     cerebro.broker.set_slippage_perc(slippage_perc)
@@ -1497,7 +1588,7 @@ def run_backtest(
     losing = [t for t in trades_list if t["pnl"] < 0]
     gross_profit = sum(t["pnl"] for t in trades_list if t["pnl"] > 0)
     gross_loss = abs(sum(t["pnl"] for t in losing))
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+    profit_factor = round(_compute_profit_factor(gross_profit, gross_loss), 2)
     expectancy_usd = round(sum(t["pnl"] for t in trades_list) / len(trades_list), 2) if trades_list else 0.0
     avg_loss = abs(sum(t["pnl"] for t in losing) / len(losing)) if losing else 1.0
     expectancy_r = round(expectancy_usd / avg_loss, 2) if avg_loss else 0.0
@@ -1524,7 +1615,7 @@ def run_backtest(
         "profitFactor": float(profit_factor),
         "expectancyUsd": float(expectancy_usd),
         "expectancyR": float(expectancy_r),
-        "rMultiple": float(expectancy_r),  # expectancy in R = avg R-multiple per trade
+        "rMultiple": float(expectancy_r),  # backward-compat alias; true per-trade R needs explicit trade risk
         "commissionPerc": float(commission_pct),
         "sortinoRatio": float(advanced.get("sortinoRatio", 0.0)),
         "calmarRatio": float(advanced.get("calmarRatio", 0.0)),
@@ -1578,6 +1669,10 @@ def main():
     years = float(os.environ.get("YEARS", "1"))
     data_file = os.environ.get("DATA_FILE", "")
     strategy_params_raw = os.environ.get("STRATEGY_PARAMS", "{}")
+    run_seed_raw = os.environ.get("RUN_SEED", "")
+    code_digest = os.environ.get("CODE_DIGEST", "")
+    actor_id = os.environ.get("ACTOR_ID", "")
+    image_digest = os.environ.get("ENGINE_IMAGE_DIGEST", "")
     run_id = os.environ.get("RUN_ID", "")
     applied_modules_raw = os.environ.get("APPLIED_MODULES", "[]")
     analysis_cfg = _parse_analysis_config()
@@ -1593,6 +1688,17 @@ def main():
         applied_modules = []
 
     try:
+        run_seed_value = None
+        if run_seed_raw.strip():
+            try:
+                run_seed_value = int(float(run_seed_raw))
+            except Exception:
+                run_seed_value = None
+        if run_seed_raw.strip():
+            try:
+                random.seed(int(float(run_seed_raw)))
+            except Exception:
+                random.seed(run_seed_raw)
         modules_dir = Path(strategy_dir) / "modules"
         print(f"[engine] strategy_dir={strategy_dir} sys.path[0]={sys.path[0] if sys.path else '?'} modules_exists={modules_dir.exists()}", file=sys.stderr, flush=True)
         if modules_dir.exists():
@@ -1714,7 +1820,7 @@ def main():
             )
             exp_payload["runDiff"] = run_diff
             exp_payload["promoteEvidence"] = promote_evidence
-            exp_payload["promoteDecision"] = "candidate_for_promote" if promote_evidence.get("promote") else "hold"
+            exp_payload["promoteDecision"] = "review_candidate" if promote_evidence.get("promote") else "hold"
             result["experiment"] = exp_payload
 
         fwd = _build_forward_bridge(result.get("metrics", {}), execution_cfg.get("forward_bridge") if isinstance(execution_cfg, dict) else None)
@@ -1735,11 +1841,15 @@ def main():
         result["runId"] = run_id or None
         result["manifest"] = {
             "runId": run_id or None,
+            "actorId": actor_id or None,
             "instrument": instrument,
             "timeframe": timeframe,
             "years": years,
             "dataFile": data_file,
             "strategyPath": strategy_path,
+            "runSeed": run_seed_value,
+            "codeDigest": code_digest or None,
+            "imageDigest": image_digest or None,
             "generatedAt": dt.datetime.utcnow().isoformat() + "Z",
             "strategyParams": strategy_params,
             "appliedModules": applied_modules,
@@ -1751,6 +1861,7 @@ def main():
             "barsIn": perf.get("barsIn"),
             "barsOut": perf.get("barsOut"),
             "cacheHit": perf.get("cacheHit"),
+            "datasetFingerprint": data_meta.get("datasetFingerprint"),
             "dataLoadMs": perf.get("dataLoadMs"),
             "resampleMs": perf.get("resampleMs"),
         }

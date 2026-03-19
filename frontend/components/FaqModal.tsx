@@ -56,7 +56,7 @@ const FAQ_ITEMS: FaqItem[] = [
   },
   {
     q: "Co je Run history?",
-    a: "Každý úspěšný Run se automaticky uloží. V záložce Run history vidíte tabulku všech spuštění s metrikami (P/L, Sharpe, R-multiple) a grafy vývoje metrik napříč runy. Můžete smazat jednotlivé runy nebo vše najednou.",
+    a: "Každý úspěšný Run se automaticky uloží. V záložce Run history vidíte tabulku všech spuštění s metrikami (P/L, Sharpe, Expectancy R) a grafy vývoje metrik napříč runy. Můžete smazat jednotlivé runy nebo vše najednou.",
   },
   {
     q: "Proč se mi nezobrazují výstupy modulů v Results?",

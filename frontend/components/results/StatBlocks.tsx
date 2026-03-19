@@ -9,7 +9,7 @@ interface StatBlocksProps {
 const STAT_ITEMS = [
   { key: "sharpeRatio", label: "Sharpe Ratio", format: (v: number) => v.toFixed(2) },
   { key: "finalEquity", label: "Final Equity", format: (v: number) => v.toLocaleString("en-US", { minimumFractionDigits: 2 }) },
-  { key: "rMultiple", label: "R-multiple", format: (v: number) => v.toFixed(2) },
+  { key: "sortinoRatio", label: "Sortino Ratio", format: (v: number) => v.toFixed(2) },
   { key: "maxDrawdown", label: "Max Drawdown", format: (v: number) => `${v.toFixed(2)}%` },
   { key: "tradeCount", label: "Trade Count", format: (v: number) => String(v) },
   { key: "longShort", label: "Longs / Shorts", format: (_: number) => "" },
@@ -20,6 +20,12 @@ const STAT_ITEMS = [
   { key: "expectancyUsd", label: "Expectancy USD", format: (v: number) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}` },
   { key: "expectancyR", label: "Expectancy R", format: (v: number) => v.toFixed(2) },
 ] as const;
+
+function formatProfitFactor(value: number | undefined): string {
+  if (value == null || Number.isNaN(value)) return "—";
+  if (value >= 999) return "No losses";
+  return value.toFixed(2);
+}
 
 export function StatBlocks({ results }: StatBlocksProps) {
   if (!results) return null;
@@ -32,6 +38,8 @@ export function StatBlocks({ results }: StatBlocksProps) {
         let value: string;
         if (key === "longShort") {
           value = `${m.longCount ?? 0} / ${m.shortCount ?? 0}`;
+        } else if (key === "profitFactor") {
+          value = formatProfitFactor(m[key] as number | undefined);
         } else {
           const v = m[key] as number | undefined;
           value = v != null ? format(v) : "—";

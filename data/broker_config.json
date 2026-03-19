@@ -1,7 +1,7 @@
 {
   "NQ": {
     "tick_size": 0.25,
-    "tick_value": 20,
+    "tick_value": 5,
     "mult": 20,
     "margin": 20000,
     "commission_per_contract": 2.5
@@ -11,6 +11,62 @@
     "tick_value": 12.5,
     "mult": 50,
     "margin": 15000,
+    "commission_per_contract": 2.5
+  },
+  "CL": {
+    "tick_size": 0.01,
+    "tick_value": 10,
+    "mult": 1000,
+    "margin": 8000,
+    "commission_per_contract": 2.5
+  },
+  "GC": {
+    "tick_size": 0.1,
+    "tick_value": 10,
+    "mult": 100,
+    "margin": 12000,
+    "commission_per_contract": 2.5
+  },
+  "EU": {
+    "tick_size": 0.0001,
+    "tick_value": 12.5,
+    "mult": 125000,
+    "margin": 4500,
+    "commission_per_contract": 2.5
+  },
+  "BP": {
+    "tick_size": 0.0001,
+    "tick_value": 6.25,
+    "mult": 62500,
+    "margin": 3500,
+    "commission_per_contract": 2.5
+  },
+  "JY": {
+    "tick_size": 0.0000005,
+    "tick_value": 6.25,
+    "mult": 12500000,
+    "margin": 4000,
+    "commission_per_contract": 2.5
+  },
+  "FV": {
+    "tick_size": 0.0078125,
+    "tick_value": 7.8125,
+    "mult": 1000,
+    "margin": 2500,
+    "commission_per_contract": 2.5
+  },
+  "TY": {
+    "tick_size": 0.015625,
+    "tick_value": 15.625,
+    "mult": 1000,
+    "margin": 3500,
+    "commission_per_contract": 2.5
+  },
+  "US": {
+    "tick_size": 0.03125,
+    "tick_value": 31.25,
+    "mult": 1000,
+    "margin": 5000,
     "commission_per_contract": 2.5
   },
   "default": {

@@ -6,6 +6,16 @@
 
 export type StrategyParamValue = number | boolean | string;
 export type StrategyParams = Record<string, StrategyParamValue>;
+export interface StrategyParamMeta {
+  title?: string;
+  whatItMeans?: string;
+  whyItMatters?: string;
+  howToUse?: string[];
+  recommendedDefault?: string;
+  withoutIt?: string;
+  bestPractices?: string[];
+}
+export type StrategyParamsMeta = Record<string, StrategyParamMeta>;
 
 /**
  * Strip Python # comments from string, preserving # inside quoted strings.
@@ -43,16 +53,12 @@ function stripPythonComments(s: string): string {
   return result;
 }
 
-/**
- * Parse PARAMS = {...} from Python strategy code.
- * Returns empty object if not found or parsing fails.
- */
-export function parseStrategyParams(code: string): StrategyParams {
-  if (!code || typeof code !== "string") return {};
+function extractDictBlock(code: string, variableName: string): string | null {
+  if (!code || typeof code !== "string") return null;
 
-  // Find PARAMS = {...} block - match balanced braces
-  const match = code.match(/PARAMS\s*=\s*(\{)/);
-  if (!match) return {};
+  const escaped = variableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = code.match(new RegExp(`${escaped}\\s*=\\s*(\\{)`));
+  if (!match) return null;
 
   const startIdx = match.index! + match[0].length - 1; // position of {
   let depth = 0;
@@ -70,37 +76,91 @@ export function parseStrategyParams(code: string): StrategyParams {
     }
   }
 
-  if (endIdx < 0) return {};
+  if (endIdx < 0) return null;
 
-  let dictStr = stripPythonComments(code.slice(startIdx, endIdx + 1));
+  return stripPythonComments(code.slice(startIdx, endIdx + 1));
+}
 
-  // Convert Python dict to JSON-compatible format
-  dictStr = dictStr
+function toJsonDict(dictStr: string): string {
+  return dictStr
     .replace(/\bTrue\b/g, "true")
     .replace(/\bFalse\b/g, "false")
     .replace(/\bNone\b/g, "null")
-    // Single-quoted keys: 'key': -> "key":
     .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, s) => `${JSON.stringify(s)}:`)
-    // Unquoted keys: , key: or { key: -> , "key": or { "key":
     .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g, (_, before, key, after) => `${before}"${key}"${after}`)
-    // Single-quoted string values (not keys): , 'val' or : 'val'
     .replace(/([:,])\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, punct, s) => `${punct} ${JSON.stringify(s)}`)
-    // Python trailing comma
     .replace(/,(\s*})/g, "$1");
+}
 
+function parsePythonDict(code: string, variableName: string): Record<string, unknown> {
+  const dictBlock = extractDictBlock(code, variableName);
+  if (!dictBlock) return {};
+  const dictStr = toJsonDict(dictBlock);
   try {
     const parsed = JSON.parse(dictStr) as Record<string, unknown>;
-    const result: StrategyParams = {};
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
-        result[k] = v;
-      }
-      // Skip complex types (objects, arrays)
-    }
-    return result;
+    return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
   }
+}
+
+function normalizeMetaEntry(value: unknown): StrategyParamMeta | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const readString = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  const readStringArray = (v: unknown): string[] | undefined =>
+    Array.isArray(v) ? v.filter((item): item is string => typeof item === "string" && item.trim().length > 0) : undefined;
+
+  const help: StrategyParamMeta = {
+    title: readString(source.title),
+    whatItMeans: readString(source.whatItMeans ?? source.what_it_means),
+    whyItMatters: readString(source.whyItMatters ?? source.why_it_matters),
+    howToUse: readStringArray(source.howToUse ?? source.how_to_use),
+    recommendedDefault: readString(source.recommendedDefault ?? source.recommended_default),
+    withoutIt: readString(source.withoutIt ?? source.without_it),
+    bestPractices: readStringArray(source.bestPractices ?? source.best_practices),
+  };
+  const hasSomeContent = Object.values(help).some((v) => (Array.isArray(v) ? v.length > 0 : !!v));
+  return hasSomeContent ? help : null;
+}
+
+function parseParamsMeta(code: string, variableName: string): StrategyParamsMeta {
+  const parsed = parsePythonDict(code, variableName);
+  const out: StrategyParamsMeta = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    const normalized = normalizeMetaEntry(v);
+    if (normalized) out[k] = normalized;
+  }
+  return out;
+}
+
+/**
+ * Parse PARAMS = {...} from Python strategy code.
+ * Returns empty object if not found or parsing fails.
+ */
+export function parseStrategyParams(code: string): StrategyParams {
+  if (!code || typeof code !== "string") return {};
+
+  const parsed = parsePythonDict(code, "PARAMS");
+  const result: StrategyParams = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
+      result[k] = v;
+    }
+  }
+  return result;
+}
+
+export function parseStrategyParamMeta(code: string): StrategyParamsMeta {
+  if (!code || typeof code !== "string") return {};
+  return parseParamsMeta(code, "PARAMS_META");
+}
+
+export function parseStrategyParamBundle(code: string): { params: StrategyParams; meta: StrategyParamsMeta } {
+  return {
+    params: parseStrategyParams(code),
+    meta: parseStrategyParamMeta(code),
+  };
 }
 
 /**
@@ -182,48 +242,24 @@ export function parseStrategyImportDependencies(code: string): StrategyImportDep
  */
 export function parseViewParams(code: string): StrategyParams {
   if (!code || typeof code !== "string") return {};
-
-  const match = code.match(/VIEW_PARAMS\s*=\s*(\{)/);
-  if (!match) return {};
-
-  const startIdx = match.index! + match[0].length - 1;
-  let depth = 0;
-  let endIdx = -1;
-
-  for (let i = startIdx; i < code.length; i++) {
-    const c = code[i];
-    if (c === "{") depth++;
-    else if (c === "}") {
-      depth--;
-      if (depth === 0) {
-        endIdx = i;
-        break;
-      }
+  const parsed = parsePythonDict(code, "VIEW_PARAMS");
+  const result: StrategyParams = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
+      result[k] = v;
     }
   }
+  return result;
+}
 
-  if (endIdx < 0) return {};
+export function parseViewParamMeta(code: string): StrategyParamsMeta {
+  if (!code || typeof code !== "string") return {};
+  return parseParamsMeta(code, "VIEW_PARAMS_META");
+}
 
-  let dictStr = stripPythonComments(code.slice(startIdx, endIdx + 1));
-  dictStr = dictStr
-    .replace(/\bTrue\b/g, "true")
-    .replace(/\bFalse\b/g, "false")
-    .replace(/\bNone\b/g, "null")
-    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, s) => `${JSON.stringify(s)}:`)
-    .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g, (_, before, key, after) => `${before}"${key}"${after}`)
-    .replace(/([:,])\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, punct, s) => `${punct} ${JSON.stringify(s)}`)
-    .replace(/,(\s*})/g, "$1");
-
-  try {
-    const parsed = JSON.parse(dictStr) as Record<string, unknown>;
-    const result: StrategyParams = {};
-    for (const [k, v] of Object.entries(parsed)) {
-      if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
-        result[k] = v;
-      }
-    }
-    return result;
-  } catch {
-    return {};
-  }
+export function parseViewParamBundle(code: string): { params: StrategyParams; meta: StrategyParamsMeta } {
+  return {
+    params: parseViewParams(code),
+    meta: parseViewParamMeta(code),
+  };
 }

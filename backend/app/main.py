@@ -3,10 +3,11 @@ FastAPI entry point for the backtesting platform API.
 Handles CORS, routes, and startup/shutdown events.
 """
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import run, data, chart, view
+from app.security import require_api_access
 
 app = FastAPI(
     title="Backtesting Platform API",
@@ -31,7 +32,7 @@ async def health():
 
 
 # Include API routes
-app.include_router(run.router, prefix="/api", tags=["run"])
-app.include_router(data.router, prefix="/api", tags=["data"])
-app.include_router(chart.router, prefix="/api", tags=["chart"])
-app.include_router(view.router, prefix="/api", tags=["view"])
+app.include_router(run.router, prefix="/api", tags=["run"], dependencies=[Depends(require_api_access)])
+app.include_router(data.router, prefix="/api", tags=["data"], dependencies=[Depends(require_api_access)])
+app.include_router(chart.router, prefix="/api", tags=["chart"], dependencies=[Depends(require_api_access)])
+app.include_router(view.router, prefix="/api", tags=["view"], dependencies=[Depends(require_api_access)])

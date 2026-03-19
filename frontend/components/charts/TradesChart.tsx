@@ -10,6 +10,7 @@ interface TradesChartProps {
 
 export function TradesChart({ trades, height = 320 }: TradesChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
+  const chartInstanceRef = useRef<import("lightweight-charts").IChartApi | null>(null);
 
   useEffect(() => {
     if (!chartRef.current || trades.length === 0) return;
@@ -34,6 +35,7 @@ export function TradesChart({ trades, height = 320 }: TradesChartProps) {
           scaleMargins: { top: 0.1, bottom: 0.1 },
         },
       });
+      chartInstanceRef.current = chart;
 
       const series = chart.addHistogramSeries({
         color: "#10b981",
@@ -42,13 +44,19 @@ export function TradesChart({ trades, height = 320 }: TradesChartProps) {
 
       const dateCounts = new Map<string, number>();
       const data = trades.map((t, i) => {
-        const dateStr = (t.exitDate || t.date || "").slice(0, 10);
-        let time: number;
-        if (dateStr && /^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-          const d = new Date(dateStr);
-          const count = dateCounts.get(dateStr) ?? 0;
-          dateCounts.set(dateStr, count + 1);
-          time = Math.floor(d.getTime() / 1000) + count;
+        const raw = (t.exitDate || t.date || "").trim();
+        let time = Number.NaN;
+        if (raw) {
+          const parsedMs = Date.parse(raw);
+          if (Number.isFinite(parsedMs)) {
+            time = Math.floor(parsedMs / 1000);
+          }
+        }
+        if (Number.isFinite(time)) {
+          const key = String(time);
+          const count = dateCounts.get(key) ?? 0;
+          dateCounts.set(key, count + 1);
+          time += count;
         } else {
           time = Math.floor(Date.now() / 1000) + i;
         }
@@ -60,14 +68,16 @@ export function TradesChart({ trades, height = 320 }: TradesChartProps) {
       });
       series.setData(data);
       chart.timeScale().fitContent();
-
-      return () => chart.remove();
     });
 
     return () => {
       mounted = false;
+      if (chartInstanceRef.current) {
+        chartInstanceRef.current.remove();
+        chartInstanceRef.current = null;
+      }
     };
-  }, [trades]);
+  }, [trades, height]);
 
   if (trades.length === 0) {
     return (

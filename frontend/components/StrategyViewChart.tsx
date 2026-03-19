@@ -251,11 +251,17 @@ export function StrategyViewChart({
       const startIdx = Math.floor(Math.random() * (maxStart + 1));
       const endIdx = Math.min(startIdx + windowBars, fullOhlc.length);
       const windowOhlc = fullOhlc.slice(startIdx, endIdx);
-      const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
-      const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+      const startTime = Date.parse(windowOhlc[0]?.date ?? "");
+      const endTime = Date.parse(windowOhlc[windowOhlc.length - 1]?.date ?? "");
 
       const inRange = (d: string) => {
+        const ts = Date.parse(d);
+        if (Number.isFinite(ts) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+          return ts >= startTime && ts <= endTime;
+        }
         const ds = d.slice(0, 10);
+        const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+        const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
         return ds >= startDate && ds <= endDate;
       };
 
@@ -269,10 +275,20 @@ export function StrategyViewChart({
       );
       setZones(
         fullZones.filter(
-          (z) =>
-            (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
-            (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
-            (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+          (z) => {
+            const zStart = Date.parse(z.date_start);
+            const zEnd = Date.parse(z.date_end);
+            if (Number.isFinite(zStart) && Number.isFinite(zEnd) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+              return (zStart >= startTime && zStart <= endTime) || (zEnd >= startTime && zEnd <= endTime) || (zStart <= startTime && zEnd >= endTime);
+            }
+            const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+            const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+            return (
+              (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
+              (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
+              (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+            );
+          }
         )
       );
     } catch (e) {
@@ -317,7 +333,18 @@ export function StrategyViewChart({
   const tickvals = Array.from({ length: Math.ceil(n / tickStep) + 1 }, (_, i) =>
     Math.min(i * tickStep, n - 1)
   );
-  const ticktext = tickvals.map((i) => ohlc[i]?.date?.slice(0, 10) ?? "");
+  const ticktext = tickvals.map((i) => {
+    const raw = ohlc[i]?.date ?? "";
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return raw;
+    const hasTime = /T\d{2}:\d{2}/.test(raw) || /\s\d{2}:\d{2}/.test(raw);
+    return parsed.toLocaleString("cs-CZ", {
+      year: "2-digit",
+      month: "2-digit",
+      day: "2-digit",
+      ...(hasTime ? { hour: "2-digit", minute: "2-digit" } : {}),
+    });
+  });
 
   const candlestickTrace: any = {
     type: "candlestick",
@@ -748,7 +775,7 @@ export function StrategyViewChart({
             )}
             {instruments.map((inv) => (
               <option key={inv.file} value={inv.file}>
-                {inv.instrument} ({inv.yearsAvailable}y)
+                {inv.displayName ? `${inv.instrument} - ${inv.displayName}` : inv.instrument} ({inv.timeframe}, {inv.yearsAvailable}y)
               </option>
             ))}
           </select>

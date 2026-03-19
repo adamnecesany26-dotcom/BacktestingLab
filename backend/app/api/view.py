@@ -3,13 +3,28 @@ GET/POST /api/view - OHLC data + optional module markers for Strategy View chart
 Used for visual testing of modules/indicators (e.g. H/L detection).
 """
 
+import re
+import uuid
 from pathlib import Path
+from typing import Any
+import asyncio
+import os
+import json
+import shutil
+import subprocess
+import tempfile
 
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from app.services.audit import append_audit_event
 
 router = APIRouter()
+MAX_VIEW_CODE_CHARS = 500_000
+MAX_VIEW_DEPENDENCIES = 50
+MAX_VIEW_DEP_CODE_CHARS = 500_000
+MODULE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,79}$")
+VIEW_WORKER_TIMEOUT_SEC = 30
 
 
 def _to_iso(value) -> str:
@@ -29,22 +44,45 @@ def _to_iso(value) -> str:
 def _get_data_dir() -> Path:
     backend_root = Path(__file__).resolve().parent.parent.parent
     primary = backend_root.parent / "data"
-    if (primary / "mock").exists():
+    if (primary / "mock").exists() or (primary / "futures_30m").exists():
         return primary
     for candidate in [Path.cwd() / "data", Path.cwd().parent / "data"]:
-        if (candidate / "mock").exists():
+        if (candidate / "mock").exists() or (candidate / "futures_30m").exists():
             return candidate
     return primary
+
+
+def _resolve_safe_data_path(data_dir: Path, data_file: str) -> Path:
+    normalized = (data_file or "").replace("\\", "/").lstrip("/")
+    if not normalized or normalized.startswith("../") or "/../" in normalized:
+        raise ValueError("Unsafe data_file path")
+    root = data_dir.resolve()
+    path = (root / normalized).resolve()
+    if root != path and root not in path.parents:
+        raise ValueError("Unsafe data_file path")
+    return path
 
 
 def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
     """Load and normalize OHLC from CSV/parquet. Returns DataFrame with datetime index."""
     data_dir = _get_data_dir()
-    path = data_dir / data_file
+    path = _resolve_safe_data_path(data_dir, data_file)
     if not path.exists():
         raise FileNotFoundError(f"Data file not found: {data_file}")
 
-    if path.suffix.lower() == ".csv":
+    if path.suffix.lower() == ".txt":
+        df = pd.read_csv(
+            path,
+            header=None,
+            names=["Date", "Time", "open", "high", "low", "close", "volume"],
+        )
+        df["datetime"] = pd.to_datetime(
+            df["Date"].astype(str).str.strip() + " " + df["Time"].astype(str).str.strip(),
+            format="%m/%d/%Y %H:%M",
+            errors="coerce",
+        )
+        df = df.dropna(subset=["datetime"]).set_index("datetime").sort_index()
+    elif path.suffix.lower() == ".csv":
         df = pd.read_csv(path)
         col_map = {}
         for c in df.columns:
@@ -77,6 +115,128 @@ def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
         df = df[df.index >= cutoff]
 
     return df
+
+
+def _validate_module_dependencies(module_dependencies: dict[str, str] | None) -> None:
+    if not module_dependencies:
+        return
+    if len(module_dependencies) > MAX_VIEW_DEPENDENCIES:
+        raise ValueError(f"Too many module dependencies (max {MAX_VIEW_DEPENDENCIES})")
+    for mod_name, mod_content in module_dependencies.items():
+        if not MODULE_NAME_RE.fullmatch(str(mod_name)):
+            raise ValueError(f"Invalid module dependency name: {mod_name}")
+        if mod_content and len(mod_content) > MAX_VIEW_DEP_CODE_CHARS:
+            raise ValueError(f"Dependency module '{mod_name}' exceeds max size ({MAX_VIEW_DEP_CODE_CHARS} chars)")
+
+
+def _series_as_float(df: pd.DataFrame, primary: str, fallback: str) -> pd.Series:
+    if primary in df.columns:
+        base = df[primary]
+    elif fallback in df.columns:
+        base = df[fallback]
+    else:
+        return pd.Series(0.0, index=df.index, dtype="float64")
+    return pd.to_numeric(base, errors="coerce").fillna(0.0).astype(float)
+
+
+def _resolve_view_worker_timeout_seconds() -> int:
+    raw = os.environ.get("VIEW_WORKER_TIMEOUT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return VIEW_WORKER_TIMEOUT_SEC
+    try:
+        parsed = int(float(raw))
+    except ValueError:
+        return VIEW_WORKER_TIMEOUT_SEC
+    return max(0, parsed)
+
+
+async def _run_view_code_in_docker(
+    *,
+    data_file: str,
+    years: float,
+    module_code: str,
+    params: dict[str, Any] | None,
+    module_dependencies: dict[str, str] | None,
+    actor_id: str,
+) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    backend_root = Path(__file__).resolve().parent.parent.parent
+    project_root = backend_root.parent
+    data_dir = _get_data_dir()
+    timeout_sec = _resolve_view_worker_timeout_seconds()
+
+    _validate_module_dependencies(module_dependencies)
+    if len(module_code or "") > MAX_VIEW_CODE_CHARS:
+        raise ValueError(f"module_code exceeds max size ({MAX_VIEW_CODE_CHARS} chars)")
+
+    work_root = project_root / ".view_run"
+    work_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix="view_", dir=work_root))
+    try:
+        modules_dir = run_dir / "modules"
+        modules_dir.mkdir(exist_ok=True)
+        (modules_dir / "__init__.py").write_text("", encoding="utf-8")
+        for mod_name, mod_content in (module_dependencies or {}).items():
+            (modules_dir / f"{mod_name}.py").write_text(mod_content, encoding="utf-8")
+
+        main_path = run_dir / "main.py"
+        main_path.write_text(module_code, encoding="utf-8")
+        req_path = run_dir / "request.json"
+        req_path.write_text(
+            json.dumps(
+                {
+                    "data_file": data_file,
+                    "years": years,
+                    "params": params or {},
+                    "main_path": "/app/view/main.py",
+                    "deps_dir": "/app/view/modules",
+                    "actor_id": actor_id,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        run_path = str(run_dir.resolve()).replace("\\", "/")
+        data_path = str(data_dir.resolve()).replace("\\", "/")
+        cmd = [
+            "docker", "run",
+            "--rm",
+            "--memory=512m",
+            "--cpus=1",
+            "--pids-limit=128",
+            "--network", "none",
+            "--security-opt", "no-new-privileges:true",
+            "--cap-drop", "ALL",
+            "-v", f"{run_path}:/app/view:rw",
+            "-v", f"{data_path}:/app/data:ro",
+            "backtest-engine",
+            "python", "view_engine.py", "/app/data", "/app/view/request.json",
+        ]
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec if timeout_sec > 0 else None,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr_preview = (proc.stderr or "unknown view engine error").strip()[:500]
+            raise RuntimeError(f"Sandbox view engine failed: {stderr_preview}")
+        stdout = (proc.stdout or "").strip()
+        if not stdout:
+            raise RuntimeError("Sandbox view engine returned empty output")
+        payload = json.loads(stdout)
+        if isinstance(payload, dict) and payload.get("error"):
+            raise RuntimeError(str(payload["error"]))
+        ohlc = payload.get("ohlc") if isinstance(payload, dict) else None
+        markers = payload.get("markers") if isinstance(payload, dict) else None
+        lines = payload.get("lines") if isinstance(payload, dict) else None
+        zones = payload.get("zones") if isinstance(payload, dict) else None
+        if not isinstance(ohlc, list) or not isinstance(markers, list) or not isinstance(lines, list) or not isinstance(zones, list):
+            raise RuntimeError("Sandbox view engine returned invalid payload")
+        return ohlc, markers, lines, zones
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 def _run_view_code(
@@ -113,14 +273,21 @@ def _run_view_code(
     tmp_dir = None
     main_path = None
     mod = None
+    module_key = f"view_module_{uuid.uuid4().hex}"
+    dep_module_names: list[str] = []
 
     try:
+        if len(code or "") > MAX_VIEW_CODE_CHARS:
+            raise ValueError(f"module_code exceeds max size ({MAX_VIEW_CODE_CHARS} chars)")
+        _validate_module_dependencies(module_dependencies)
+
         if module_dependencies:
             tmp_dir = Path(tempfile.mkdtemp())
             modules_dir = tmp_dir / "modules"
             modules_dir.mkdir()
             (modules_dir / "__init__.py").write_text("", encoding="utf-8")
             for mod_name, mod_content in module_dependencies.items():
+                dep_module_names.append(mod_name)
                 (modules_dir / f"{mod_name}.py").write_text(mod_content, encoding="utf-8")
             main_path = tmp_dir / "main.py"
             main_path.write_text(code, encoding="utf-8")
@@ -130,9 +297,11 @@ def _run_view_code(
                 f.write(code)
                 main_path = Path(f.name)
 
-        spec = importlib.util.spec_from_file_location("view_module", main_path)
+        spec = importlib.util.spec_from_file_location(module_key, main_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Unable to load view module")
         mod = importlib.util.module_from_spec(spec)
-        sys.modules["view_module"] = mod
+        sys.modules[module_key] = mod
         spec.loader.exec_module(mod)
 
         params = params or {}
@@ -234,12 +403,99 @@ def _run_view_code(
 
         return markers, lines, zones
     finally:
+        if module_key in sys.modules:
+            del sys.modules[module_key]
+        for dep_name in dep_module_names:
+            dep_key = f"modules.{dep_name}"
+            if dep_key in sys.modules:
+                del sys.modules[dep_key]
+        if dep_module_names and "modules" in sys.modules:
+            del sys.modules["modules"]
         if tmp_dir and tmp_dir.exists():
             if str(tmp_dir) in sys.path:
                 sys.path.remove(str(tmp_dir))
             shutil.rmtree(tmp_dir, ignore_errors=True)
         elif main_path and main_path.exists():
             main_path.unlink(missing_ok=True)
+
+
+def _view_worker_process(
+    data_file: str,
+    years: float,
+    code: str,
+    params: dict[str, Any] | None,
+    module_dependencies: dict[str, str] | None,
+    queue,
+) -> None:
+    try:
+        df = _load_ohlc(data_file, years)
+        markers, lines, zones = _run_view_code(
+            code,
+            df,
+            params=params or {},
+            module_dependencies=module_dependencies,
+        )
+        queue.put({
+            "ok": True,
+            "markers": markers,
+            "lines": lines,
+            "zones": zones,
+        })
+    except Exception as e:
+        queue.put({
+            "ok": False,
+            "error": str(e),
+        })
+
+
+def _run_view_code_isolated(
+    data_file: str,
+    years: float,
+    code: str,
+    params: dict[str, Any] | None = None,
+    module_dependencies: dict[str, str] | None = None,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue(maxsize=1)
+    timeout_sec = _resolve_view_worker_timeout_seconds()
+    proc = ctx.Process(
+        target=_view_worker_process,
+        args=(data_file, years, code, params, module_dependencies, queue),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=timeout_sec if timeout_sec > 0 else None)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        queue.close()
+        queue.join_thread()
+        raise TimeoutError(f"View worker timed out after {timeout_sec} seconds.")
+
+    try:
+        payload = queue.get(timeout=1)
+    except Exception:
+        payload = None
+    finally:
+        queue.close()
+        queue.join_thread()
+
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"View worker exited unexpectedly (exit_code={proc.exitcode})")
+    if not payload.get("ok"):
+        raise RuntimeError(str(payload.get("error") or "Unknown isolated view worker error"))
+
+    markers = payload.get("markers")
+    lines = payload.get("lines")
+    zones = payload.get("zones")
+    if not isinstance(markers, list) or not isinstance(lines, list) or not isinstance(zones, list):
+        raise RuntimeError("Invalid isolated view worker payload")
+    return markers, lines, zones
 
 
 class ViewRequest(BaseModel):
@@ -292,9 +548,11 @@ def _merge_major_markers_from_deps(
             continue
         try:
             spec = importlib.util.spec_from_file_location(
-                f"view_dep_{mod_name}", mod_path
+                f"view_dep_{mod_name}_{uuid.uuid4().hex}", mod_path
             )
             dep_mod = importlib.util.module_from_spec(spec)
+            if spec.loader is None:
+                continue
             spec.loader.exec_module(dep_mod)
             if not hasattr(dep_mod, "detect"):
                 continue
@@ -326,39 +584,57 @@ def _merge_major_markers_from_deps(
 
 
 @router.post("/view")
-async def get_view_data(req: ViewRequest):
+async def get_view_data(req: ViewRequest, request: Request):
     """
     Load OHLC data and optionally run detect()/get_line() from module/indicator/strategy.
     Returns { ohlc: [...], markers: [...], lines: [{name, data: [...]}, ...] }.
     """
     try:
         df = _load_ohlc(req.data_file, req.years)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    ohlc = []
-    for i, (ts, row) in enumerate(df.iterrows()):
-        date_str = _to_iso(ts)
-        ohlc.append({
-            "date": date_str,
-            "open": float(row.get("open", row.get("Open", 0))),
-            "high": float(row.get("high", row.get("High", 0))),
-            "low": float(row.get("low", row.get("Low", 0))),
-            "close": float(row.get("close", row.get("Close", 0))),
-        })
+    ohlc_df = pd.DataFrame({
+        "date": [_to_iso(ts) for ts in df.index],
+        "open": _series_as_float(df, "open", "Open"),
+        "high": _series_as_float(df, "high", "High"),
+        "low": _series_as_float(df, "low", "Low"),
+        "close": _series_as_float(df, "close", "Close"),
+    })
+    ohlc = ohlc_df.to_dict(orient="records")
 
+    actor_id = getattr(request.state, "actor_id", "unknown")
     markers = []
     lines = []
     zones = []
     if req.module_code and req.module_code.strip():
         try:
-            markers, lines, zones = _run_view_code(
-                req.module_code.strip(),
-                df,
+            ohlc, markers, lines, zones = await _run_view_code_in_docker(
+                data_file=req.data_file,
+                years=req.years,
+                module_code=req.module_code.strip(),
                 params=req.params or {},
                 module_dependencies=req.module_dependencies,
+                actor_id=actor_id,
             )
+            append_audit_event(
+                action="view.run",
+                actor_id=actor_id,
+                entity="view",
+                status="ok",
+                details={"data_file": req.data_file, "years": req.years, "has_module_code": True},
+            )
+            return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"View error: {str(e)}")
+            append_audit_event(
+                action="view.run",
+                actor_id=actor_id,
+                entity="view",
+                status="error",
+                details={"data_file": req.data_file, "years": req.years, "error": str(e)[:300]},
+            )
+            raise HTTPException(status_code=400, detail="View error: sandbox execution failed.")
 
     return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}

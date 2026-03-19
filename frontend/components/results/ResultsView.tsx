@@ -20,6 +20,7 @@ interface ResultsViewProps {
   onExport: () => void;
   onDeleteRun: (id: string) => void;
   onDeleteAllRuns: () => void;
+  onUpdateLifecycle: (runDocId: string, patch: Record<string, unknown>) => Promise<void>;
   strategyName?: string;
 }
 
@@ -31,6 +32,7 @@ export function ResultsView({
   onExport,
   onDeleteRun,
   onDeleteAllRuns,
+  onUpdateLifecycle,
   strategyName,
 }: ResultsViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>("equity");
@@ -119,12 +121,12 @@ export function ResultsView({
             dates={
               !results.equityCurve?.length && results.ohlc?.length
                 ? (() => {
-                    const first = results.ohlc![0]?.date?.slice(0, 10);
+                    const first = results.ohlc![0]?.date;
                     if (!first) return undefined;
                     const d = new Date(first);
                     d.setDate(d.getDate() - 1);
-                    const dayBefore = d.toISOString().slice(0, 10);
-                    return [dayBefore, ...results.ohlc!.map((o) => o.date.slice(0, 10))];
+                    const dayBefore = d.toISOString();
+                    return [dayBefore, ...results.ohlc!.map((o) => o.date)];
                   })()
                 : undefined
             }
@@ -157,6 +159,7 @@ export function ResultsView({
               runs={runHistory}
               onDeleteRun={onDeleteRun}
               onDeleteAll={onDeleteAllRuns}
+              onUpdateLifecycle={onUpdateLifecycle}
             />
           </div>
         )}

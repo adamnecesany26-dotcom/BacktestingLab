@@ -1,38 +1,51 @@
 rules_version = '2';
 
-// Firestore security rules pro Backtesting aplikaci
-// Nasazení: firebase deploy --only firestore:rules
-
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isAuthed() {
+      return request.auth != null;
+    }
 
-    // Strategie, indikátory, moduly - plný přístup (pro development)
-    // V produkci doporučujeme přidat auth: request.auth != null
+    function isAdmin() {
+      return isAuthed() &&
+        (
+          request.auth.token.role == "admin" ||
+          request.auth.token.role == "reviewer"
+        );
+    }
+
+    function owns(resourceData) {
+      return isAuthed() && resourceData.ownerUid == request.auth.uid;
+    }
+
     match /strategies/{strategyId} {
-      allow read, write: if true;
+      allow create: if isAuthed() && request.resource.data.ownerUid == request.auth.uid;
+      allow read, update, delete: if owns(resource.data) || isAdmin();
 
-      // Subkolekce: soubory strategie
       match /files/{fileId} {
-        allow read, write: if true;
+        allow create, read, update, delete: if owns(get(/databases/$(database)/documents/strategies/$(strategyId)).data) || isAdmin();
       }
 
-      // Subkolekce: výsledky backtestů (Run history)
       match /results/{resultId} {
-        allow read, write: if true;
+        allow create: if owns(get(/databases/$(database)/documents/strategies/$(strategyId)).data) || isAdmin();
+        allow read, update: if owns(get(/databases/$(database)/documents/strategies/$(strategyId)).data) || isAdmin();
+        allow delete: if isAdmin(); // hard-delete restricted; prefer soft delete via update.
       }
     }
 
     match /indicators/{indicatorId} {
-      allow read, write: if true;
+      allow create: if isAuthed() && request.resource.data.ownerUid == request.auth.uid;
+      allow read, update, delete: if owns(resource.data) || isAdmin();
       match /files/{fileId} {
-        allow read, write: if true;
+        allow create, read, update, delete: if owns(get(/databases/$(database)/documents/indicators/$(indicatorId)).data) || isAdmin();
       }
     }
 
     match /modules/{moduleId} {
-      allow read, write: if true;
+      allow create: if isAuthed() && request.resource.data.ownerUid == request.auth.uid;
+      allow read, update, delete: if owns(resource.data) || isAdmin();
       match /files/{fileId} {
-        allow read, write: if true;
+        allow create, read, update, delete: if owns(get(/databases/$(database)/documents/modules/$(moduleId)).data) || isAdmin();
       }
     }
   }

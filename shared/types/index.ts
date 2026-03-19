@@ -70,6 +70,7 @@ export interface BrokerConfig {
 /** Available data source */
 export interface DataInstrument {
   instrument: string;
+  displayName?: string;
   timeframe: string;
   file: string;
   minDate: string;

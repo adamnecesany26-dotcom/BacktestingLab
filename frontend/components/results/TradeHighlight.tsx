@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { TradeHighlightChart } from "@/components/charts/TradeHighlightChart";
 import type { Trade } from "@shared/types";
 import type { OhlcBar } from "@shared/types";
@@ -13,8 +13,15 @@ interface TradeHighlightProps {
 
 function formatDate(s: string | undefined): string {
   if (!s) return "—";
-  const d = s.slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : s;
+  const parsed = new Date(s);
+  if (Number.isNaN(parsed.getTime())) return s;
+  const hasTime = /T\d{2}:\d{2}/.test(s) || /\s\d{2}:\d{2}/.test(s);
+  return parsed.toLocaleString("cs-CZ", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(hasTime ? { hour: "2-digit", minute: "2-digit", second: "2-digit" } : {}),
+  });
 }
 
 function formatPnl(n: number | undefined): string {
@@ -27,6 +34,13 @@ export function TradeHighlight({ ohlc, trades, chartHeight = 360 }: TradeHighlig
   const [selectedIndex, setSelectedIndex] = useState<number | null>(
     trades.length > 0 ? 0 : null
   );
+  useEffect(() => {
+    if (trades.length === 0) {
+      setSelectedIndex(null);
+      return;
+    }
+    setSelectedIndex((prev) => (prev == null || prev >= trades.length ? 0 : prev));
+  }, [trades]);
   const selectedTrade = selectedIndex != null && trades[selectedIndex] ? trades[selectedIndex] : null;
 
   if (trades.length === 0) {

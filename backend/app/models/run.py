@@ -2,9 +2,10 @@
 Request/response models for the /run endpoint.
 """
 
+import re
 from typing import Any, List, Optional, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AppliedModule(BaseModel):
@@ -66,6 +67,20 @@ class RunRequest(BaseModel):
                 if content and len(content) > 500_000:
                     raise ValueError(f"File '{path}' exceeds max size (500k chars)")
         return self
+
+    @field_validator("run_id")
+    @classmethod
+    def validate_run_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        run_id = value.strip()
+        if not run_id:
+            return None
+        if len(run_id) > 80:
+            raise ValueError("run_id is too long (max 80 chars)")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+            raise ValueError("run_id may contain only letters, numbers, '_' and '-'")
+        return run_id
 
 
 class Trade(BaseModel):

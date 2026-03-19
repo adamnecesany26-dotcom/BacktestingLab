@@ -4,6 +4,14 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 
 **Účel dokumentu:** Tento soubor slouží jako kompletní technická dokumentace pro hodnocení workflow aplikace (např. ChatGPT, code review).
 
+> **Důležité (2026-03):** Přidán institution-grade hardening:
+> - API auth + rate limiting,
+> - `/api/view` běží v Docker sandboxu,
+> - append-only audit log (`.audit/events.jsonl`),
+> - run manifest fingerprinting (`runSeed`, `datasetFingerprint`, `codeDigest`, `imageDigest`, `actorId`),
+> - Firestore owner/role policy + soft-delete run history,
+> - compare workspace + lifecycle approvals v Run history.
+
 ---
 
 ## 1. Přehled aplikace
@@ -20,7 +28,7 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 7. **Run history** – automatické ukládání každého runu do Firestore, tabulka + grafy metrik napříč runy
 8. **View mode** – svíčkový graf s markery/čáry z modulu/indikátoru bez backtestu; **View params drawer** – ikona vedle Obnovit otevře panel pro úpravu `VIEW_PARAMS` (period, barva, …)
 9. **Uložit / Uloženo** – tlačítko Uložit se po uložení změní na „Uloženo“ (disabled), po změně kódu zpět na „Uložit“
-10. **FAQ** – ikona otazníku v pravém dolním rohu otevře modal s častými otázkami pro nové uživatele
+10. **Guide** – ikona otazníku v pravém dolním rohu otevře stránku `/guide` s A-Z průvodcem
 
 ### 1.2 Architektura (vysokoúrovňově)
 
@@ -63,7 +71,7 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 Strategie je cizí Python kód. Spouští se v izolovaném kontejneru:
 - Bez síťového přístupu (`--network none`)
 - Omezená paměť (1 GB), CPU (1 core)
-- Timeout 3 minuty
+- Timeout default 5 minut (`RUN_TIMEOUT_SEC=300`, lze přepsat env)
 - Nemůže poškodit hostitelský systém
 
 ---
@@ -75,6 +83,7 @@ Backtesting_app/
 ├── frontend/                    # Next.js aplikace
 │   ├── app/
 │   │   ├── page.tsx             # Hlavní stránka – stav, logika, orchestrace, handleRun, loadRunHistory
+│   │   ├── guide/page.tsx       # A-Z průvodce aplikací (stránka /guide)
 │   │   ├── layout.tsx
 │   │   └── globals.css
 │   ├── components/
@@ -100,29 +109,35 @@ Backtesting_app/
 │   │   ├── LoadingOverlay.tsx   # Progress bar + Zastavit
 │   │   ├── CreateModal.tsx     # Modal pro vytvoření strategie/indikátoru/modulu
 │   │   ├── AddFileModal.tsx    # Modal pro přidání souboru
-│   │   └── FaqModal.tsx        # Modal s častými otázkami (ikona ? v pravém dolním rohu)
+│   │   ├── FieldHelpPopover.tsx # Detailní wiki pop-upy pro konfigurace
+│   │   └── backtestFieldMeta.ts # Metadata a texty nápověd konfigurací
+│   ├── data/
+│   │   └── guideContent.ts      # Strukturovaný obsah A-Z guide stránky
 │   └── lib/
 │       ├── api.ts               # runBacktestStreaming, getAvailableData, getChartImage
-│       ├── firestore.ts         # listItems, createItem, getFiles, saveFile, saveBacktestResult, listBacktestResults, deleteBacktestResult, deleteAllBacktestResults
+│       ├── firestore.ts         # CRUD + owner metadata, soft-delete run history, governance update
 │       ├── firebase.ts          # Firebase konfigurace
 │       └── strategyParams.ts    # parseStrategyParams, parseViewParams – parsování PARAMS/VIEW_PARAMS (strip Python # komentářů)
 │
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app, CORS, routy
+│   │   ├── security.py          # Auth + rate limiting dependency
 │   │   ├── api/
 │   │   │   ├── run.py           # POST /api/run (streaming / non-streaming)
 │   │   │   ├── data.py          # GET /api/data, GET /api/data/debug
 │   │   │   ├── view.py          # POST /api/view (OHLC + markery/čáry z modulu, View params)
 │   │   │   └── chart.py         # POST /api/chart (PNG)
 │   │   ├── services/
-│   │   │   ├── runner.py        # Docker orchestrace, streamování
+│   │   │   ├── runner.py        # Docker orchestrace, streamování + manifest metadata
+│   │   │   ├── audit.py         # Append-only audit logger
 │   │   │   └── chart.py         # mplfinance generace grafu
 │   │   └── models/
 │   │       └── run.py           # RunRequest, RunResponse, Trade, BacktestMetrics
 │   └── docker/
 │       ├── Dockerfile           # python:3.11-slim + backtrader
 │       ├── engine.py            # Skript běžící UVNITŘ kontejneru
+│       ├── view_engine.py       # Sandbox engine pro /api/view
 │       └── requirements.txt
 │
 ├── shared/
@@ -257,15 +272,16 @@ Backtesting_app/
    ```
 4. Čte stdout/stderr v odděleném vlákně
 5. Parsuje JSON z stdout → `{"equity": [...], "metrics": {...}, "trades": [...], "ohlc": [...]}` → event `result`
-6. Pokud `applied_modules` v requestu: po obdržení výsledku volá `_run_module_outputs()` – pro každý modul importuje `detect`/`get_line`, spustí na OHLC datech a přidá `moduleOutputs` do odpovědi
+6. Pokud `applied_modules` v requestu: `engine.py` dopočítá `moduleOutputs` uvnitř kontejneru (detect/get_line/get_zones) a vrátí je v JSON výsledku
 7. Parsuje `PROGRESS:10` z stderr → event `progress`
 8. Při chybě: JSON `{"error": "..."}` → event `error`
 9. Streamuje události klientovi přes SSE
 10. Po dokončení smaže `.backtest_run/*.py`
+11. Do engine env posílá governance metadata: `RUN_SEED`, `CODE_DIGEST`, `ENGINE_IMAGE_DIGEST`, `ACTOR_ID`
 
 **Engine (`docker/engine.py` – uvnitř kontejneru):**
 
-1. Načte env: `STRATEGY_PATH`, `DATA_PATH`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `STRATEGY_PARAMS` (JSON)
+1. Načte env: `STRATEGY_PATH`, `DATA_PATH`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `STRATEGY_PARAMS` (JSON), `RUN_SEED`, `CODE_DIGEST`, `ENGINE_IMAGE_DIGEST`, `ACTOR_ID`
 2. `load_strategy(path)`: dynamický import, najde první třídu dědící z `bt.Strategy`
 3. `strategy_params = json.loads(STRATEGY_PARAMS)` → předá do `cerebro.addstrategy(TradeRecordingStrategy, **params)`
 4. `load_data(data_path, instrument, timeframe, years, data_file)`:
@@ -550,16 +566,32 @@ Používá se pro futures v engine (zatím primárně pro konfiguraci; výpočet
     - fileName, content
 ```
 
-### 7.1 Run history – ukládání a mazání
+### 7.1 Run history – ukládání, governance a mazání
 
 - **Uložení:** `saveBacktestResult(strategyId, strategyName, { equityCurve, metrics, trades })` – voláno automaticky po úspěšném Run
+  - ukládá také `ownerUid`, governance metadata a experiment context
 - **Seznam:** `listBacktestResults(strategyId)` – seřazeno podle `savedAt` (nejnovější první)
-- **Smazání jednoho:** `deleteBacktestResult(strategyId, resultId)`
-- **Smazání všech:** `deleteAllBacktestResults(strategyId)`
+- **Smazání jednoho:** `deleteBacktestResult(strategyId, resultId)` = soft delete (`deletedAt`, `deletedBy`, `deleteReason`)
+- **Smazání všech:** `deleteAllBacktestResults(strategyId)` = hromadný soft delete
+- **Lifecycle update:** `updateBacktestRunGovernance(strategyId, resultId, patch)` pro approval workflow
 
 ---
 
 ## 8. API reference
+
+### 8.0 Auth a rate limiting
+
+API endpointy používají security dependency:
+- Auth: `X-API-Key` nebo Bearer token
+- Identity lineage: volitelně `X-Actor-Id`
+- Rate limiting: in-memory window limiter
+
+Doporučené env:
+- `API_AUTH_REQUIRED=true`
+- `API_AUTH_KEY=<strong-secret>`
+- `API_ALLOW_DEV_BYPASS=false`
+- `API_RATE_LIMIT_MAX_REQUESTS=120`
+- `API_RATE_LIMIT_WINDOW_SEC=60`
 
 ### GET /api/data
 
@@ -615,7 +647,9 @@ OHLC data + volitelné markery a čáry z modulu/indikátoru/strategie pro View 
 - `detect(ohlc, params=None)` → markery: `[{"date", "type": "high"|"low"|"signal", "value"}, ...]`
 - `get_line(ohlc, params=None)` → čáry: `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}`
 
-**View params:** Pokud modul definuje `VIEW_PARAMS = {...}`, frontend posílá `params` v requestu; backend předává `params` do `detect`/`get_line` (pokud funkce druhý argument přijímá). Backend zapisuje dočasný soubor s `encoding="utf-8"` (kvůli kompatibilitě na Windows).
+**View sandbox execution:** Pokud je v requestu `module_code`, backend spouští `view_engine.py` uvnitř Docker sandboxu.
+
+**View params:** Pokud modul definuje `VIEW_PARAMS = {...}`, frontend posílá `params` v requestu; backend předává `params` do `detect`/`get_line` (pokud funkce druhý argument přijímá).
 
 **Barva čar:** `get_line` může vracet `{"název": {"data": [...], "color": "#hex"}}` – frontend použije barvu v grafu.
 
@@ -687,19 +721,27 @@ Modul **Swing HL** (`examples/swing_hl_detector.py`) vrací:
 ### Environment variables
 
 - **Frontend:** `NEXT_PUBLIC_API_URL` – URL backendu (default `http://localhost:8000`)
-- **Backend:** žádné povinné (CORS pro localhost:3000)
+- **Frontend (auth):** `NEXT_PUBLIC_API_AUTH_KEY` – API key posílaný na backend
+- **Backend (security):** `API_AUTH_REQUIRED`, `API_AUTH_KEY`, `API_ALLOW_DEV_BYPASS`, `API_RATE_LIMIT_MAX_REQUESTS`, `API_RATE_LIMIT_WINDOW_SEC`
+- **Backend (timeouts):** `RUN_TIMEOUT_SEC`, `RUN_STREAM_IDLE_TIMEOUT_SEC`, `VIEW_WORKER_TIMEOUT_SEC`
+- **Backend (manifest):** `BACKTEST_ENGINE_IMAGE_DIGEST` (volitelné, pro audit fingerprint)
 - **Firebase:** konfigurace v `frontend/lib/firebase.ts`
 
 ### Runner
 
-- Timeout: default **disabled** (`RUN_TIMEOUT_SEC <= 0`), optional env override
+- Timeout: default **300s** (`RUN_TIMEOUT_SEC=300`), optional env override
 - Docker: `--memory=1g`, `--cpus=1`, `--network none`
 
 ---
 
 ## 12. Firestore pravidla
 
-Pro ukládání výsledků backtestů (Run history) musí být nasazena Firestore pravidla. V root projektu:
+Pro ukládání výsledků backtestů musí být nasazena Firestore pravidla v owner/role režimu:
+- create: pouze autentikovaný owner (`ownerUid == request.auth.uid`),
+- read/update: owner + role `admin`/`reviewer`,
+- hard delete run result: pouze admin (UI používá soft-delete).
+
+Nasazení v root projektu:
 
 ```bash
 firebase deploy --only firestore:rules
@@ -721,6 +763,8 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 
 | Problém | Možná příčina | Řešení |
 |---------|---------------|--------|
+| 401 Unauthorized na API | Chybí API key / auth header | Nastav `NEXT_PUBLIC_API_AUTH_KEY` a backend `API_AUTH_KEY`, zkontroluj hlavičky |
+| 429 Rate limit | Příliš mnoho requestů ve window | Uprav `API_RATE_LIMIT_MAX_REQUESTS` / `API_RATE_LIMIT_WINDOW_SEC` |
 | Instrument se nenačítá | Instrument Type ≠ typ dat | Zkontroluj, že máš vybraný správný Instrument Type (Futures pro NQ) |
 | Žádné instrumenty | Data složka prázdná nebo špatná cesta | Zkontroluj `GET /api/data/debug`, strukturu `data/mock/` |
 | Backtest selže | Docker neběží, chyba ve strategii | Zkontroluj `docker ps`, logy v LogPanelu, `.backtest_run/last_error_strategy.py` |

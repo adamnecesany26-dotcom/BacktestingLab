@@ -11,6 +11,12 @@ function pct(part: number, total: number): number {
   return (part / total) * 100;
 }
 
+function formatProfitFactor(value: number | undefined): string {
+  if (value == null || Number.isNaN(value)) return "N/A";
+  if (value >= 999) return "No losing trades in sample";
+  return value.toFixed(2);
+}
+
 export function AnalyticsView({ results }: AnalyticsViewProps) {
   const trades = results.trades ?? [];
   const wins = trades.filter((t) => (t.pnl ?? 0) > 0);
@@ -101,9 +107,48 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
     const v = Number(c.count ?? 0);
     return Number.isFinite(v) ? Math.max(m, v) : m;
   }, 0);
+  const tradeCount = Number(results.metrics.tradeCount ?? trades.length ?? 0);
+  const validationMode = String(results.validation?.mode ?? "single");
+  const riskOfRuin = Number(monteCarlo?.riskOfRuin ?? NaN);
+  const monteCarloMethod = String(monteCarlo?.method ?? "n/a");
+  const monteCarloNote =
+    typeof monteCarlo?.note === "string" && monteCarlo.note.trim() ? monteCarlo.note.trim() : null;
+  const overfittingFlags: string[] = [];
+  if (validationMode === "single") overfittingFlags.push("Pouze single run (bez OOS/WF).");
+  if (tradeCount < 20) overfittingFlags.push(`Nízký počet obchodů (${tradeCount}).`);
+  if (!Number.isFinite(riskOfRuin)) overfittingFlags.push("Chybí Monte Carlo risk-of-ruin odhad.");
+  if (qualityGate && qualityGate.passed === false) overfittingFlags.push("Quality gate je FAIL.");
+  const readinessLabel =
+    overfittingFlags.length === 0
+      ? "Heuristic signal: eligible for controlled forward test"
+      : overfittingFlags.length <= 2
+        ? "Heuristic signal: promising, but still needs more validation"
+        : "Heuristic signal: not ready for trust";
 
   return (
     <div className="py-4 space-y-4">
+      <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/60 p-3">
+        <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">Heuristic edge readiness signal</div>
+        <div className="text-sm text-zinc-200">{readinessLabel}</div>
+        <div className="text-xs text-zinc-400 mt-1">
+          Validation: {validationMode} | Trades: {tradeCount} | Risk of ruin:{" "}
+          {Number.isFinite(riskOfRuin) ? riskOfRuin.toFixed(4) : "N/A"}
+        </div>
+      </div>
+
+      {overfittingFlags.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+          <div className="text-xs uppercase tracking-wider text-amber-200 mb-2">Overfitting warnings</div>
+          <div className="space-y-1">
+            {overfittingFlags.map((flag) => (
+              <div key={flag} className="text-sm text-amber-100">
+                - {flag}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {cards.map((card) => (
           <div key={card.label} className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
@@ -145,6 +190,7 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
             <div>Validation mode: {String(results.validation?.mode ?? "single")}</div>
             <div>Folds: {String(validationSummary?.foldCount ?? 0)}</div>
             <div>Avg degradation: {String(validationSummary?.avgDegradation ?? 0)}</div>
+            <div>Profit factor: {formatProfitFactor(results.metrics.profitFactor)}</div>
           </div>
         </div>
         <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
@@ -157,7 +203,9 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
               {`${String(scoreDistribution?.p10 ?? 0)} / ${String(scoreDistribution?.p50 ?? 0)} / ${String(scoreDistribution?.p90 ?? 0)}`}
             </div>
             <div>MC simulations: {String(monteCarlo?.simulations ?? 0)}</div>
-            <div>Risk of ruin: {String(monteCarlo?.riskOfRuin ?? 0)}</div>
+            <div>MC method: {monteCarloMethod}</div>
+            <div>Risk of ruin estimate: {String(monteCarlo?.riskOfRuin ?? 0)}</div>
+            {monteCarloNote && <div className="text-xs text-zinc-500 pt-1">{monteCarloNote}</div>}
           </div>
         </div>
         <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
@@ -201,7 +249,7 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
             {forwardBridge && (
               <div>
                 Drift %: {String(forwardBridge.driftPct ?? 0)} (baseline{" "}
-                {String(forwardBridge.baselineFinalEquity ?? "n/a")} ->{" "}
+                {String(forwardBridge.baselineFinalEquity ?? "n/a")} {"->"}{" "}
                 {String(forwardBridge.currentFinalEquity ?? "n/a")})
               </div>
             )}
@@ -265,10 +313,13 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
             <div>
               Tags: {Array.isArray(experiment?.tags) ? (experiment?.tags as unknown[]).map(String).join(", ") : "N/A"}
             </div>
+            <div>Branch: {String(experiment?.branch_name ?? experiment?.branchName ?? "main")}</div>
+            <div>Branch seq: {String(experiment?.branch_seq ?? experiment?.branchSeq ?? "N/A")}</div>
+            <div>Parent run ID: {String(experiment?.parent_run_id ?? experiment?.parentRunId ?? "root")}</div>
             <div>Promote on pass: {String(experiment?.promote_on_pass ?? false)}</div>
             <div>
               Promote recommendation:{" "}
-              {String(experiment?.promoteDecision ?? (qualityGate?.passed === true ? "candidate_for_promote" : "hold"))}
+              {String(experiment?.promoteDecision ?? (qualityGate?.passed === true ? "review_candidate" : "hold"))}
             </div>
             <div>Baseline run ID: {String(experiment?.baseline_run_id ?? "N/A")}</div>
             {promoteEvidence && (

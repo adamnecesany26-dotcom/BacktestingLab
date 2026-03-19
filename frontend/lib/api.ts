@@ -3,8 +3,47 @@
  */
 
 import type { RunRequest, RunResponse, OhlcBar, Trade } from "@shared/types";
+import { getFirebaseAuth } from "@/lib/firebase";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_AUTH_KEY = process.env.NEXT_PUBLIC_API_AUTH_KEY ?? "";
+
+async function readApiErrorMessage(res: Response): Promise<string> {
+  const raw = await res.text();
+  if (!raw) return `HTTP ${res.status}`;
+  try {
+    const parsed = JSON.parse(raw) as { detail?: unknown; message?: unknown };
+    const detail = typeof parsed.detail === "string" ? parsed.detail : typeof parsed.message === "string" ? parsed.message : "";
+    if (detail) return detail;
+  } catch {
+    // fall back to raw text
+  }
+  return raw;
+}
+
+function formatApiError(status: number, message: string, endpoint: string): string {
+  const normalized = (message || "").trim();
+  if (status === 401) {
+    return `HTTP 401 na ${endpoint}: backend vyžaduje API auth. Zkontrolujte backend \`API_AUTH_KEY\` a frontend \`NEXT_PUBLIC_API_AUTH_KEY\`.`;
+  }
+  if (status === 429) {
+    return `HTTP 429 na ${endpoint}: překročen rate limit backendu.`;
+  }
+  return normalized ? `HTTP ${status} na ${endpoint}: ${normalized}` : `HTTP ${status} na ${endpoint}`;
+}
+
+async function getApiHeaders(contentTypeJson: boolean = true): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {};
+  if (contentTypeJson) headers["Content-Type"] = "application/json";
+  if (API_AUTH_KEY) headers["X-API-Key"] = API_AUTH_KEY;
+  try {
+    const uid = getFirebaseAuth().currentUser?.uid;
+    if (uid) headers["X-Actor-Id"] = uid;
+  } catch {
+    // ignore
+  }
+  return headers;
+}
 
 export type StreamEvent =
   | { type: "log"; line: string; stream?: string }
@@ -13,14 +52,15 @@ export type StreamEvent =
   | { type: "error"; message: string };
 
 export async function runBacktest(request: RunRequest): Promise<RunResponse> {
+  const headers = await getApiHeaders(true);
   const res = await fetch(`${API_BASE}/api/run`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(request),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    const message = await readApiErrorMessage(res);
+    throw new Error(formatApiError(res.status, message, "/api/run"));
   }
   return res.json();
 }
@@ -30,15 +70,16 @@ export async function runBacktestStreaming(
   signal: AbortSignal,
   onEvent: (ev: StreamEvent) => void
 ): Promise<RunResponse> {
+  const headers = await getApiHeaders(true);
   const res = await fetch(`${API_BASE}/api/run?stream=1`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(request),
     signal,
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text ? `${res.status}: ${text}` : `HTTP ${res.status} - backend neodpovídá`);
+    const message = await readApiErrorMessage(res);
+    throw new Error(formatApiError(res.status, message, "/api/run?stream=1"));
   }
   const reader = res.body?.getReader();
   if (!reader) throw new Error("No response body");
@@ -62,7 +103,9 @@ export async function runBacktestStreaming(
           if (ev.type === "result") result = ev.data;
           if (ev.type === "error") throw new Error(ev.message || "Chyba engine");
         } catch (e) {
-          if (e instanceof SyntaxError) continue;
+          if (e instanceof SyntaxError) {
+            throw new Error(`Backend poslal nevalidní SSE event: ${line.slice(0, 180)}`);
+          }
           throw e;
         }
       }
@@ -76,8 +119,11 @@ export async function runBacktestStreaming(
 export async function getAvailableData(): Promise<{
   instruments: import("@shared/types").DataInstrument[];
 }> {
-  const res = await fetch(`${API_BASE}/api/data`);
-  if (!res.ok) throw new Error(await res.text());
+  const res = await fetch(`${API_BASE}/api/data`, { headers: await getApiHeaders(false) });
+  if (!res.ok) {
+    const message = await readApiErrorMessage(res);
+    throw new Error(formatApiError(res.status, message, "/api/data"));
+  }
   return res.json();
 }
 
@@ -132,9 +178,10 @@ export async function getViewData(
   lines: ViewLine[];
   zones?: ViewZone[];
 }> {
+  const headers = await getApiHeaders(true);
   const res = await fetch(`${API_BASE}/api/view`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({
       data_file: dataFile,
       years,
@@ -144,22 +191,23 @@ export async function getViewData(
     }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    const message = await readApiErrorMessage(res);
+    throw new Error(formatApiError(res.status, message, "/api/view"));
   }
   return res.json();
 }
 
 /** Fetch mplfinance chart PNG from backend. */
 export async function getChartImage(ohlc: OhlcBar[], trades: Trade[]): Promise<Blob> {
+  const headers = await getApiHeaders(true);
   const res = await fetch(`${API_BASE}/api/chart`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify({ ohlc, trades }),
   });
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(text || `HTTP ${res.status}`);
+    const message = await readApiErrorMessage(res);
+    throw new Error(formatApiError(res.status, message, "/api/chart"));
   }
   return res.blob();
 }

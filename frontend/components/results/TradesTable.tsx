@@ -8,8 +8,15 @@ interface TradesTableProps {
 
 function formatDate(s: string | undefined): string {
   if (!s) return "—";
-  const d = s.slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : s;
+  const parsed = new Date(s);
+  if (Number.isNaN(parsed.getTime())) return s;
+  const hasTime = /T\d{2}:\d{2}/.test(s) || /\s\d{2}:\d{2}/.test(s);
+  return parsed.toLocaleString("cs-CZ", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    ...(hasTime ? { hour: "2-digit", minute: "2-digit", second: "2-digit" } : {}),
+  });
 }
 
 function formatPrice(n: number | undefined): string {
