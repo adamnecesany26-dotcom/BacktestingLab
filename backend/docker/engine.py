@@ -28,8 +28,15 @@ _strategy_dir = os.path.dirname(_strategy_path)
 if _strategy_dir and _strategy_dir not in sys.path:
     sys.path.insert(0, _strategy_dir)
 
+# Early stderr so the host sees activity while heavy deps import (cold start can take 10–60s on slow disks/CPU).
+print(
+    "[engine] Booting — loading backtrader / pandas (first container start may be slow)...",
+    file=sys.stderr,
+    flush=True,
+)
 import backtrader as bt
 import pandas as pd
+print("[engine] Libraries loaded.", file=sys.stderr, flush=True)
 
 TF_TO_MINUTES = {
     "1m": 1,
@@ -369,6 +376,109 @@ def _safe_metrics_snapshot(result: dict) -> dict:
     }
 
 
+def _fold_test_metrics_detail(test_result: dict) -> dict:
+    """Subset of test metrics for fold-level reporting (full numbers, bounded size)."""
+    m = test_result.get("metrics", {}) if isinstance(test_result, dict) else {}
+    if not isinstance(m, dict):
+        return {}
+    keys = (
+        "tradeCount",
+        "profitFactor",
+        "totalReturnUsd",
+        "sharpeRatio",
+        "sortinoRatio",
+        "maxDrawdownPct",
+        "winRate",
+        "finalEquity",
+        "expectancyR",
+        "expectancyUsd",
+    )
+    out = {}
+    for k in keys:
+        if k in m:
+            out[k] = m.get(k)
+    return out
+
+
+def _df_window_meta(train_df: pd.DataFrame, test_df: pd.DataFrame) -> dict:
+    def span(dfi: pd.DataFrame) -> tuple[str, str, int]:
+        if dfi is None or len(dfi) == 0:
+            return "", "", 0
+        i0, i1 = dfi.index[0], dfi.index[-1]
+        return _safe_iso(i0), _safe_iso(i1), int(len(dfi))
+
+    ts, te, tnb = span(train_df)
+    vs, ve, vnb = span(test_df)
+    return {
+        "trainStart": ts,
+        "trainEnd": te,
+        "trainBarCount": tnb,
+        "testStart": vs,
+        "testEnd": ve,
+        "testBarCount": vnb,
+    }
+
+
+def _validation_guardrails(
+    folds: list[dict],
+    quality_gates: dict | None,
+    mode: str,
+) -> dict:
+    """Heuristic flags only — not proof of leakage or absence of issues."""
+    qg = quality_gates or {}
+    min_trades = int(qg.get("min_trades", 5) or 5)
+    min_pf = float(qg.get("min_pf", 0.0) or 0.0)
+    hints: list[str] = []
+    short_test = False
+    low_trades_fold = False
+    folds_failed = 0
+    worst_fold_id = None
+    worst_test_ret: float | None = None
+
+    for f in folds:
+        tid = str(f.get("id", ""))
+        vnb = int(f.get("testBarCount", 0) or 0)
+        if vnb > 0 and vnb < 30:
+            short_test = True
+        tm = f.get("testMetrics") if isinstance(f.get("testMetrics"), dict) else {}
+        tc = int(tm.get("tradeCount", 0) or 0)
+        if tc < min_trades:
+            low_trades_fold = True
+        tr = float(tm.get("totalReturnUsd", 0.0) or 0.0)
+        if worst_test_ret is None or tr < worst_test_ret:
+            worst_test_ret = tr
+            worst_fold_id = tid
+        pf_raw = float(tm.get("profitFactor", 0.0) or 0.0)
+        pf_eff = 999.0 if pf_raw >= 999.0 else pf_raw
+        fold_fail = False
+        if min_pf > 0 and pf_eff < min_pf:
+            fold_fail = True
+        if tc < min_trades:
+            fold_fail = True
+        if fold_fail:
+            folds_failed += 1
+
+    if short_test:
+        hints.append("At least one fold has a short OOS/test window (<30 bars) — variance of metrics is high.")
+    if low_trades_fold:
+        hints.append(f"At least one fold has fewer than {min_trades} trades in the test segment.")
+    if mode == "walk_forward":
+        hints.append(
+            "Walk-forward uses rolling/expanding segments; correlation across folds is expected — "
+            "do not treat folds as independent trials."
+        )
+
+    return {
+        "possibleLeakageHints": hints,
+        "flags": {
+            "shortTestWindow": short_test,
+            "lowTradesInSomeFold": low_trades_fold,
+        },
+        "worstFold": worst_fold_id,
+        "foldsFailedGates": folds_failed,
+    }
+
+
 def _run_validation(
     strategy_cls,
     data: pd.DataFrame,
@@ -377,11 +487,12 @@ def _run_validation(
     strategy_params: dict | None,
     mode: str,
     cfg: dict | None,
+    quality_gates: dict | None = None,
 ) -> dict:
     cfg = cfg or {}
     n = len(data)
     if n < 50 or mode == "single":
-        return {"mode": "single", "folds": [], "summary": {}}
+        return {"mode": "single", "folds": [], "summary": {}, "guardrails": {}}
     folds: list[dict] = []
     if mode == "oos_split":
         ratio = float(cfg.get("oos_ratio", 0.25) or 0.25)
@@ -392,7 +503,16 @@ def _run_validation(
         test = data.iloc[split:]
         train_result = run_backtest(strategy_cls, train, data_path=data_path, instrument=instrument, strategy_params=strategy_params)
         test_result = run_backtest(strategy_cls, test, data_path=data_path, instrument=instrument, strategy_params=strategy_params)
-        folds.append({"id": "oos_split", "train": _safe_metrics_snapshot(train_result), "test": _safe_metrics_snapshot(test_result)})
+        meta = _df_window_meta(train, test)
+        folds.append(
+            {
+                "id": "oos_split",
+                **meta,
+                "train": _safe_metrics_snapshot(train_result),
+                "test": _safe_metrics_snapshot(test_result),
+                "testMetrics": _fold_test_metrics_detail(test_result),
+            }
+        )
     elif mode == "walk_forward":
         folds_count = int(cfg.get("folds", 4) or 4)
         folds_count = min(max(folds_count, 2), 12)
@@ -409,21 +529,35 @@ def _run_validation(
             test = data.iloc[train_end:test_end]
             train_result = run_backtest(strategy_cls, train, data_path=data_path, instrument=instrument, strategy_params=strategy_params)
             test_result = run_backtest(strategy_cls, test, data_path=data_path, instrument=instrument, strategy_params=strategy_params)
-            folds.append({"id": f"wf_{i+1}", "train": _safe_metrics_snapshot(train_result), "test": _safe_metrics_snapshot(test_result)})
+            meta = _df_window_meta(train, test)
+            folds.append(
+                {
+                    "id": f"wf_{i+1}",
+                    **meta,
+                    "train": _safe_metrics_snapshot(train_result),
+                    "test": _safe_metrics_snapshot(test_result),
+                    "testMetrics": _fold_test_metrics_detail(test_result),
+                }
+            )
     degradation = []
     for f in folds:
         train_ret = float(f["train"].get("totalReturnUsd", 0.0))
         test_ret = float(f["test"].get("totalReturnUsd", 0.0))
         d = 0.0 if abs(train_ret) < 1e-9 else (test_ret - train_ret) / abs(train_ret)
         degradation.append(d)
+    guardrails = _validation_guardrails(folds, quality_gates, mode)
+    summary = {
+        "foldCount": len(folds),
+        "avgDegradation": float(round(sum(degradation) / len(degradation), 6)) if degradation else 0.0,
+        "medianDegradation": float(round(sorted(degradation)[len(degradation) // 2], 6)) if degradation else 0.0,
+        "worstFold": guardrails.get("worstFold"),
+        "foldsFailedGates": guardrails.get("foldsFailedGates", 0),
+    }
     return {
         "mode": mode,
         "folds": folds,
-        "summary": {
-            "foldCount": len(folds),
-            "avgDegradation": float(round(sum(degradation) / len(degradation), 6)) if degradation else 0.0,
-            "medianDegradation": float(round(sorted(degradation)[len(degradation) // 2], 6)) if degradation else 0.0,
-        },
+        "summary": summary,
+        "guardrails": guardrails,
     }
 
 
@@ -611,18 +745,67 @@ def _compute_profit_factor(gross_profit: float, gross_loss: float) -> float:
     return 999.0 if gross_profit > 0 else 0.0
 
 
-def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | None) -> dict:
+def _default_mc_block_size(timeframe: str, n_trades: int) -> int:
+    tf = _normalize_tf(timeframe) or "1d"
+    minutes = TF_TO_MINUTES.get(tf, 1440)
+    nt = max(1, int(n_trades))
+    if minutes <= 30:
+        return max(3, min(12, max(3, nt // 15)))
+    if minutes <= 240:
+        return max(2, min(8, max(2, nt // 20)))
+    return max(2, min(5, max(2, nt // 25)))
+
+
+def _mc_resample_pnl_iid(pnl: list[float]) -> list[float]:
+    return [random.choice(pnl) for _ in range(len(pnl))]
+
+
+def _mc_resample_pnl_blocks(pnl: list[float], block_size: int) -> list[float]:
+    n = len(pnl)
+    if n == 0:
+        return []
+    bs = max(1, min(int(block_size), n))
+    out: list[float] = []
+    while len(out) < n:
+        start = random.randint(0, n - bs)
+        out.extend(pnl[start : start + bs])
+    return out[:n]
+
+
+def _run_monte_carlo(
+    trades: list[dict],
+    initial_capital: float,
+    cfg: dict | None,
+    *,
+    data_timeframe: str = "1d",
+) -> dict:
     cfg = cfg or {}
     pnl = [float(t.get("pnl", 0.0) or 0.0) for t in trades]
+    mode = str(cfg.get("mode", "iid_trade") or "iid_trade").lower().strip()
+    if mode not in ("iid_trade", "block_bootstrap"):
+        mode = "iid_trade"
+    block_size = cfg.get("block_size")
+    try:
+        block_size_i = int(block_size) if block_size is not None else _default_mc_block_size(data_timeframe, len(pnl))
+    except (TypeError, ValueError):
+        block_size_i = _default_mc_block_size(data_timeframe, len(pnl))
+    block_size_i = max(1, min(block_size_i, max(1, len(pnl))))
+
+    base_note = (
+        "riskOfRuin is a bootstrap estimate from resampled closed-trade PnL paths, not a structural market probability."
+    )
     if not pnl:
         return {
             "simulations": 0,
             "drawdownPct": {},
             "endingEquity": {},
             "riskOfRuin": 0.0,
-            "method": "iid_trade_bootstrap",
-            "note": "Monte Carlo uses bootstrap resampling of historical trade PnL.",
+            "method": "trade_pnl_bootstrap",
+            "mode": mode,
+            "blockSize": block_size_i,
+            "note": base_note + " No trades — MC skipped.",
         }
+
     sims = int(cfg.get("simulations", 300) or 300)
     sims = min(max(sims, 50), 2000)
     ruin_dd = float(cfg.get("ruin_dd_pct", 50.0) or 50.0)
@@ -630,7 +813,10 @@ def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | Non
     end_vals = []
     ruin_count = 0
     for _ in range(sims):
-        seq = [random.choice(pnl) for _ in range(len(pnl))]
+        if mode == "block_bootstrap":
+            seq = _mc_resample_pnl_blocks(pnl, block_size_i)
+        else:
+            seq = _mc_resample_pnl_iid(pnl)
         eq = [float(initial_capital)]
         cur = float(initial_capital)
         for x in seq:
@@ -650,6 +836,11 @@ def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | Non
         idx = int((len(values) - 1) * p)
         return float(values[idx])
 
+    mode_note = (
+        "IID resampling of individual trade PnL (ignores serial correlation)."
+        if mode == "iid_trade"
+        else f"Block bootstrap (block_size={block_size_i}) preserves short-run serial correlation in trade PnL order."
+    )
     return {
         "simulations": sims,
         "drawdownPct": {
@@ -663,8 +854,10 @@ def _run_monte_carlo(trades: list[dict], initial_capital: float, cfg: dict | Non
             "p90": round(pctile(end_vals, 0.90), 2),
         },
         "riskOfRuin": round(ruin_count / sims, 6),
-        "method": "iid_trade_bootstrap",
-        "note": "Monte Carlo uses bootstrap resampling of historical trade PnL.",
+        "method": "trade_pnl_bootstrap",
+        "mode": mode,
+        "blockSize": block_size_i if mode == "block_bootstrap" else None,
+        "note": f"{base_note} {mode_note}",
     }
 
 
@@ -783,6 +976,64 @@ def _run_portfolio_analysis(
             "count": len(rows),
         },
     }
+
+
+def _engine_methodology_notes() -> dict[str, str]:
+    """Short methodology strings for manifest / export (single source in engine)."""
+    return {
+        "profitFactor": (
+            "Gross profit divided by gross losses from closed trades. "
+            "When there are no losing trades the engine uses a high sentinel (999) — cap in sweep scoring."
+        ),
+        "monteCarloRiskOfRuin": (
+            "Fraction of bootstrap paths where max drawdown (%) exceeds ruin_dd_pct. "
+            "Interpret as a resampling stress test, not a calibrated tail probability."
+        ),
+        "expectancyR": (
+            "Expectancy in R units uses average loss magnitude as rough risk proxy; not broker-reported R-multiple per trade."
+        ),
+        "walkForwardGuardrails": (
+            "Fold-level hints are heuristics (short windows, low trade count); they are not proof of leakage or robustness."
+        ),
+        "executionCosts": (
+            "Fees come from Backtrader commission on closed trades. Slippage cost is a separate model estimate from "
+            "configured slippage (including execution_model extras when enabled)."
+        ),
+    }
+
+
+def _build_cost_attribution(trades: list[dict] | None, total_return_usd: float) -> dict:
+    rows = trades or []
+    tc = len(rows)
+    total_fees = sum(float(t.get("fees", 0.0) or 0.0) for t in rows)
+    total_slip = sum(float(t.get("slippageCost", 0.0) or 0.0) for t in rows)
+    total_costs = total_fees + total_slip
+    sum_pnl = sum(float(t.get("pnl", 0.0) or 0.0) for t in rows)
+    gross_abs = sum(abs(float(t.get("pnl", 0.0) or 0.0)) for t in rows)
+    out: dict = {
+        "totalFees": round(total_fees, 6),
+        "totalSlippageCost": round(total_slip, 6),
+        "totalExecutionCosts": round(total_costs, 6),
+        "tradeCount": tc,
+        "avgFeePerTrade": round(total_fees / tc, 6) if tc else 0.0,
+        "avgSlippagePerTrade": round(total_slip / tc, 6) if tc else 0.0,
+        "sumClosedTradePnl": round(sum_pnl, 6),
+        "definitions": {
+            "fees": "Sum of Backtrader closed-trade commission per trade.",
+            "slippageCost": "Engine estimate from notional × slippage_perc (base + execution_model extras when enabled).",
+            "pnl": "Closed-trade PnL after commission (pnlcomm); slippage row is an explicit overlay for attribution.",
+        },
+    }
+    denom = abs(float(total_return_usd)) if abs(float(total_return_usd)) > 1e-9 else (abs(sum_pnl) if abs(sum_pnl) > 1e-9 else 0.0)
+    if denom > 1e-12:
+        out["executionCostsToNetReturnRatio"] = round(total_costs / denom, 6)
+    else:
+        out["executionCostsToNetReturnRatio"] = None
+    if gross_abs > 1e-9:
+        out["executionCostsToGrossAbsPnlRatio"] = round(total_costs / gross_abs, 6)
+    else:
+        out["executionCostsToGrossAbsPnlRatio"] = None
+    return out
 
 
 def _build_execution_summary(data: pd.DataFrame, trades: list[dict], cfg: dict | None) -> dict:
@@ -1390,7 +1641,9 @@ def run_backtest(
         try:
             dt_open = trade.open_datetime() if hasattr(trade, "open_datetime") else None
             dt_close = trade.close_datetime() if hasattr(trade, "close_datetime") else None
-            size, is_long = 1, True
+            # Backtrader exposes trade.long for closed PnL trades; history[0].event.size can mis-classify shorts.
+            is_long = bool(getattr(trade, "long", True))
+            size = 1
             entry_price = trade.price
             exit_price = trade.price
             if hasattr(trade, "history") and trade.history:
@@ -1401,7 +1654,8 @@ def run_backtest(
                 if ev_open is not None:
                     exec_size = getattr(ev_open, "size", None)
                     size = abs(exec_size) if exec_size is not None else 1
-                    is_long = (exec_size or 0) > 0
+                    if getattr(trade, "long", None) is None:
+                        is_long = (exec_size or 0) > 0
                 entry_price = _get_price_from_history_entry(h_open, trade.price)
                 exit_price = _get_price_from_history_entry(h_close, trade.price)
             mfe, mae, mfe_pct, mae_pct = _compute_trade_excursions(
@@ -1580,7 +1834,11 @@ def run_backtest(
 
     total_trades = ta.get("total", {}).get("closed", 0) or 0
     won = ta.get("won", {}).get("total", 0) or 0
-    win_rate = (won / total_trades * 100) if total_trades else 0
+    listed = len(trades_list)
+    # Prefer recorded trades for headline count — TradeAnalyzer "closed" can differ slightly from our list.
+    trade_count_ui = int(listed) if listed else int(total_trades)
+    won_listed = sum(1 for t in trades_list if t.get("pnl", 0) > 0)
+    win_rate = (won_listed / listed * 100.0) if listed else ((won / total_trades * 100) if total_trades else 0)
     final_equity = cerebro.broker.getvalue()
     total_return_usd = final_equity - initial_capital
     total_return_pct = round((total_return_usd / initial_capital) * 100, 2)
@@ -1606,7 +1864,7 @@ def run_backtest(
         "maxDrawdown": float(round(max_drawdown_pct, 4)),
         "maxDrawdownPct": float(round(max_drawdown_pct, 4)),
         "maxDrawdownUsd": float(round(curve_max_dd_usd, 2)),
-        "tradeCount": int(total_trades),
+        "tradeCount": trade_count_ui,
         "longCount": int(long_count),
         "shortCount": int(short_count),
         "winRate": float(round(win_rate, 2)),
@@ -1742,6 +2000,7 @@ def main():
                 strategy_params=strategy_params,
                 mode=validation_mode,
                 cfg=validation_cfg,
+                quality_gates=quality_gates,
             )
 
         if sweep_mode in ("grid", "random"):
@@ -1760,6 +2019,7 @@ def main():
                 trades=result.get("trades", []),
                 initial_capital=float(os.environ.get("INITIAL_CAPITAL", "100000")),
                 cfg=monte_carlo_cfg,
+                data_timeframe=timeframe,
             )
 
         if regime_cfg:
@@ -1829,6 +2089,21 @@ def main():
             if isinstance(result["executionSummary"], dict):
                 result["executionSummary"]["forwardBridge"] = fwd
 
+        # Cost attribution (always, for Results/Analytics) — ratios use totalReturnUsd from metrics
+        _m = result.get("metrics") or {}
+        _tr_usd = float(_m.get("totalReturnUsd", 0.0) or 0.0)
+        _ca = _build_cost_attribution(result.get("trades"), _tr_usd)
+        result.setdefault("executionSummary", {})
+        if isinstance(result["executionSummary"], dict):
+            if execution_cfg and not result["executionSummary"].get("enabled", False):
+                result["executionSummary"]["enabled"] = bool(execution_cfg.get("enabled", False))
+            result["executionSummary"]["costAttribution"] = _ca
+        else:
+            result["executionSummary"] = {
+                "enabled": bool(execution_cfg and execution_cfg.get("enabled", False)),
+                "costAttribution": _ca,
+            }
+
         if applied_modules:
             result["moduleOutputs"] = _run_module_outputs_in_engine(
                 strategy_dir=strategy_dir,
@@ -1864,6 +2139,7 @@ def main():
             "datasetFingerprint": data_meta.get("datasetFingerprint"),
             "dataLoadMs": perf.get("dataLoadMs"),
             "resampleMs": perf.get("resampleMs"),
+            "methodology": _engine_methodology_notes(),
         }
         print(json.dumps(result))
     except Exception as e:

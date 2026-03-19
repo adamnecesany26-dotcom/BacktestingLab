@@ -56,6 +56,8 @@ export interface RunRequest {
   portfolio_config?: Record<string, unknown>;
   execution_model?: Record<string, unknown>;
   experiment?: Record<string, unknown>;
+  /** Sequential batch: { batch_id?, max_runs?, items: Partial<RunRequest>[] } */
+  batch_config?: Record<string, unknown>;
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -194,6 +196,7 @@ export interface RunResponse {
   executionSummary?: Record<string, unknown>;
   qualityGate?: Record<string, unknown>;
   experiment?: Record<string, unknown>;
+  batchSummary?: Record<string, unknown>;
 }
 
 /** Project structure for file tree */

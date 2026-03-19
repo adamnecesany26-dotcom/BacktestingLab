@@ -117,6 +117,100 @@ def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
     return df
 
 
+# --- View chart candle timeframe (OHLC resample; only coarser than native bars) ---
+_CHART_TF_TO_PANDAS: dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "1D": "1D",
+    "1W": "1W",
+    "1Mo": "1ME",
+}
+_CHART_TF_MINUTES: dict[str, float] = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "2h": 120,
+    "4h": 240,
+    "1D": 1440,
+    "1W": 10080,
+    "1Mo": 43200,
+}
+
+
+def _infer_native_bar_minutes(df: pd.DataFrame) -> float:
+    """Median bar spacing (minutes), ignoring gaps > 48h (weekends etc.)."""
+    if df is None or len(df.index) < 2:
+        return 1440.0
+    delta_min = df.index.to_series().diff().dt.total_seconds() / 60.0
+    valid = delta_min[(delta_min > 0) & (delta_min < 60 * 48)]
+    if valid.empty:
+        return 1440.0
+    return float(valid.median())
+
+
+def _normalize_chart_tf_key(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "native":
+        return None
+    if s in _CHART_TF_TO_PANDAS:
+        return s
+    low = s.lower()
+    for k in _CHART_TF_TO_PANDAS:
+        if k.lower() == low:
+            return k
+    return None
+
+
+def _resample_ohlc_dataframe(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    rename: dict[str, str] = {}
+    for c in list(work.columns):
+        low = c.lower()
+        if low in ("open", "high", "low", "close", "volume"):
+            rename[c] = low
+    work = work.rename(columns=rename)
+    for need in ("open", "high", "low", "close"):
+        if need not in work.columns:
+            cap = need.capitalize()
+            if cap in work.columns:
+                work[need] = work[cap]
+            else:
+                raise ValueError(f"Missing OHLC column for resample: {need}")
+    if "volume" not in work.columns:
+        work["volume"] = 0.0
+    agg_map = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    out = work[["open", "high", "low", "close", "volume"]].resample(rule, label="left", closed="left").agg(agg_map)
+    out = out.dropna(subset=["open", "high", "low", "close"], how="any")
+    return out
+
+
+def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -> pd.DataFrame:
+    key = _normalize_chart_tf_key(chart_timeframe)
+    if key is None:
+        return df
+    if key not in _CHART_TF_TO_PANDAS:
+        raise ValueError(f"Unknown chart_timeframe: {chart_timeframe!r}")
+    native_min = _infer_native_bar_minutes(df)
+    target_min = _CHART_TF_MINUTES[key]
+    if target_min < native_min * 0.99:
+        raise ValueError(
+            f"chart_timeframe {key} is finer than native data (~{native_min:.1f} min bars); use native or a coarser step."
+        )
+    rule = _CHART_TF_TO_PANDAS[key]
+    return _resample_ohlc_dataframe(df, rule)
+
+
 def _validate_module_dependencies(module_dependencies: dict[str, str] | None) -> None:
     if not module_dependencies:
         return
@@ -158,6 +252,7 @@ async def _run_view_code_in_docker(
     params: dict[str, Any] | None,
     module_dependencies: dict[str, str] | None,
     actor_id: str,
+    chart_timeframe: str | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     backend_root = Path(__file__).resolve().parent.parent.parent
     project_root = backend_root.parent
@@ -187,6 +282,7 @@ async def _run_view_code_in_docker(
                     "data_file": data_file,
                     "years": years,
                     "params": params or {},
+                    "chart_timeframe": chart_timeframe,
                     "main_path": "/app/view/main.py",
                     "deps_dir": "/app/view/modules",
                     "actor_id": actor_id,
@@ -504,6 +600,8 @@ class ViewRequest(BaseModel):
     module_code: str | None = None
     params: dict | None = None
     module_dependencies: dict[str, str] | None = None
+    # native / None = source bars; else 1m,5m,…,1Mo (must be coarser than native bar size)
+    chart_timeframe: str | None = None
 
 
 def _call_with_params(fn, df: pd.DataFrame, params: dict):
@@ -596,19 +694,11 @@ async def get_view_data(req: ViewRequest, request: Request):
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    ohlc_df = pd.DataFrame({
-        "date": [_to_iso(ts) for ts in df.index],
-        "open": _series_as_float(df, "open", "Open"),
-        "high": _series_as_float(df, "high", "High"),
-        "low": _series_as_float(df, "low", "Low"),
-        "close": _series_as_float(df, "close", "Close"),
-    })
-    ohlc = ohlc_df.to_dict(orient="records")
-
     actor_id = getattr(request.state, "actor_id", "unknown")
-    markers = []
-    lines = []
-    zones = []
+    markers: list = []
+    lines: list = []
+    zones: list = []
+
     if req.module_code and req.module_code.strip():
         try:
             ohlc, markers, lines, zones = await _run_view_code_in_docker(
@@ -618,13 +708,19 @@ async def get_view_data(req: ViewRequest, request: Request):
                 params=req.params or {},
                 module_dependencies=req.module_dependencies,
                 actor_id=actor_id,
+                chart_timeframe=req.chart_timeframe,
             )
             append_audit_event(
                 action="view.run",
                 actor_id=actor_id,
                 entity="view",
                 status="ok",
-                details={"data_file": req.data_file, "years": req.years, "has_module_code": True},
+                details={
+                    "data_file": req.data_file,
+                    "years": req.years,
+                    "has_module_code": True,
+                    "chart_timeframe": req.chart_timeframe,
+                },
             )
             return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
         except Exception as e:
@@ -636,5 +732,19 @@ async def get_view_data(req: ViewRequest, request: Request):
                 details={"data_file": req.data_file, "years": req.years, "error": str(e)[:300]},
             )
             raise HTTPException(status_code=400, detail="View error: sandbox execution failed.")
+
+    try:
+        df_chart = _apply_view_chart_timeframe(df, req.chart_timeframe)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    ohlc_df = pd.DataFrame({
+        "date": [_to_iso(ts) for ts in df_chart.index],
+        "open": _series_as_float(df_chart, "open", "Open"),
+        "high": _series_as_float(df_chart, "high", "High"),
+        "low": _series_as_float(df_chart, "low", "Low"),
+        "close": _series_as_float(df_chart, "close", "Close"),
+    })
+    ohlc = ohlc_df.to_dict(orient="records")
 
     return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}

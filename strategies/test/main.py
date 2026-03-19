@@ -1,54 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-Swing HL strategie - Long při 3× Higher High, Short při 3× Lower Low.
+Test strategie – EMA 120 (built-in Backtrader indikátor).
 
-Vyžaduje modul Swing HL (from modules.Swing_HL import get_swings).
-V panelu Moduly vyber "Swing HL" a potvrď.
+Logika (long-only, smoke-test engine + dat):
+  • Nakoupit, když close aktuálního baru je **nad** EMA(120).
+  • Prodat (zavřít long), když close je **pod** EMA(120).
 
-REŽIM BEZ OBCHODŮ: next() nic nedělá – jen prohlédnutí Results (Equity, Moduly, …).
+Žádné externí moduly/indikátory – vhodné pro ověření datového feedu a brokeru.
 """
 
-import os
 import backtrader as bt
-from modules.HL_identificator import get_swings
 
 PARAMS = {
-    "swing_tf": "1d",
-    "hh_count": 3,
-    "ll_count": 3,
+    "ema_period": 120,
 }
-
-
-def _get_ohlc_to_current(strat) -> "pd.DataFrame":
-    """Vrátí OHLC DataFrame od začátku do aktuálního baru (včetně)."""
-    import pandas as pd
-
-    n = len(strat)
-    if n <= 0:
-        return pd.DataFrame()
-    dates = [strat.data.datetime.datetime(-i) for i in range(n - 1, -1, -1)]
-    opens = [float(strat.data.open[-i]) for i in range(n - 1, -1, -1)]
-    highs = [float(strat.data.high[-i]) for i in range(n - 1, -1, -1)]
-    lows = [float(strat.data.low[-i]) for i in range(n - 1, -1, -1)]
-    closes = [float(strat.data.close[-i]) for i in range(n - 1, -1, -1)]
-    df = pd.DataFrame(
-        {"open": opens, "high": highs, "low": lows, "close": closes},
-        index=pd.DatetimeIndex(dates),
-    )
-    return df
 
 
 class Strategy(bt.Strategy):
     params = (
+        ("ema_period", 120),
+        # Absorb params from UI / modules (prevents TypeError when extra keys are passed)
         ("swing_tf", "1d"),
-        ("hh_count", 3),
-        ("ll_count", 3),
+        ("timeframe", "1d"),
         ("module_params", {}),
     )
 
     def __init__(self):
-        pass
+        self.ema = bt.ind.ExponentialMovingAverage(
+            self.data.close,
+            period=int(self.p.ema_period),
+        )
 
     def next(self):
-        # Žádné obchody – jen prohlédnutí Results záložky (Equity, Moduly, …)
-        return
+        # Dokud EMA nemá dostatek barů, Backtrader obvykle nevolá next dřív;
+        # pojistka pro vlastní feedy:
+        if len(self) < self.p.ema_period:
+            return
+
+        close = float(self.data.close[0])
+        ema_val = float(self.ema[0])
+
+        if close > ema_val and not self.position:
+            self.buy(size=1)
+        elif close < ema_val and self.position:
+            self.close()

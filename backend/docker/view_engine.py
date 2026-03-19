@@ -37,6 +37,98 @@ def _series_as_float(df: pd.DataFrame, primary: str, fallback: str) -> pd.Series
     return pd.to_numeric(base, errors="coerce").fillna(0.0).astype(float)
 
 
+_CHART_TF_TO_PANDAS: dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "2h": "2h",
+    "4h": "4h",
+    "1D": "1D",
+    "1W": "1W",
+    "1Mo": "1ME",
+}
+_CHART_TF_MINUTES: dict[str, float] = {
+    "1m": 1,
+    "5m": 5,
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "2h": 120,
+    "4h": 240,
+    "1D": 1440,
+    "1W": 10080,
+    "1Mo": 43200,
+}
+
+
+def _infer_native_bar_minutes(df: pd.DataFrame) -> float:
+    if df is None or len(df.index) < 2:
+        return 1440.0
+    delta_min = df.index.to_series().diff().dt.total_seconds() / 60.0
+    valid = delta_min[(delta_min > 0) & (delta_min < 60 * 48)]
+    if valid.empty:
+        return 1440.0
+    return float(valid.median())
+
+
+def _normalize_chart_tf_key(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() == "native":
+        return None
+    if s in _CHART_TF_TO_PANDAS:
+        return s
+    low = s.lower()
+    for k in _CHART_TF_TO_PANDAS:
+        if k.lower() == low:
+            return k
+    return None
+
+
+def _resample_ohlc_dataframe(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    rename: dict[str, str] = {}
+    for c in list(work.columns):
+        low = c.lower()
+        if low in ("open", "high", "low", "close", "volume"):
+            rename[c] = low
+    work = work.rename(columns=rename)
+    for need in ("open", "high", "low", "close"):
+        if need not in work.columns:
+            cap = need.capitalize()
+            if cap in work.columns:
+                work[need] = work[cap]
+            else:
+                raise ValueError(f"Missing OHLC column for resample: {need}")
+    if "volume" not in work.columns:
+        work["volume"] = 0.0
+    agg_map = {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    out = work[["open", "high", "low", "close", "volume"]].resample(rule, label="left", closed="left").agg(agg_map)
+    out = out.dropna(subset=["open", "high", "low", "close"], how="any")
+    return out
+
+
+def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -> pd.DataFrame:
+    key = _normalize_chart_tf_key(chart_timeframe)
+    if key is None:
+        return df
+    if key not in _CHART_TF_TO_PANDAS:
+        raise ValueError(f"Unknown chart_timeframe: {chart_timeframe!r}")
+    native_min = _infer_native_bar_minutes(df)
+    target_min = _CHART_TF_MINUTES[key]
+    if target_min < native_min * 0.99:
+        raise ValueError(
+            f"chart_timeframe {key} is finer than native data (~{native_min:.1f} min bars); use native or coarser."
+        )
+    rule = _CHART_TF_TO_PANDAS[key]
+    return _resample_ohlc_dataframe(df, rule)
+
+
 def _load_ohlc(data_root: Path, data_file: str, years: float) -> pd.DataFrame:
     safe_file = (data_file or "").replace("\\", "/").lstrip("/")
     if not safe_file or safe_file.startswith("../") or "/../" in safe_file:
@@ -189,6 +281,12 @@ def main() -> None:
     params = req.get("params") if isinstance(req.get("params"), dict) else {}
 
     df = _load_ohlc(data_path, data_file, years)
+    chart_tf = req.get("chart_timeframe")
+    try:
+        df = _apply_view_chart_timeframe(df, chart_tf if isinstance(chart_tf, str) else None)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}), file=sys.stderr)
+        sys.exit(1)
     markers, lines, zones = _run_view_code(main_path, "sandbox_view_module", df, params)
     ohlc_df = pd.DataFrame({
         "date": [_to_iso(ts) for ts in df.index],

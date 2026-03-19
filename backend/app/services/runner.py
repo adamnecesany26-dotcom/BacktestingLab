@@ -21,8 +21,36 @@ from typing import AsyncGenerator, Awaitable, Callable, Union
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 
 RUN_TIMEOUT = 300  # seconds (override with RUN_TIMEOUT_SEC)
-RUN_STREAM_IDLE_TIMEOUT = 120  # seconds (override with RUN_STREAM_IDLE_TIMEOUT_SEC)
+# Importing pandas/backtrader in Docker can be silent on stdout for a long time; keep this generous.
+RUN_STREAM_IDLE_TIMEOUT = 300  # seconds (override with RUN_STREAM_IDLE_TIMEOUT_SEC)
+# Do not kill the container on client-disconnect right after start (avoids flaky SSE / strict-mode races).
+RUN_DISCONNECT_GRACE_SEC = 20.0
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+
+def _resolve_disconnect_grace_seconds() -> float:
+    raw = os.environ.get("RUN_DISCONNECT_GRACE_SEC")
+    if raw is None or str(raw).strip() == "":
+        return RUN_DISCONNECT_GRACE_SEC
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return RUN_DISCONNECT_GRACE_SEC
+
+
+def _format_docker_failure(stderr: str, returncode: int | None) -> str:
+    err = (stderr or "").strip()
+    if returncode == 130 or "KeyboardInterrupt" in err:
+        return (
+            "Běh engine byl přerušen (exit 130 / KeyboardInterrupt). "
+            "To není typická chyba pandas — proces dostal signál „zastav“ (jako Ctrl+C). "
+            "Nejčastěji: tlačítko Zastavit v aplikaci, zavření záložky / přerušení požadavku, nebo ruční ukončení kontejneru v Dockeru. "
+            "Zkuste spustit znovu a nechte běh doběhnout; první start po zapnutí Dockeru může kvůli načtení knihoven chvíli trvat. "
+            "(Technický výpis: "
+            + (err[:600] + ("…" if len(err) > 600 else ""))
+            + ")"
+        )
+    return f"Docker failed (exit {returncode}): {err}"
 
 
 def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[str]:
@@ -218,6 +246,7 @@ def _normalize_result_payload(
     normalized.setdefault("executionSummary", None)
     normalized.setdefault("qualityGate", None)
     normalized.setdefault("experiment", None)
+    normalized.setdefault("batchSummary", None)
 
     normalized["runId"] = run_id
     normalized.setdefault("manifest", {})
@@ -599,6 +628,8 @@ async def run_strategy_streaming(
             stderr=subprocess.PIPE,
             text=False,
         )
+        proc_started = time.perf_counter()
+        disconnect_grace_sec = _resolve_disconnect_grace_seconds()
 
         queue: asyncio.Queue = asyncio.Queue()
         stdout_buffer: list[str] = []
@@ -636,6 +667,10 @@ async def run_strategy_streaming(
             if asyncio.iscoroutine(conn):
                 conn = await conn
             if not conn:
+                # Avoid killing during cold import if the HTTP client briefly reports disconnected.
+                if time.perf_counter() - proc_started < disconnect_grace_sec:
+                    await asyncio.sleep(0.5)
+                    continue
                 proc.kill()
                 break
             try:
@@ -716,7 +751,7 @@ async def run_strategy_streaming(
             yield {"type": "error", "message": stream_stall_message}
         elif not result_data and not error_msg and proc.returncode != 0:
             err = "\n".join(stderr_buffer) or "Unknown error"
-            msg = f"Docker failed (exit {proc.returncode}): {err}"
+            msg = _format_docker_failure(err, proc.returncode)
             print(f"[runner] DOCKER FAILED:\n{msg[:1500]}", flush=True)
             (run_dir / "last_error_strategy.py").write_text(
                 (code or "")[:5000] if code else str(files or {})[:5000], encoding="utf-8"
@@ -824,4 +859,5 @@ async def run_strategy(
         executionSummary=result_data.get("executionSummary"),
         qualityGate=result_data.get("qualityGate"),
         experiment=result_data.get("experiment"),
+        batchSummary=result_data.get("batchSummary"),
     )

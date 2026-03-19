@@ -43,3 +43,9 @@ Strategie obchodující Supply/Demand zóny – Long na Demand, Short na Supply.
 3. V panelu Moduly vyber **Swing HL** a **S/D Zones**, klikni Potvrdit
 4. Nastav instrument (NQ, ES, …) a data
 5. Spusť backtest
+
+---
+
+## Platforma Backtesting App
+
+Strategie běží v **[Backtesting_app](../../README.md)**. Uživatelská mapa aplikace: **[READMEADAM.md](../../READMEADAM.md)**; příkazy: **[SCRIPTS.md](../../SCRIPTS.md)**; vývojová reference: **[READMEAI.md](../../READMEAI.md)**.

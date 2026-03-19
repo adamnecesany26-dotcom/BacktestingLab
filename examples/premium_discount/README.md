@@ -26,3 +26,9 @@ Indikátor určuje, zda je cena v **Premium**, **Mid range** nebo **Discount** n
 ## Parametry
 
 - `timeframe`: časový rámec pro Major Swing (default: "1d")
+
+---
+
+## Platforma Backtesting App
+
+Indikátor pro **[Backtesting_app](../../README.md)**. Přehled aplikace: **[READMEADAM.md](../../READMEADAM.md)**; technická dokumentace: **[README.md](../../README.md)**; **SCRIPTS.md**, **READMEAI.md** v kořeni repa.

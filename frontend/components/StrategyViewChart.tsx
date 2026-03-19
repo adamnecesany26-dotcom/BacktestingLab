@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { getViewData } from "@/lib/api";
 import { getFileContent } from "@/lib/firestore";
 import { parseViewParams, type StrategyParams } from "@/lib/strategyParams";
 import type { DataInstrument } from "@shared/types";
 import type { FirestoreItem } from "@/lib/firestore";
 import type { OhlcBar } from "@shared/types";
+import { buildViewChartTimeframeOptions } from "@/lib/viewChartTimeframe";
 
 function toModuleName(name: string): string {
   return (name || "module").replace(/\s+/g, "_").replace(/-/g, "_").replace(/\./g, "_") || "module";
@@ -123,6 +124,8 @@ export function StrategyViewChart({
     }
   }, [instruments, dataFile]);
   const [years, setYears] = useState(0.5);
+  /** Candle bar size for chart + module OHLC: native = instrument resolution; else server-side resample */
+  const [chartTimeframe, setChartTimeframe] = useState<string>("native");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(initialItemId ?? null);
   const [selectedItemType, setSelectedItemType] = useState<ViewItemType>(
     initialItemType ?? "module"
@@ -141,6 +144,21 @@ export function StrategyViewChart({
   useEffect(() => {
     viewParamsRef.current = viewParamsValues;
   }, [viewParamsValues]);
+
+  const selectedInstrument = useMemo(
+    () => instruments.find((i) => i.file === dataFile),
+    [instruments, dataFile]
+  );
+  const chartTfOptions = useMemo(
+    () => buildViewChartTimeframeOptions(selectedInstrument?.timeframe),
+    [selectedInstrument?.timeframe]
+  );
+
+  useEffect(() => {
+    if (!chartTfOptions.some((o) => o.value === chartTimeframe)) {
+      setChartTimeframe("native");
+    }
+  }, [chartTfOptions, chartTimeframe]);
 
   useEffect(() => {
     if (initialItemId && initialItemType) {
@@ -185,7 +203,7 @@ export function StrategyViewChart({
       const depNames = code ? parseViewDependencies(code) : [];
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
-      const res = await getViewData(dataFile, years, code, paramsToSend, moduleDeps);
+      const res = await getViewData(dataFile, years, code, paramsToSend, moduleDeps, chartTimeframe);
       setOhlc(res.ohlc);
       setMarkers(res.markers);
       setLines(res.lines ?? []);
@@ -199,7 +217,7 @@ export function StrategyViewChart({
     } finally {
       setLoading(false);
     }
-  }, [dataFile, years, selectedItemId, selectedItemType, instruments, modules]);
+  }, [dataFile, years, chartTimeframe, selectedItemId, selectedItemType, instruments, modules]);
 
   const handleShuffle = useCallback(async () => {
     setLoading(true);
@@ -232,7 +250,7 @@ export function StrategyViewChart({
       const depNames = code ? parseViewDependencies(code) : [];
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
-      const res = await getViewData(dataFile, 0, code, paramsToSend, moduleDeps);
+      const res = await getViewData(dataFile, 0, code, paramsToSend, moduleDeps, chartTimeframe);
       const fullOhlc = res.ohlc;
       const fullMarkers = res.markers ?? [];
       const fullLines = res.lines ?? [];
@@ -776,6 +794,25 @@ export function StrategyViewChart({
             {instruments.map((inv) => (
               <option key={inv.file} value={inv.file}>
                 {inv.displayName ? `${inv.instrument} - ${inv.displayName}` : inv.instrument} ({inv.timeframe}, {inv.yearsAvailable}y)
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label
+            className="text-xs text-zinc-500 block mb-1"
+            title="Agregace OHLC na serveru (pandas resample) před vykreslením i před voláním detect/get_line/get_zones. Nelze zjemnit pod rozlišení souboru."
+          >
+            Timeframe svíček
+          </label>
+          <select
+            value={chartTimeframe}
+            onChange={(e) => setChartTimeframe(e.target.value)}
+            className={inputClass}
+          >
+            {chartTfOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
               </option>
             ))}
           </select>

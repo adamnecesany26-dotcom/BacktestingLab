@@ -218,3 +218,9 @@ V podobném místě (cenový overlap ≥ 25 %) a blízkém čase (≤ 7 barů) n
 
 - **SD_def.md** – formální definice S/D zón
 - **swing_hl_detector.py** – závislý modul pro BOS a swingy
+
+---
+
+## Platforma Backtesting App
+
+Modul je určen pro **[Backtesting_app](../../README.md)**. Přehled UI: **[READMEADAM.md](../../READMEADAM.md)**; spuštění lokálně: **[SCRIPTS.md](../../SCRIPTS.md)**; kontrakty API: **[READMEAI.md](../../READMEAI.md)**.

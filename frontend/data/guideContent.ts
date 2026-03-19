@@ -225,14 +225,15 @@ export const guideSections: GuideSection[] = [
         id: "tabs",
         title: "Co znamenají záložky výsledků",
         whatItIs:
-          "Equity, Highlight, Detailed, Analytics a Run history společně tvoří vícevrstvou analýzu.",
+          "Equity, Highlight, Detailed, Analytics a Run history společně tvoří vícevrstvou analýzu; nad záložkami jsou StatBlocks (metriky + ⓘ) a tlačítka Export JSON / Repro bundle (ZIP).",
         whyItMatters:
           "Každá záložka odpovídá jiné otázce; jedna metrika nikdy nestačí.",
         howToUse: [
           "Equity: hodnotíš tvar křivky, drawdown a stabilitu růstu.",
           "Highlight/Detailed: kontroluješ kvalitu jednotlivých obchodů.",
-          "Analytics: hodnotíš robustnost, risk-of-ruin a validační evidence.",
-          "Run history: porovnáváš iterace a branch vývoj.",
+          "Analytics: robustnost, Monte Carlo, validace, foldy, guardrails, cost attribution, heuristický readiness a overfitting varování.",
+          "Run history: porovnáváš iterace, branch vývoj, N-way compare a lifecycle stavy.",
+          "Repro bundle: manifest + souhrn + snapshot main.py z editoru pro pozdější audit (ulož kód před exportem).",
         ],
       },
       {
@@ -299,6 +300,81 @@ export const guideSections: GuideSection[] = [
           "Nikdy neber jeden run jako finální důkaz.",
           "Při zhoršení robustnosti vrať změnu a testuj menší krok.",
           "Rozhoduj se podle důkazů z více metrik, ne podle jediné hodnoty.",
+        ],
+      },
+    ],
+  },
+  {
+    id: "advanced-recent",
+    title: "8) Pokročilé funkce a nedávná rozšíření",
+    intro:
+      "Tato sekce doplňuje základní průvodce o to, co aplikace umí nad rámec „jeden single run“: reprodukovatelnost, druhy Monte Carla, dávkové běhy, export a heuristické hodnocení overfittingu. Detailní mapu celé aplikace máš v souboru READMEADAM.md v kořeni repozitáře.",
+    topics: [
+      {
+        id: "fixed-seed",
+        title: "Fixní run seed (reprodukovatelnost)",
+        whatItIs:
+          "V Edge finding můžeš zapnout pevný seed. Hodnota se uloží do experimentu a v Dockeru nastaví RUN_SEED — stejné náhodné větve (Monte Carlo, sweep, block bootstrap) při stejném kódu a datech.",
+        whyItMatters:
+          "Bez fixního seedu jsou MC a sweep mezi běhy mírně odlišné; pro debugging a porovnání dvou verzí kódu je pevný seed praktický.",
+        howToUse: [
+          "Zapni „Použít pevný seed“ a zadej celé číslo (0–999999999).",
+          "Pro běžný průzkum nech seed vypnutý — každý run dostane náhodný seed.",
+          "U batch dávky sdílí všechny dílčí runy stejný seed z rodičovského requestu (srovnatelné RNG napříč položkami).",
+        ],
+        recommendedDefaults: ["Pro regresní testy např. seed 42; pro research náhodný."],
+      },
+      {
+        id: "mc-modes",
+        title: "Monte Carlo: IID trade vs block bootstrap",
+        whatItIs:
+          "IID náhodně vybírá uzavřené obchody; block bootstrap náhodně vybírá souvislé úseky PnL v čase, aby lépe zachytil serialitu.",
+        whyItMatters:
+          "U strategií s korelovanými výsledky po sobě může IID pod nebo přestřelit tail odhady.",
+        howToUse: [
+          "V Edge finding zapni Monte Carlo a zvol režim podle stylu strategie.",
+          "Ve výsledcích čti pole method / mode / note u monteCarlo.",
+          "Kombinuj s dostatečným počtem obchodů a OOS/WF.",
+        ],
+        recommendedDefaults: ["300–500 simulací; block_bootstrap pro kratší holdy nebo intraday."],
+      },
+      {
+        id: "sweep-and-batch",
+        title: "Parametrický sweep a batch (matrix) runy",
+        whatItIs:
+          "Sweep testuje více kombinací parametrů (random nebo grid). Batch spouští víkrát stejnou strategii s různými overrides (např. jiný instrument nebo data_file) v jednom requestu.",
+        whyItMatters:
+          "Oba přístupy zvyšují počet „pokusů“ — roste riziko náhodného výborného výsledku (multiple testing).",
+        howToUse: [
+          "Sweep nikdy nespoléhej na single run; používej s OOS nebo walk-forward.",
+          "Batch drž na malý počet položek na začátku (max runs cap v UI).",
+          "V Analytics a batchSummary čti varování k vícenásobnému testování.",
+        ],
+        commonMistakes: ["Společně zapnutý portfolio režim a batch (UI varuje).", "Interpretace jen „nejlepšího“ řádku bez kontextu."],
+      },
+      {
+        id: "analytics-overfitting",
+        title: "Analytics: readiness, overfitting a náklady",
+        whatItIs:
+          "Nahoře v Analytics je heuristický readiness signál a seznam varování (single run, málo obchodů, MC, degradace train→test, sweep na single, batch, guardrails, …). Severity score shrnuje závažnost — není to statistický test.",
+        whyItMatters:
+          "Dává konzistentní checklist, na co se dívat před tím, než začneš věřit výsledku.",
+        howToUse: [
+          "Projdi oranžový blok varování před každým „go live“ rozhodnutím.",
+          "Srovnej se sloupcem readiness v Run history.",
+          "V sekci execution / cost attribution zkontroluj podíl poplatků a slippage.",
+        ],
+      },
+      {
+        id: "repro-bundle",
+        title: "Export JSON a Repro bundle (ZIP)",
+        whatItIs:
+          "Export JSON uloží celý RunResponse. Repro bundle zabalí manifest, zkrácený souhrn výsledků a snapshot main.py z editoru v okamžiku kliknutí.",
+        whyItMatters:
+          "Pro poznámky, audit nebo obnovu kontextu bez proklikávání UI.",
+        howToUse: [
+          "Před exportem ZIP ulož main.py, pokud chceš shodu s Firestore.",
+          "Dataset a Docker image musí sedět s původním během — README uvnitř ZIP to připomíná.",
         ],
       },
     ],

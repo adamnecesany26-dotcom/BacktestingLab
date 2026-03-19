@@ -70,3 +70,9 @@ Vrací S/R zóny jako horizontální čáry (value_low == value_high).
 2. **Path A: 2× touch** – cluster major bodů, 2+ validní dotyky (travel-away rule)
 3. **Path B: Range consolidation** – dvojice major bodů, cena pobývala v jejich rozmezí min. N barů → oba body S/R
 4. **Zóna končí** při close pod support / nad resistance. Výjimka: breakout + retest → flip S↔R
+
+---
+
+## Platforma Backtesting App
+
+Modul pro **[Backtesting_app](../../README.md)**. Mapa funkcí v UI: **[READMEADAM.md](../../READMEADAM.md)**; příkazy: **[SCRIPTS.md](../../SCRIPTS.md)**; vývoj: **[READMEAI.md](../../READMEAI.md)**.

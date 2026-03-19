@@ -53,6 +53,8 @@ class RunRequest(BaseModel):
     portfolio_config: Optional[dict[str, Any]] = None
     execution_model: Optional[dict[str, Any]] = None
     experiment: Optional[dict[str, Any]] = None
+    # Sequential matrix runs: { "batch_id"?: str, "max_runs"?: int (cap 48), "items": [ { partial RunRequest fields } ] }
+    batch_config: Optional[dict[str, Any]] = None
 
     @model_validator(mode="after")
     def validate_source(self):
@@ -66,6 +68,10 @@ class RunRequest(BaseModel):
                     raise ValueError("File path too long")
                 if content and len(content) > 500_000:
                     raise ValueError(f"File '{path}' exceeds max size (500k chars)")
+        if self.batch_config and isinstance(self.batch_config, dict):
+            items = self.batch_config.get("items")
+            if isinstance(items, list) and len(items) > 48:
+                raise ValueError("batch_config.items exceeds maximum of 48")
         return self
 
     @field_validator("run_id")
@@ -172,3 +178,4 @@ class RunResponse(BaseModel):
     executionSummary: Optional[dict[str, Any]] = None
     qualityGate: Optional[dict[str, Any]] = None
     experiment: Optional[dict[str, Any]] = None
+    batchSummary: Optional[dict[str, Any]] = None

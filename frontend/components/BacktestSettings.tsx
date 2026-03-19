@@ -37,6 +37,8 @@ export interface EdgeFindingSettings {
   sweepSamples: number;
   monteCarloEnabled: boolean;
   monteCarloSims: number;
+  /** iid_trade = per-trade bootstrap; block_bootstrap preserves short-run serial correlation */
+  monteCarloMode: "iid_trade" | "block_bootstrap";
   regimeEnabled: boolean;
   portfolioEnabled: boolean;
   portfolioInstrumentsJson: string;
@@ -51,6 +53,15 @@ export interface EdgeFindingSettings {
   experimentTagsCsv: string;
   experimentBranch: string;
   promoteOnPass: boolean;
+  /** When true, engine uses fixed RNG seed (Monte Carlo, sweep, bootstrap blocks). */
+  runFixedSeedEnabled: boolean;
+  /** Integer seed sent as experiment.seed → RUN_SEED in engine (clamped). */
+  runFixedSeedValue: number;
+  /** Sequential matrix runs (same strategy files, overridden fields per item) */
+  batchEnabled: boolean;
+  batchMaxRuns: number;
+  /** JSON array of objects with partial overrides, e.g. [{"instrument":"ES","data_file":"mock/ES_5Y.csv"}] */
+  batchItemsJson: string;
 }
 
 const BEGINNER_EDGE_DEFAULTS: Partial<EdgeFindingSettings> = {
@@ -65,6 +76,7 @@ const BEGINNER_EDGE_DEFAULTS: Partial<EdgeFindingSettings> = {
   sweepSamples: 24,
   monteCarloEnabled: true,
   monteCarloSims: 300,
+  monteCarloMode: "iid_trade",
   regimeEnabled: false,
   portfolioEnabled: false,
   executionEnabled: false,
@@ -73,6 +85,11 @@ const BEGINNER_EDGE_DEFAULTS: Partial<EdgeFindingSettings> = {
   slippageVolMult: 1,
   latencyBars: 0,
   promoteOnPass: false,
+  runFixedSeedEnabled: false,
+  runFixedSeedValue: 42,
+  batchEnabled: false,
+  batchMaxRuns: 8,
+  batchItemsJson: '[{"instrument":"NQ","data_file":"mock/NQ_5Y.csv","timeframe":"1d"}]',
 };
 
 const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingSettings>> = {
@@ -87,6 +104,7 @@ const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingS
     sweepSamples: 24,
     monteCarloEnabled: true,
     monteCarloSims: 500,
+    monteCarloMode: "block_bootstrap",
     executionEnabled: true,
     spreadBps: 0.5,
     slippageVolMult: 1,
@@ -103,6 +121,7 @@ const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingS
     sweepSamples: 24,
     monteCarloEnabled: true,
     monteCarloSims: 300,
+    monteCarloMode: "iid_trade",
     executionEnabled: true,
     spreadBps: 0.5,
     slippageVolMult: 1,
@@ -117,10 +136,72 @@ const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingS
     sweepMode: "random",
     sweepSamples: 48,
     monteCarloEnabled: false,
+    monteCarloMode: "iid_trade",
     executionEnabled: false,
     promoteOnPass: false,
+    batchEnabled: false,
   },
 };
+
+/** Module-level: stable component identity so inputs are not remounted on every parent render. */
+function resolveBacktestFieldHelp(fieldId: string, override?: Partial<BacktestFieldHelp>): BacktestFieldHelp {
+  const base = backtestFieldHelp[fieldId] ?? {
+    id: fieldId,
+    title: fieldId,
+    whatItMeans: "Konfigurace backtestu.",
+    whyItMatters: "Tato volba ovlivnuje chovani simulace a kvalitu vysledku.",
+    howToUse: ["Pouzij konzistentni hodnoty napric porovnavanymi runy."],
+    recommendedDefault: "Pouzij baseline hodnotu dle guide.",
+    withoutIt: "Muze dojít ke zkresleni vyhodnoceni.",
+    bestPractices: ["Pri zmene konfigurace zmen eviduj v hypothesis/branch."],
+  };
+  return { ...base, ...override };
+}
+
+function SettingsFieldLabel({
+  label,
+  fieldId,
+  helpOverride,
+}: {
+  label: string;
+  fieldId: string;
+  helpOverride?: Partial<BacktestFieldHelp>;
+}) {
+  return (
+    <div className="mb-1 flex items-center gap-2">
+      <span className="text-sm text-zinc-400">{label}</span>
+      <FieldHelpPopover help={resolveBacktestFieldHelp(fieldId, helpOverride)} />
+    </div>
+  );
+}
+
+function SettingsSection({
+  id,
+  title,
+  open,
+  onToggle,
+  children,
+}: {
+  id: string;
+  title: string;
+  open: boolean;
+  onToggle: (id: string) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="border border-zinc-800 rounded-lg bg-zinc-900/40">
+      <button
+        type="button"
+        onClick={() => onToggle(id)}
+        className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-zinc-800/40 rounded-lg"
+      >
+        <span className="text-xs font-medium text-zinc-400 uppercase tracking-wider">{title}</span>
+        <span className="text-zinc-500 text-sm">{open ? "▼" : "▶"}</span>
+      </button>
+      {open && <div className="px-3 pb-3 space-y-3">{children}</div>}
+    </div>
+  );
+}
 
 interface BacktestSettingsProps {
   instruments: DataInstrument[];
@@ -202,19 +283,6 @@ export function BacktestSettings({
 
   const inputClass = "w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200";
   const labelTextClass = "text-sm text-zinc-400";
-  const getFieldHelp = (fieldId: string, override?: Partial<BacktestFieldHelp>): BacktestFieldHelp => {
-    const base = backtestFieldHelp[fieldId] ?? {
-      id: fieldId,
-      title: fieldId,
-      whatItMeans: "Konfigurace backtestu.",
-      whyItMatters: "Tato volba ovlivnuje chovani simulace a kvalitu vysledku.",
-      howToUse: ["Pouzij konzistentni hodnoty napric porovnavanymi runy."],
-      recommendedDefault: "Pouzij baseline hodnotu dle guide.",
-      withoutIt: "Muze dojít ke zkresleni vyhodnoceni.",
-      bestPractices: ["Pri zmene konfigurace zmen eviduj v hypothesis/branch."],
-    };
-    return { ...base, ...override };
-  };
   const getDynamicParamHelp = (paramName: string): BacktestFieldHelp => {
     const source = paramsTab === "strategy" ? "PARAMS" : "VIEW_PARAMS";
     const moduleMeta = paramsTab === "strategy" ? undefined : moduleParamMeta[paramsTab]?.[paramName];
@@ -236,12 +304,6 @@ export function BacktestSettings({
           : fallback.bestPractices,
     };
   };
-  const FieldLabel = ({ label, fieldId, helpOverride }: { label: string; fieldId: string; helpOverride?: Partial<BacktestFieldHelp> }) => (
-    <div className="mb-1 flex items-center gap-2">
-      <span className={labelTextClass}>{label}</span>
-      <FieldHelpPopover help={getFieldHelp(fieldId, helpOverride)} />
-    </div>
-  );
   const edge = edgeSettings;
   const guidanceSteps = [
     { label: "1) Vyber instrument + roky", done: !!selectedInstrument && years >= minYears },
@@ -263,6 +325,11 @@ export function BacktestSettings({
     }
     if (!edge.monteCarloEnabled) {
       guidanceWarnings.push("Bez Monte Carlo nevidíš tail-risk a risk of ruin.");
+    }
+    if (edge.runFixedSeedEnabled && edge.validationMode === "single" && edge.sweepMode !== "none") {
+      guidanceWarnings.push(
+        "Fixní seed sice zaručí reprodukovatelnost, ale sweep na single runu pořád zvyšuje riziko přeladění.",
+      );
     }
   }
 
@@ -324,35 +391,13 @@ export function BacktestSettings({
           ? "Higher confidence"
           : "Medium confidence";
 
-  const Section = ({
-    id,
-    title,
-    children,
-  }: {
-    id: string;
-    title: string;
-    children: React.ReactNode;
-  }) => (
-    <div className="border border-zinc-800 rounded-lg bg-zinc-900/40">
-      <button
-        type="button"
-        onClick={() => toggleSection(id)}
-        className="w-full flex items-center justify-between px-3 py-2 text-left hover:bg-zinc-800/40 rounded-lg"
-      >
-        <span className="text-xs font-medium text-zinc-400 uppercase tracking-wider">{title}</span>
-        <span className="text-zinc-500 text-sm">{sectionsOpen[id] ? "▼" : "▶"}</span>
-      </button>
-      {sectionsOpen[id] && <div className="px-3 pb-3 space-y-3">{children}</div>}
-    </div>
-  );
-
   const content = (
     <div className="space-y-4">
       <h4 className="text-xs font-medium text-zinc-500 uppercase tracking-wider">
         Nastavení backtestu
       </h4>
       {canRun && (
-        <Section id="guided" title="Guided mode (beginner)">
+        <SettingsSection id="guided" title="Guided mode (beginner)" open={sectionsOpen.guided} onToggle={toggleSection}>
           <div className="rounded border border-zinc-700/60 bg-zinc-800/40 p-3 space-y-3">
             <div className="flex items-center justify-between gap-3">
               <div className="text-xs text-zinc-300">
@@ -388,11 +433,11 @@ export function BacktestSettings({
               </div>
             )}
           </div>
-        </Section>
+        </SettingsSection>
       )}
-      <Section id="basic" title="Basic settings">
+      <SettingsSection id="basic" title="Basic settings" open={sectionsOpen.basic} onToggle={toggleSection}>
         <div>
-          <FieldLabel label="Instrument Type" fieldId="instrumentType" />
+          <SettingsFieldLabel label="Instrument Type" fieldId="instrumentType" />
           <select
             value={params.instrumentType}
             onChange={(e) => onParamsChange({ instrumentType: e.target.value as InstrumentType })}
@@ -404,7 +449,7 @@ export function BacktestSettings({
           </select>
         </div>
         <div>
-          <FieldLabel label="Instrument" fieldId="instrument" />
+          <SettingsFieldLabel label="Instrument" fieldId="instrument" />
           <select
             value={selectedInstrument?.file ?? ""}
             onChange={(e) => {
@@ -440,7 +485,7 @@ export function BacktestSettings({
           )}
         </div>
         <div>
-          <FieldLabel label={`Delka (roky, min ${minYears} - max ${maxYears})`} fieldId="years" />
+          <SettingsFieldLabel label={`Delka (roky, min ${minYears} - max ${maxYears})`} fieldId="years" />
           <input
             type="number"
             min={minYears}
@@ -451,13 +496,13 @@ export function BacktestSettings({
             className={inputClass}
           />
         </div>
-      </Section>
+      </SettingsSection>
 
-      <Section id="instrumentConfig" title="Instrument config">
+      <SettingsSection id="instrumentConfig" title="Instrument config" open={sectionsOpen.instrumentConfig} onToggle={toggleSection}>
         {params.instrumentType === "futures" && (
           <div className="space-y-3">
             <div>
-              <FieldLabel label="Tick Size" fieldId="tickSize" />
+              <SettingsFieldLabel label="Tick Size" fieldId="tickSize" />
               <input
                 type="number"
                 min={0}
@@ -468,7 +513,7 @@ export function BacktestSettings({
               />
             </div>
             <div>
-              <FieldLabel label="Value Per Tick (USD)" fieldId="valuePerTick" />
+              <SettingsFieldLabel label="Value Per Tick (USD)" fieldId="valuePerTick" />
               <input
                 type="number"
                 min={0}
@@ -482,7 +527,7 @@ export function BacktestSettings({
         )}
         {params.instrumentType === "stocks" && (
           <div>
-            <FieldLabel label="Position Size (pocet akcii)" fieldId="shareSize" />
+            <SettingsFieldLabel label="Position Size (pocet akcii)" fieldId="shareSize" />
             <input
               type="number"
               min={1}
@@ -496,7 +541,7 @@ export function BacktestSettings({
         {params.instrumentType === "forex" && (
           <div className="space-y-3">
             <div>
-              <FieldLabel label="Lot Size" fieldId="lotSize" />
+              <SettingsFieldLabel label="Lot Size" fieldId="lotSize" />
               <input
                 type="number"
                 min={0}
@@ -507,7 +552,7 @@ export function BacktestSettings({
               />
             </div>
             <div>
-              <FieldLabel label="Pip Size" fieldId="pipSize" />
+              <SettingsFieldLabel label="Pip Size" fieldId="pipSize" />
               <input
                 type="number"
                 min={0}
@@ -518,7 +563,7 @@ export function BacktestSettings({
               />
             </div>
             <div>
-              <FieldLabel label="Pip Value (USD)" fieldId="pipValue" />
+              <SettingsFieldLabel label="Pip Value (USD)" fieldId="pipValue" />
               <input
                 type="number"
                 min={0}
@@ -530,11 +575,11 @@ export function BacktestSettings({
             </div>
           </div>
         )}
-      </Section>
+      </SettingsSection>
 
-      <Section id="simulation" title="Simulation">
+      <SettingsSection id="simulation" title="Simulation" open={sectionsOpen.simulation} onToggle={toggleSection}>
         <div>
-          <FieldLabel label="Pocatecni kapital" fieldId="initialCapital" />
+          <SettingsFieldLabel label="Pocatecni kapital" fieldId="initialCapital" />
           <input
             type="number"
             min={1000}
@@ -545,7 +590,7 @@ export function BacktestSettings({
           />
         </div>
         <div>
-          <FieldLabel label="Slippage (%)" fieldId="slippagePerc" />
+          <SettingsFieldLabel label="Slippage (%)" fieldId="slippagePerc" />
           <input
             type="number"
             min={0}
@@ -557,7 +602,7 @@ export function BacktestSettings({
           />
         </div>
         <div>
-          <FieldLabel label="Komise (%)" fieldId="commissionPerc" />
+          <SettingsFieldLabel label="Komise (%)" fieldId="commissionPerc" />
           <input
             type="number"
             min={0}
@@ -568,13 +613,13 @@ export function BacktestSettings({
             className={inputClass}
           />
         </div>
-      </Section>
+      </SettingsSection>
 
       {canRun && (
-        <Section id="dependencies" title="Indicators & Modules">
+        <SettingsSection id="dependencies" title="Indicators & Modules" open={sectionsOpen.dependencies} onToggle={toggleSection}>
           {onSelectIndicators && (
             <div>
-              <FieldLabel label="Indikatory (auto-detect + rucni uprava)" fieldId="selectedIndicatorIds" />
+              <SettingsFieldLabel label="Indikatory (auto-detect + rucni uprava)" fieldId="selectedIndicatorIds" />
               <div className="max-h-24 overflow-auto rounded bg-zinc-800 border border-zinc-700 p-2 space-y-1">
                 {indicators.length === 0 ? (
                   <p className="text-zinc-500 text-xs">Žádné indikátory. Vytvoř v sekci Indikátory.</p>
@@ -602,7 +647,7 @@ export function BacktestSettings({
           )}
           {onSelectModules && (
             <div>
-              <FieldLabel label="Moduly (auto-detect + rucni uprava)" fieldId="selectedModuleIds" />
+              <SettingsFieldLabel label="Moduly (auto-detect + rucni uprava)" fieldId="selectedModuleIds" />
               <div className="max-h-24 overflow-auto rounded bg-zinc-800 border border-zinc-700 p-2 space-y-1">
                 {modules.length === 0 ? (
                   <p className="text-zinc-500 text-xs">Žádné moduly. Vytvoř v sekci Moduly.</p>
@@ -636,11 +681,11 @@ export function BacktestSettings({
               Potvrdit → zobrazit v menu
             </button>
           )}
-        </Section>
+        </SettingsSection>
       )}
 
       {canRun && (
-        <Section id="edgeFinding" title="Edge finding">
+        <SettingsSection id="edgeFinding" title="Edge finding" open={sectionsOpen.edgeFinding} onToggle={toggleSection}>
           {edge ? (
             <>
               <div className="rounded border border-zinc-700/60 bg-zinc-800/40 p-3 space-y-2">
@@ -705,7 +750,7 @@ export function BacktestSettings({
                 </div>
               </div>
               <div>
-                <FieldLabel label="Validation mode" fieldId="validationMode" />
+                <SettingsFieldLabel label="Validation mode" fieldId="validationMode" />
                 <select
                   value={edge.validationMode}
                   onChange={(e) =>
@@ -723,7 +768,7 @@ export function BacktestSettings({
               </div>
               {edge.validationMode === "oos_split" && (
                 <div>
-                  <FieldLabel label="OOS ratio" fieldId="oosRatio" />
+                  <SettingsFieldLabel label="OOS ratio" fieldId="oosRatio" />
                   <input
                     type="number"
                     min={0.05}
@@ -738,7 +783,7 @@ export function BacktestSettings({
               {edge.validationMode === "walk_forward" && (
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <FieldLabel label="WF folds" fieldId="wfFolds" />
+                    <SettingsFieldLabel label="WF folds" fieldId="wfFolds" />
                     <input
                       type="number"
                       min={2}
@@ -750,7 +795,7 @@ export function BacktestSettings({
                     />
                   </div>
                   <div>
-                    <FieldLabel label="WF test ratio" fieldId="wfTestRatio" />
+                    <SettingsFieldLabel label="WF test ratio" fieldId="wfTestRatio" />
                     <input
                       type="number"
                       min={0.1}
@@ -765,9 +810,15 @@ export function BacktestSettings({
                   </div>
                 </div>
               )}
+              {(edge.validationMode === "walk_forward" || edge.validationMode === "oos_split") && (
+                <p className="text-xs text-zinc-500 leading-relaxed">
+                  WF/OOS: engine vrací foldy s daty a test metrikami; guardrails v Analytics jsou{" "}
+                  <strong>heuristiky</strong> (krátké okno, málo obchodů) — ne důkaz absence leakage.
+                </p>
+              )}
               <div className="grid grid-cols-3 gap-2">
                 <div>
-                  <FieldLabel label="Gate min trades" fieldId="minTradesGate" />
+                  <SettingsFieldLabel label="Gate min trades" fieldId="minTradesGate" />
                   <input
                     type="number"
                     min={0}
@@ -780,7 +831,7 @@ export function BacktestSettings({
                   />
                 </div>
                 <div>
-                  <FieldLabel label="Gate max DD %" fieldId="maxDdGate" />
+                  <SettingsFieldLabel label="Gate max DD %" fieldId="maxDdGate" />
                   <input
                     type="number"
                     min={0}
@@ -791,7 +842,7 @@ export function BacktestSettings({
                   />
                 </div>
                 <div>
-                  <FieldLabel label="Gate min PF" fieldId="minPfGate" />
+                  <SettingsFieldLabel label="Gate min PF" fieldId="minPfGate" />
                   <input
                     type="number"
                     min={0}
@@ -804,7 +855,38 @@ export function BacktestSettings({
               </div>
               <div className="space-y-2 pt-1 border-t border-zinc-800">
                 <div>
-                  <FieldLabel label="Experiment hypothesis" fieldId="experimentHypothesis" />
+                  <SettingsFieldLabel label="Fixní run seed (reprodukovatelnost)" fieldId="runFixedSeed" />
+                  <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300 mb-2">
+                    <input
+                      type="checkbox"
+                      checked={edge.runFixedSeedEnabled}
+                      onChange={(e) => onEdgeSettingsChange?.({ ...edge, runFixedSeedEnabled: e.target.checked })}
+                      className="rounded"
+                    />
+                    Použít pevný seed pro MC / sweep / bootstrap (jinak náhodný každý run)
+                  </label>
+                  <input
+                    type="number"
+                    step={1}
+                    min={0}
+                    max={999999999}
+                    disabled={!edge.runFixedSeedEnabled}
+                    value={edge.runFixedSeedValue}
+                    onChange={(e) =>
+                      onEdgeSettingsChange?.({
+                        ...edge,
+                        runFixedSeedValue: parseInt(e.target.value, 10) || 0,
+                      })
+                    }
+                    className={inputClass + (!edge.runFixedSeedEnabled ? " opacity-50" : "")}
+                  />
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Hodnota jde do manifestu a <code className="text-zinc-400">RUN_SEED</code> v engine. U batch dávky
+                    sdílí všechny dílčí runy stejný seed z parent requestu (srovnatelné RNG napříč položkami).
+                  </p>
+                </div>
+                <div>
+                  <SettingsFieldLabel label="Experiment hypothesis" fieldId="experimentHypothesis" />
                   <input
                     type="text"
                     value={edge.experimentHypothesis}
@@ -814,7 +896,7 @@ export function BacktestSettings({
                   />
                 </div>
                 <div>
-                  <FieldLabel label="Experiment tags (CSV)" fieldId="experimentTagsCsv" />
+                  <SettingsFieldLabel label="Experiment tags (CSV)" fieldId="experimentTagsCsv" />
                   <input
                     type="text"
                     value={edge.experimentTagsCsv}
@@ -824,7 +906,7 @@ export function BacktestSettings({
                   />
                 </div>
                 <div>
-                  <FieldLabel label="Run branch" fieldId="experimentBranch" />
+                  <SettingsFieldLabel label="Run branch" fieldId="experimentBranch" />
                   <input
                     type="text"
                     value={edge.experimentBranch}
@@ -834,7 +916,7 @@ export function BacktestSettings({
                   />
                 </div>
                 <div className="space-y-1">
-                  <FieldLabel label="Promote candidate when gates pass" fieldId="promoteOnPass" />
+                  <SettingsFieldLabel label="Promote candidate when gates pass" fieldId="promoteOnPass" />
                   <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                     <input
                       type="checkbox"
@@ -848,7 +930,7 @@ export function BacktestSettings({
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <FieldLabel label="Sweep mode" fieldId="sweepMode" />
+                  <SettingsFieldLabel label="Sweep mode" fieldId="sweepMode" />
                   <select
                     value={edge.sweepMode}
                     onChange={(e) =>
@@ -865,7 +947,7 @@ export function BacktestSettings({
                   </select>
                 </div>
                 <div>
-                  <FieldLabel label="Sweep samples" fieldId="sweepSamples" />
+                  <SettingsFieldLabel label="Sweep samples" fieldId="sweepSamples" />
                   <input
                     type="number"
                     min={4}
@@ -879,7 +961,7 @@ export function BacktestSettings({
               </div>
               <div className="space-y-2">
                 <div className="space-y-1">
-                  <FieldLabel label="Monte Carlo" fieldId="monteCarloEnabled" />
+                  <SettingsFieldLabel label="Monte Carlo" fieldId="monteCarloEnabled" />
                   <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                     <input
                       type="checkbox"
@@ -891,23 +973,44 @@ export function BacktestSettings({
                   </label>
                 </div>
                 {edge.monteCarloEnabled && (
-                  <div>
-                    <FieldLabel label="MC simulations" fieldId="monteCarloSims" />
-                    <input
-                      type="number"
-                      min={50}
-                      max={2000}
-                      step={10}
-                      value={edge.monteCarloSims}
-                      onChange={(e) =>
-                        onEdgeSettingsChange?.({ ...edge, monteCarloSims: parseInt(e.target.value, 10) || 300 })
-                      }
-                      className={inputClass}
-                    />
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <SettingsFieldLabel label="MC simulations" fieldId="monteCarloSims" />
+                      <input
+                        type="number"
+                        min={50}
+                        max={2000}
+                        step={10}
+                        value={edge.monteCarloSims}
+                        onChange={(e) =>
+                          onEdgeSettingsChange?.({ ...edge, monteCarloSims: parseInt(e.target.value, 10) || 300 })
+                        }
+                        className={inputClass}
+                      />
+                    </div>
+                    <div>
+                      <SettingsFieldLabel label="MC mode" fieldId="monteCarloMode" />
+                      <select
+                        value={edge.monteCarloMode ?? "iid_trade"}
+                        onChange={(e) =>
+                          onEdgeSettingsChange?.({
+                            ...edge,
+                            monteCarloMode: e.target.value as EdgeFindingSettings["monteCarloMode"],
+                          })
+                        }
+                        className={inputClass}
+                      >
+                        <option value="iid_trade">IID trade bootstrap (default)</option>
+                        <option value="block_bootstrap">Block bootstrap (serialita PnL)</option>
+                      </select>
+                      <p className="text-[11px] text-zinc-500 mt-1">
+                        Block režim resampluje souvislé bloky uzavřených obchodů — lepší pro korelované výsledky.
+                      </p>
+                    </div>
                   </div>
                 )}
                 <div className="space-y-1">
-                  <FieldLabel label="Regime segmentation" fieldId="regimeEnabled" />
+                  <SettingsFieldLabel label="Regime segmentation" fieldId="regimeEnabled" />
                   <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                     <input
                       type="checkbox"
@@ -919,7 +1022,7 @@ export function BacktestSettings({
                   </label>
                 </div>
                 <div className="space-y-1">
-                  <FieldLabel label="Portfolio backtest" fieldId="portfolioEnabled" />
+                  <SettingsFieldLabel label="Portfolio backtest" fieldId="portfolioEnabled" />
                   <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                     <input
                       type="checkbox"
@@ -932,7 +1035,7 @@ export function BacktestSettings({
                 </div>
                 {edge.portfolioEnabled && (
                   <div>
-                    <FieldLabel label="Portfolio instruments (JSON array)" fieldId="portfolioInstrumentsJson" />
+                    <SettingsFieldLabel label="Portfolio instruments (JSON array)" fieldId="portfolioInstrumentsJson" />
                     <textarea
                       value={edge.portfolioInstrumentsJson}
                       onChange={(e) => onEdgeSettingsChange?.({ ...edge, portfolioInstrumentsJson: e.target.value })}
@@ -941,8 +1044,52 @@ export function BacktestSettings({
                     />
                   </div>
                 )}
+                <div className="space-y-2 pt-2 border-t border-zinc-800">
+                  <div className="space-y-1">
+                    <SettingsFieldLabel label="Batch / matrix runs" fieldId="batchEnabled" />
+                    <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
+                      <input
+                        type="checkbox"
+                        checked={edge.batchEnabled}
+                        onChange={(e) => onEdgeSettingsChange?.({ ...edge, batchEnabled: e.target.checked })}
+                        className="rounded"
+                      />
+                      Enabled (sekvenční Docker runy, max 48)
+                    </label>
+                  </div>
+                  {edge.batchEnabled && (
+                    <div className="space-y-2">
+                      <p className="text-xs text-amber-200/90">
+                        Pozor na multiple testing — výsledky zobrazí varování. Nelze kombinovat s portfolio režimem.
+                      </p>
+                      <div>
+                        <SettingsFieldLabel label="Max runs (cap)" fieldId="batchMaxRuns" />
+                        <input
+                          type="number"
+                          min={1}
+                          max={48}
+                          value={edge.batchMaxRuns}
+                          onChange={(e) =>
+                            onEdgeSettingsChange?.({ ...edge, batchMaxRuns: parseInt(e.target.value, 10) || 8 })
+                          }
+                          className={inputClass}
+                        />
+                      </div>
+                      <div>
+                        <SettingsFieldLabel label="Items JSON" fieldId="batchItemsJson" />
+                        <textarea
+                          value={edge.batchItemsJson}
+                          onChange={(e) => onEdgeSettingsChange?.({ ...edge, batchItemsJson: e.target.value })}
+                          rows={6}
+                          className={`${inputClass} font-mono text-xs`}
+                          spellCheck={false}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <div className="space-y-1">
-                  <FieldLabel label="Realistic execution model" fieldId="executionEnabled" />
+                  <SettingsFieldLabel label="Realistic execution model" fieldId="executionEnabled" />
                   <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                     <input
                       type="checkbox"
@@ -957,7 +1104,7 @@ export function BacktestSettings({
                   <div className="space-y-2">
                     <div className="grid grid-cols-3 gap-2">
                       <div>
-                        <FieldLabel label="Spread (bps)" fieldId="spreadBps" />
+                        <SettingsFieldLabel label="Spread (bps)" fieldId="spreadBps" />
                         <input
                           type="number"
                           min={0}
@@ -968,7 +1115,7 @@ export function BacktestSettings({
                         />
                       </div>
                       <div>
-                        <FieldLabel label="Slip x vol" fieldId="slippageVolMult" />
+                        <SettingsFieldLabel label="Slip x vol" fieldId="slippageVolMult" />
                         <input
                           type="number"
                           min={0}
@@ -981,7 +1128,7 @@ export function BacktestSettings({
                         />
                       </div>
                       <div>
-                        <FieldLabel label="Latency bars" fieldId="latencyBars" />
+                        <SettingsFieldLabel label="Latency bars" fieldId="latencyBars" />
                         <input
                           type="number"
                           min={0}
@@ -993,7 +1140,7 @@ export function BacktestSettings({
                       </div>
                     </div>
                     <div className="space-y-1">
-                      <FieldLabel label="Forward testing bridge" fieldId="forwardBridgeEnabled" />
+                      <SettingsFieldLabel label="Forward testing bridge" fieldId="forwardBridgeEnabled" />
                       <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
                         <input
                           type="checkbox"
@@ -1007,7 +1154,7 @@ export function BacktestSettings({
                     {edge.forwardBridgeEnabled && (
                       <div className="grid grid-cols-2 gap-2">
                         <div>
-                          <FieldLabel label="Bridge mode" fieldId="forwardBridgeMode" />
+                          <SettingsFieldLabel label="Bridge mode" fieldId="forwardBridgeMode" />
                           <select
                             value={edge.forwardBridgeMode}
                             onChange={(e) =>
@@ -1023,7 +1170,7 @@ export function BacktestSettings({
                           </select>
                         </div>
                         <div>
-                          <FieldLabel label="Baseline equity" fieldId="forwardBridgeBaselineEquity" />
+                          <SettingsFieldLabel label="Baseline equity" fieldId="forwardBridgeBaselineEquity" />
                           <input
                             type="number"
                             min={0}
@@ -1047,11 +1194,11 @@ export function BacktestSettings({
           ) : (
             <p className="text-zinc-500 text-xs">Edge settings nejsou dostupné.</p>
           )}
-        </Section>
+        </SettingsSection>
       )}
 
       {canRun && (
-        <Section id="parameters" title="Parameters">
+        <SettingsSection id="parameters" title="Parameters" open={sectionsOpen.parameters} onToggle={toggleSection}>
           {hasAnyParams ? (
             <>
               <div className="flex gap-1 flex-wrap">
@@ -1136,10 +1283,10 @@ export function BacktestSettings({
           ) : (
             <p className="text-zinc-500 text-xs">Žádné parametry</p>
           )}
-        </Section>
+        </SettingsSection>
       )}
 
-      <Section id="run" title="Run">
+      <SettingsSection id="run" title="Run" open={sectionsOpen.run} onToggle={toggleSection}>
         <button
           onClick={onRun}
           disabled={isRunning || !canRun}
@@ -1147,7 +1294,7 @@ export function BacktestSettings({
         >
           {isRunning ? "Běží..." : canRun ? "Run" : "Otevřete strategii"}
         </button>
-      </Section>
+      </SettingsSection>
     </div>
   );
   return content;

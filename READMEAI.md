@@ -2,6 +2,17 @@
 
 **Purpose:** This document enables any AI model or bot to understand the application in detail: architecture, data flow, workflows, logic, technologies, and where to make changes. Read this file first when working with the codebase.
 
+**Documentation set (repo root):**
+
+| File | Role |
+|------|------|
+| `READMEADAM.md` | Human UI/feature map + workflow (keep in sync with `backtestFieldMeta.ts` + `guideContent.ts`). |
+| `README.md` | Full technical + API + project structure. |
+| `READMEAI.md` | This file — AI/dev contracts and change locations. |
+| `SCRIPTS.md` | Run commands (Docker, uvicorn, npm). |
+
+When adding UX, update **READMEADAM.md**, **`frontend/data/guideContent.ts`**, and **`frontend/components/backtestFieldMeta.ts`** together; bump **README.md** sections if behavior/API changes.
+
 **Language:** Czech and English mixed (matches codebase). Key terms are consistent.
 
 > **Important update (2026-03):** System now includes API auth/rate-limit, sandboxed `/api/view`, append-only audit events, deterministic run fingerprinting in manifest, Firestore owner/role rules with soft-delete, and compare/lifecycle governance in Run history.
@@ -114,7 +125,8 @@ Backtesting_app/
 │       ├── api.ts                # runBacktestStreaming, getViewData, getAvailableData
 │       ├── firestore.ts          # CRUD + soft-delete + run governance update
 │       ├── firebase.ts
-│       └── strategyParams.ts     # parseStrategyParams, parseViewParams
+│       ├── strategyParams.ts     # parseStrategyParams, parseViewParams
+│       └── overfittingSignals.ts # assessOverfitting + readiness (AnalyticsView, RunHistory)
 ├── backend/
 │   ├── app/main.py
 │   ├── app/security.py
@@ -188,8 +200,10 @@ Backtesting_app/
 
 ### 5.0 Security contract (all `/api/*`)
 
-- Client sends `X-API-Key` (or Bearer) for authenticated calls.
-- Optional `X-Actor-Id` is forwarded for lineage/audit.
+- Client sends `X-API-Key` (or Bearer token) matching `API_AUTH_KEY` when set.
+- **Local dev:** if `API_AUTH_REQUIRED` is true but `API_AUTH_KEY` is **not** set and the client IP is `127.0.0.1` / `::1`, backend accepts the request with `auth_method=local_dev_auto` (`backend/app/security.py`).
+- Frontend: `NEXT_PUBLIC_API_AUTH_KEY` → `frontend/lib/api.ts` sends `X-API-Key`.
+- Optional `X-Actor-Id` is sanitized and forwarded for lineage/audit.
 - Backend applies in-memory rate limiting per client key.
 - Relevant envs: `API_AUTH_REQUIRED`, `API_AUTH_KEY`, `API_ALLOW_DEV_BYPASS`, `API_RATE_LIMIT_MAX_REQUESTS`, `API_RATE_LIMIT_WINDOW_SEC`.
 
@@ -217,10 +231,15 @@ Backtesting_app/
   "quality_gates": { "min_trades": 30, "max_dd": 25, "min_pf": 1.2, "min_sortino": 0.5 },
   "sweep_mode": "random",
   "sweep_config": { "max_samples": 24, "param_ranges": { "risk_pct": { "min": 0.5, "max": 2.0 } } },
-  "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50 },
+  "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50, "mode": "iid_trade" },
   "regime_config": { "enabled": true },
   "portfolio_config": { "instruments": [] },
   "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0 },
+  "batch_config": {
+    "batch_id": "batch_abc",
+    "max_runs": 8,
+    "items": [{ "instrument": "NQ", "data_file": "mock/NQ_5Y.csv", "timeframe": "1d" }]
+  },
   "experiment": {
     "hypothesis": "edge-test",
     "tags": ["manual-run"],
@@ -228,10 +247,21 @@ Backtesting_app/
       "totalReturnUsd": { "current": 1500, "baseline": 900, "delta": 600, "deltaPct": 66.6667 }
     },
     "promoteEvidence": { "gatePassed": true, "promoteRequested": true, "stabilityScore": 0.61, "promote": true },
-    "promoteDecision": "candidate_for_promote"
+    "promoteDecision": "review_candidate",
+    "seed": 42
   }
 }
 ```
+
+`promoteDecision` is constrained in UI to **`review_candidate`** | **`hold`** (not free-form strings).
+
+**`experiment.seed`:** optional integer; `runner.py` passes it as Docker `RUN_SEED` so `engine.py` can `random.seed(...)` for Monte Carlo, sweep sampling, and block-bootstrap starts. UI toggle *Fixní run seed* sets this; if omitted, runner generates a random seed. Batch sub-runs inherit the same parent seed (each subprocess still deterministic for that seed).
+
+**`batch_config`:** when present with non-empty `items`, `run.py` runs a **sequence** of Docker jobs (`_merge_batch_sub_request` merges each item into a copy of the base request, clears nested `batch_config` on sub-requests). Final streamed/non-stream response includes **`batchSummary`** (`batchId`, `runCount`, `runs[]`, `multipleTestingWarning`). Do not combine with `portfolio_config` in UI (client warns).
+
+**Overfitting / readiness:** `frontend/lib/overfittingSignals.ts` centralizes heuristic rules consumed by **Analytics** (warnings list + severity score) and **Run history** (ready / caution / not_ready). Not a statistical test—only guides human review.
+
+**Repro ZIP:** `ResultsView` uses dynamic `fflate` import; bundle includes manifest, trimmed JSON summary, and editor snapshot of `main.py` (see `handleReproBundle`).
 
 **Response (RunResponse):**
 ```json
@@ -250,10 +280,10 @@ Backtesting_app/
   },
   "validation": { "mode": "walk_forward", "folds": [], "summary": {} },
   "robustness": { "mode": "random", "tested": 24, "stabilityScore": 0.62, "results": [], "heatmap": {} },
-  "monteCarlo": { "simulations": 300, "drawdownPct": {}, "endingEquity": {}, "riskOfRuin": 0.12 },
+  "monteCarlo": { "simulations": 300, "method": "trade_pnl_bootstrap", "mode": "iid_trade", "note": "...", "drawdownPct": {}, "endingEquity": {}, "riskOfRuin": 0.12 },
   "regimeAnalysis": { "regimes": {}, "sessions": {} },
   "portfolio": null,
-  "executionSummary": { "enabled": true, "spreadBps": 0.5, "latencyBars": 0, "totalFees": 123.4, "totalSlippageCost": 89.1, "forwardBridge": { "mode": "paper_shadow", "driftPct": 1.2 } },
+  "executionSummary": { "enabled": true, "spreadBps": 0.5, "latencyBars": 0, "totalFees": 123.4, "totalSlippageCost": 89.1, "costAttribution": {}, "forwardBridge": { "mode": "paper_shadow", "driftPct": 1.2 } },
   "qualityGate": { "passed": true, "checks": [] },
   "experiment": { "hypothesis": "edge-test", "tags": ["manual-run"] }
 }
@@ -269,9 +299,12 @@ Backtesting_app/
   "data_file": "mock/NQ_5Y.csv",
   "years": 1,
   "module_code": "def detect(ohlc, params=None): ...",
-  "params": { "period": 20 }
+  "params": { "period": 20 },
+  "chart_timeframe": null
 }
 ```
+
+**`chart_timeframe`:** `null` / omit / `"native"` = use source bar size. Otherwise resample OHLC on the server before chart + module (`1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `1D`, `1W`, `1Mo`) — must be **coarser** than inferred native bar spacing (median delta, gaps &lt; 48h ignored). Implemented in `view.py` and `docker/view_engine.py` (pandas `resample`).
 
 **Response:**
 ```json
@@ -292,6 +325,7 @@ Backend executes `module_code` in Docker sandbox (`view_engine.py`), checks `has
 {
   "instruments": [{
     "instrument": "NQ",
+    "displayName": "Nasdaq-100 E-mini",
     "timeframe": "1d",
     "file": "mock/NQ_5Y.csv",
     "minDate", "maxDate", "yearsAvailable",
@@ -300,6 +334,16 @@ Backend executes `module_code` in Docker sandbox (`view_engine.py`), checks `has
   }]
 }
 ```
+
+Intraday futures live under `data/futures_30m/*.txt` (one row per bar: `MM/DD/YYYY,HH:MM,O,H,L,C,V`); API returns `timeframe: "30m"` and `file` like `futures_30m/NQ.txt`.
+
+**GET /api/data/debug:** `data_dir`, `mock_exists`, `futures_30m_exists`, `csv_count`, `txt_count`, `csv_files`, `txt_files`.
+
+### 5.3a Metrics / Monte Carlo notes for AI
+
+- **`profitFactor`:** engine may use a sentinel when there are no losing trades; UI shows ∞/N/A; sweep scoring caps PF to avoid sentinel skew.
+- **`riskOfRuin` (Monte Carlo):** interpret as **bootstrap estimate** from resampled trade (or block) PnL, not a structural market probability. Always read `monteCarlo.method`, `monteCarlo.mode`, `monteCarlo.note`.
+- **Run history table:** primary R column is **expectancy in R** (`expectancyR`); legacy payloads may still expose `rMultiple` — prefer `expectancyR` when present.
 
 ---
 
@@ -362,6 +406,8 @@ Strategy passes `params.module_params["Swing HL"]` to module functions.
 
 **Key functions:** `listItems`, `createItem`, `getFiles`, `getFileContent`, `saveFile`, `createFile`, `saveBacktestResult`, `listBacktestResults`, `deleteBacktestResult` (soft-delete), `deleteAllBacktestResults` (soft-delete), `updateBacktestRunGovernance`
 
+**Governance patch:** `updateBacktestRunGovernance` uses Firestore **dot-path merge** into nested `experiment.*` fields. Client should only send **whitelisted** governance keys (see `frontend/lib/firestore.ts`). **Phase 6b (server-only approvals):** enforcing reviewer rules requires Cloud Functions or a trusted backend proxy—not client-only Firestore writes.
+
 ---
 
 ## 8. Runner Logic (runner.py)
@@ -411,6 +457,10 @@ Used in `createItem` when creating new strategy/indicator/module.
 | Change default strategy/indicator/module content | `frontend/lib/firestore.ts` |
 | Change param parsing | `frontend/lib/strategyParams.ts` |
 | Change guide content | `frontend/data/guideContent.ts`, `frontend/app/guide/page.tsx` |
+| Change field popovers | `frontend/components/backtestFieldMeta.ts` |
+| Change readiness/overfitting rules | `frontend/lib/overfittingSignals.ts` (AnalyticsView + RunHistory) |
+| Change repro ZIP contents | `frontend/components/results/ResultsView.tsx` |
+| User-facing feature map | `READMEADAM.md` (keep aligned with guide + popovers) |
 
 ---
 
@@ -418,7 +468,7 @@ Used in `createItem` when creating new strategy/indicator/module.
 
 | Type | UI params | Data path |
 |------|-----------|-----------|
-| futures | tick_size, value_per_tick | mock/*.csv, mock/futures/*.csv |
+| futures | tick_size, value_per_tick | mock/*.csv, mock/futures/*.csv, futures_30m/*.txt |
 | stocks | share_size | mock/stocks/*.csv |
 | forex | lot_size, pip_size, pip_value | mock/forex/*.csv |
 
@@ -476,6 +526,14 @@ handleRun
 | Run history | Saved backtest results in Firestore under strategy |
 | PARAMS | Strategy parameters dict, parsed for Parameter Panel |
 | VIEW_PARAMS | Module/indicator params for View mode, parsed for View params drawer |
+
+---
+
+## 16. Documentation maintenance
+
+- **Single source of truth for UI labels/help:** `backtestFieldMeta.ts` (popovers), `guideContent.ts` + `/guide` (narrative), `READMEADAM.md` (inventory).
+- **Single source for API shapes:** `shared/types/index.ts`, `backend/app/models/run.py`, this file §5.
+- **Operators:** `SCRIPTS.md` for local run; `README.md` §11–14 for env and Firestore.
 
 ---
 

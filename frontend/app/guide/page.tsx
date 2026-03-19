@@ -30,6 +30,14 @@ export default function GuidePage() {
             <li>Projdi sekce postupně, každá navazuje na předchozí.</li>
             <li>U každého tématu sleduj: co to je, proč je to důležité a jak to použít v praxi.</li>
             <li>Na konci použij checklist věrohodného backtestu jako kontrolu kvality před dalším runem.</li>
+            <li>
+              V aplikaci u každého pole v pravém panelu klikni na ikonu nápovědy — texty jsou v repu v{" "}
+              <code className="text-zinc-400">frontend/components/backtestFieldMeta.ts</code> a odpovídají aktuálnímu UI.
+            </li>
+            <li>
+              <strong>READMEADAM.md</strong> v kořeni projektu je kompletní mapa funkcí a obrazovky pro rychlý re-orient po změnách
+              v aplikaci.
+            </li>
           </ul>
         </div>
 
@@ -47,12 +55,13 @@ export default function GuidePage() {
                 </a>
               ))}
             </nav>
-            <div className="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
+              <div className="mt-4 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3">
               <p className="text-xs font-semibold uppercase tracking-wide text-emerald-300">Cíl po dočtení</p>
               <ul className="mt-2 space-y-1 text-xs text-zinc-200">
                 <li>Budeš umět aplikaci používat zhruba na 90 % bez řešení edge-case supportu.</li>
                 <li>Budeš umět rozlišit věrohodný a nevěrohodný backtest.</li>
                 <li>Budeš rozumět OOS, Walk-forward a Monte Carlo v praktickém workflow.</li>
+                <li>Budeš vědět, kde je batch/sweep, fixní seed, repro ZIP a co znamená readiness v Analytics.</li>
               </ul>
             </div>
           </aside>
@@ -119,9 +128,13 @@ export default function GuidePage() {
               <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-zinc-200">
                 <li>Validace není pouze single run (ideálně OOS nebo Walk-forward).</li>
                 <li>Quality gates filtrují slabé nebo náhodné edge.</li>
-                <li>Monte Carlo je zapnuté a risk-of-ruin je v přijatelné oblasti.</li>
-                <li>Execution model započítává spread, slippage i latenci.</li>
-                <li>Run má manifest fingerprinty (seed, data/code/env lineage) pro reprodukovatelnost.</li>
+                <li>Monte Carlo je zapnuté, risk-of-ruin je v přijatelné oblasti a víš, jestli běží IID nebo block bootstrap.</li>
+                <li>Execution model započítává spread, slippage i latenci; v Analytics zkontroluj cost attribution.</li>
+                <li>
+                  Run má v manifestu lineage včetně seedu — při potřebě přesné opakovatelnosti zapni fixní seed v Edge finding.
+                </li>
+                <li>Po sweepu nebo batch dávce nepřebírej jen nejlepší výsledek; uvědom si multiple testing.</li>
+                <li>V Analytics projdi oranžové overfitting varování a readiness / severity (heuristika).</li>
                 <li>Rozhodnutí o promote je podložené compare workspace + reviewer approval.</li>
                 <li>Výsledek drží stabilitu napříč více runy ve stejné branchi.</li>
               </ul>

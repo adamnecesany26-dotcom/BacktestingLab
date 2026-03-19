@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import type { SavedBacktestRun } from "@/lib/firestore";
+import { assessOverfitting, readinessFromSeverity } from "@/lib/overfittingSignals";
 
 interface RunHistoryProps {
   runs: SavedBacktestRun[];
@@ -30,7 +31,7 @@ function formatNum(n: number | undefined): string {
 
 function formatProfitFactor(n: number | undefined): string {
   if (n == null || Number.isNaN(n)) return "—";
-  if (n >= 999) return "No losses";
+  if (n >= 999) return "∞ / no losses";
   return n.toFixed(2);
 }
 
@@ -86,14 +87,33 @@ function getReadiness(run: SavedBacktestRun): "ready" | "caution" | "not_ready" 
     run.monteCarlo && typeof run.monteCarlo === "object"
       ? Number((run.monteCarlo as Record<string, unknown>).riskOfRuin ?? NaN)
       : NaN;
-  const warnings =
-    (validationMode === "single" ? 1 : 0) +
-    (tradeCount < 20 ? 1 : 0) +
-    (!Number.isFinite(riskOfRuin) ? 1 : 0) +
-    (qualityGatePassed === false ? 1 : 0);
-  if (warnings === 0) return "ready";
-  if (warnings <= 2) return "caution";
-  return "not_ready";
+  const validation = run.validation && typeof run.validation === "object" ? (run.validation as Record<string, unknown>) : null;
+  const summary = validation?.summary && typeof validation.summary === "object" ? (validation.summary as Record<string, unknown>) : null;
+  const guardrails =
+    validation?.guardrails && typeof validation.guardrails === "object"
+      ? (validation.guardrails as Record<string, unknown>)
+      : null;
+  const hints = Array.isArray(guardrails?.possibleLeakageHints)
+    ? (guardrails.possibleLeakageHints as unknown[])
+    : [];
+  const robustness = run.robustness && typeof run.robustness === "object" ? (run.robustness as Record<string, unknown>) : null;
+  const batchSummary =
+    run.batchSummary && typeof run.batchSummary === "object" ? (run.batchSummary as Record<string, unknown>) : null;
+  const pf = Number(run.metrics?.profitFactor ?? NaN);
+  const { severityScore } = assessOverfitting({
+    validationMode,
+    tradeCount,
+    riskOfRuin,
+    qualityGatePassed: typeof qualityGatePassed === "boolean" ? qualityGatePassed : null,
+    avgDegradation: Number(summary?.avgDegradation ?? 0),
+    foldsFailedGates: Number(summary?.foldsFailedGates ?? 0),
+    guardHintCount: hints.length,
+    sweepTested: Number(robustness?.tested ?? 0),
+    stabilityScore: Number(robustness?.stabilityScore ?? NaN),
+    batchRunCount: Number(batchSummary?.runCount ?? 0),
+    profitFactor: pf,
+  });
+  return readinessFromSeverity(severityScore);
 }
 
 function getBranchSeq(run: SavedBacktestRun): number | null {
@@ -474,7 +494,7 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll, onUpdateLifecycle }
                         <td key={`${r.id}_${String(m.key)}`} className="py-2 text-right text-zinc-300 font-mono">
                           {Number.isFinite(value)
                             ? m.key === "profitFactor" && value >= 999
-                              ? "No losses"
+                              ? "∞ / no losses"
                               : value.toFixed(2)
                             : "—"}
                           {Number.isFinite(delta) && baselineRun && baselineRun.id !== r.id ? (

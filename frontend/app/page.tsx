@@ -30,6 +30,7 @@ import {
   type ItemType,
   type FirestoreItem,
 } from "@/lib/firestore";
+import { ensureAnonymousSession } from "@/lib/firebase";
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
 import {
   parseStrategyParams,
@@ -127,6 +128,12 @@ export default function Home() {
     experimentTagsCsv: "manual-run",
     experimentBranch: "main",
     promoteOnPass: false,
+    runFixedSeedEnabled: false,
+    runFixedSeedValue: 42,
+    monteCarloMode: "iid_trade",
+    batchEnabled: false,
+    batchMaxRuns: 8,
+    batchItemsJson: '[{"instrument":"NQ","data_file":"mock/NQ_5Y.csv","timeframe":"1d"}]',
   });
   const [results, setResults] = useState<RunResponse | null>(null);
   const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
@@ -143,6 +150,27 @@ export default function Home() {
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
+
+  /** Firestore writes need auth; on localhost we try anonymous sign-in automatically. */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const r = await ensureAnonymousSession();
+      if (cancelled) return;
+      if ("user" in r) {
+        addLog(
+          r.user.isAnonymous
+            ? "Firebase: přihlášen anonymně (localhost nebo NEXT_PUBLIC_FIREBASE_ANONYMOUS_SIGNIN) — Run history se může ukládat."
+            : "Firebase: přihlášen — Run history se může ukládat."
+        );
+      } else {
+        addLog(`Firebase: nepodařilo se přihlásit — ${r.error} (Run history se bez toho neuloží).`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [addLog]);
 
   const loadItems = useCallback(async (type: ItemType) => {
     const list = await listItems(type);
@@ -631,6 +659,28 @@ export default function Home() {
           return;
         }
       }
+      let batchConfig: Record<string, unknown> | undefined = undefined;
+      if (edgeSettings.batchEnabled) {
+        if (edgeSettings.portfolioEnabled) {
+          addLog("Batch run nelze kombinovat s portfolio režimem — vypni jedno z nich.");
+          runLockRef.current = false;
+          return;
+        }
+        try {
+          const items = JSON.parse(edgeSettings.batchItemsJson) as unknown;
+          if (!Array.isArray(items) || items.length === 0) {
+            throw new Error("empty");
+          }
+          batchConfig = {
+            max_runs: Math.min(48, Math.max(1, edgeSettings.batchMaxRuns)),
+            items,
+          };
+        } catch {
+          addLog("Batch items JSON je neplatný. Očekává se pole objektů s poli jako instrument, data_file, …");
+          runLockRef.current = false;
+          return;
+        }
+      }
       const runRequest: RunRequest = {
         files: allFiles,
         instrument: selectedInstrument.instrument,
@@ -691,6 +741,7 @@ export default function Home() {
                 : undefined,
             }
           : undefined,
+        batch_config: batchConfig,
         experiment: {
           hypothesis: edgeSettings.experimentHypothesis || strategyContext.name,
           tags: edgeSettings.experimentTagsCsv
@@ -705,7 +756,15 @@ export default function Home() {
           parent_run_id: parentRunId,
           branch_seq: branchSeq,
           promote_on_pass: edgeSettings.promoteOnPass,
-          seed: Date.now() % 1_000_000_000,
+          seed: (() => {
+            if (edgeSettings.runFixedSeedEnabled) {
+              const v = Math.floor(Number(edgeSettings.runFixedSeedValue));
+              if (!Number.isFinite(v)) return 42;
+              const m = 1_000_000_000;
+              return ((v % m) + m) % m;
+            }
+            return Math.floor(Date.now() % 1_000_000_000);
+          })(),
           lifecycleStatus: "draft",
           reviewerApproved: false,
           approvalRequired: true,
@@ -797,6 +856,8 @@ export default function Home() {
       executionSummary: data.executionSummary ?? null,
       qualityGate: data.qualityGate ?? null,
       experiment: data.experiment ?? null,
+      batchSummary: data.batchSummary ?? null,
+      methodologyNotes: (data.manifest?.methodology as Record<string, string> | undefined) ?? null,
     };
   }
 
@@ -885,6 +946,7 @@ export default function Home() {
       onDeleteAllRuns={handleDeleteAllRuns}
       onUpdateLifecycle={handleUpdateRunLifecycle}
       strategyName={openItem?.name}
+      strategyMainPy={fileContent}
     />
   ) : (
     <div className="flex flex-col min-h-0 flex-1">

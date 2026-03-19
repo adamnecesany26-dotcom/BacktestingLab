@@ -171,7 +171,9 @@ export async function getViewData(
   years: number,
   moduleCode?: string | null,
   params?: Record<string, number | boolean | string> | null,
-  moduleDependencies?: Record<string, string> | null
+  moduleDependencies?: Record<string, string> | null,
+  /** native = source bar size; else backend resamples OHLC (1m…1Mo) before module + chart */
+  chartTimeframe?: string | null
 ): Promise<{
   ohlc: OhlcBar[];
   markers: { date: string; type: string; value: number }[];
@@ -188,6 +190,8 @@ export async function getViewData(
       module_code: moduleCode || null,
       params: params || null,
       module_dependencies: moduleDependencies || null,
+      chart_timeframe:
+        chartTimeframe && chartTimeframe !== "native" ? chartTimeframe : null,
     }),
   });
   if (!res.ok) {

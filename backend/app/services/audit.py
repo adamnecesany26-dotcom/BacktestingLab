@@ -1,5 +1,11 @@
 """
 Append-only audit event logger.
+
+Common `action` values (convention):
+- run.request / run.complete / run.stream — single backtest lifecycle
+- run.batch — parameter matrix / batch runs (details: plannedRuns, completedRuns)
+- governance.change — (optional) server-side governance mutations
+- export.bundle — (optional) reproducibility bundle downloads via API proxy
 """
 
 from __future__ import annotations

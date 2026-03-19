@@ -2,6 +2,15 @@
 
 Přehled všech důležitých příkazů, jak spustit aplikaci, co dělat při problémech a tipy pro vývoj.
 
+## Dokumentace (související soubory v kořeni)
+
+| Soubor | K čemu |
+|--------|--------|
+| **README.md** | Architektura, API, Firestore, výsledkové záložky, limity. |
+| **READMEADAM.md** | Co kde v UI najdeš; Edge finding; exporty; nápověda v aplikaci. |
+| **READMEAI.md** | Pro vývoj: kde v kódu měnit chování, kontrakty request/response. |
+| **SCRIPTS.md** (tento soubor) | Jen příkazy a běh lokálně. |
+
 ---
 
 ## Prerekvizity
@@ -274,8 +283,9 @@ pip install -r requirements.txt
 
 ### Export nefunguje
 
-- Export je aktivní jen když máš výsledky (po úspěšném Run)
-- Klikni pravým na „Export“ a zkontroluj, že se stahuje JSON
+- **Export JSON** a **Repro bundle (ZIP)** jsou aktivní jen po úspěšném Run (záložky výsledků)
+- JSON: stáhne celý RunResponse; ZIP: manifest + souhrn + snapshot `main.py` z editoru (vyžaduje balíček `fflate` — `npm install` ve `frontend/`)
+- Co které tlačítko dělá: **[READMEADAM.md](READMEADAM.md)** → sekce Výsledky
 
 ---
 
@@ -308,3 +318,11 @@ cd frontend && npm run dev
 - [ ] Vytvořena alespoň jedna strategie
 - [ ] V strategii existuje `main.py` s třídou dědící z `bt.Strategy`
 - [ ] Data `data/mock/NQ_5Y.csv` existují
+
+---
+
+## Další čtení
+
+- **[READMEADAM.md](READMEADAM.md)** — co všechno aplikace umí v UI (Edge finding, validace, exporty).
+- **[README.md](README.md)** — API, Docker, Firestore, struktura projektu.
+- **[READMEAI.md](READMEAI.md)** — kde v kódu hledat změny.

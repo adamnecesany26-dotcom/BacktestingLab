@@ -1,6 +1,8 @@
 "use client";
 
+import { useState } from "react";
 import type { RunResponse } from "@shared/types";
+import { assessOverfitting } from "@/lib/overfittingSignals";
 
 interface AnalyticsViewProps {
   results: RunResponse;
@@ -13,11 +15,12 @@ function pct(part: number, total: number): number {
 
 function formatProfitFactor(value: number | undefined): string {
   if (value == null || Number.isNaN(value)) return "N/A";
-  if (value >= 999) return "No losing trades in sample";
+  if (value >= 999) return "∞ / no losses";
   return value.toFixed(2);
 }
 
 export function AnalyticsView({ results }: AnalyticsViewProps) {
+  const [foldOpen, setFoldOpen] = useState<string | null>(null);
   const trades = results.trades ?? [];
   const wins = trades.filter((t) => (t.pnl ?? 0) > 0);
   const losses = trades.filter((t) => (t.pnl ?? 0) < 0);
@@ -111,19 +114,53 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
   const validationMode = String(results.validation?.mode ?? "single");
   const riskOfRuin = Number(monteCarlo?.riskOfRuin ?? NaN);
   const monteCarloMethod = String(monteCarlo?.method ?? "n/a");
+  const monteCarloMode = String(monteCarlo?.mode ?? "n/a");
   const monteCarloNote =
     typeof monteCarlo?.note === "string" && monteCarlo.note.trim() ? monteCarlo.note.trim() : null;
-  const overfittingFlags: string[] = [];
-  if (validationMode === "single") overfittingFlags.push("Pouze single run (bez OOS/WF).");
-  if (tradeCount < 20) overfittingFlags.push(`Nízký počet obchodů (${tradeCount}).`);
-  if (!Number.isFinite(riskOfRuin)) overfittingFlags.push("Chybí Monte Carlo risk-of-ruin odhad.");
-  if (qualityGate && qualityGate.passed === false) overfittingFlags.push("Quality gate je FAIL.");
-  const readinessLabel =
-    overfittingFlags.length === 0
-      ? "Heuristic signal: eligible for controlled forward test"
-      : overfittingFlags.length <= 2
-        ? "Heuristic signal: promising, but still needs more validation"
-        : "Heuristic signal: not ready for trust";
+  const costAttr =
+    execution?.costAttribution && typeof execution.costAttribution === "object"
+      ? (execution.costAttribution as Record<string, unknown>)
+      : null;
+  const defs =
+    costAttr?.definitions && typeof costAttr.definitions === "object"
+      ? (costAttr.definitions as Record<string, string>)
+      : null;
+  const foldsRaw = Array.isArray(results.validation?.folds) ? (results.validation?.folds as Record<string, unknown>[]) : [];
+  const guardrails =
+    results.validation?.guardrails && typeof results.validation.guardrails === "object"
+      ? (results.validation.guardrails as Record<string, unknown>)
+      : null;
+  const guardHints = Array.isArray(guardrails?.possibleLeakageHints)
+    ? (guardrails.possibleLeakageHints as string[])
+    : [];
+  const batchSummary =
+    results.batchSummary && typeof results.batchSummary === "object"
+      ? (results.batchSummary as Record<string, unknown>)
+      : null;
+  const sweepTested = Number(robustness?.tested ?? 0);
+  const stabilityScore = Number(robustness?.stabilityScore ?? NaN);
+  const avgDegradation = Number(validationSummary?.avgDegradation ?? 0);
+  const foldsFailedGates = Number(validationSummary?.foldsFailedGates ?? 0);
+  const batchRunCount = Number(batchSummary?.runCount ?? 0);
+  const profitFactorMetric = Number(results.metrics?.profitFactor ?? NaN);
+  const qualityGatePassed =
+    qualityGate && typeof qualityGate.passed === "boolean" ? (qualityGate.passed as boolean) : undefined;
+
+  const overfittingAssessment = assessOverfitting({
+    validationMode,
+    tradeCount,
+    riskOfRuin,
+    qualityGatePassed: qualityGatePassed ?? null,
+    avgDegradation,
+    foldsFailedGates,
+    guardHintCount: guardHints.length,
+    sweepTested,
+    stabilityScore,
+    batchRunCount,
+    profitFactor: profitFactorMetric,
+  });
+  const overfittingFlags = overfittingAssessment.warnings;
+  const readinessLabel = overfittingAssessment.readinessLabel;
 
   return (
     <div className="py-4 space-y-4">
@@ -132,7 +169,8 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
         <div className="text-sm text-zinc-200">{readinessLabel}</div>
         <div className="text-xs text-zinc-400 mt-1">
           Validation: {validationMode} | Trades: {tradeCount} | Risk of ruin:{" "}
-          {Number.isFinite(riskOfRuin) ? riskOfRuin.toFixed(4) : "N/A"}
+          {Number.isFinite(riskOfRuin) ? riskOfRuin.toFixed(4) : "N/A"} | Severity score:{" "}
+          {overfittingAssessment.severityScore} (heuristika, ne p-value)
         </div>
       </div>
 
@@ -204,6 +242,7 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
             </div>
             <div>MC simulations: {String(monteCarlo?.simulations ?? 0)}</div>
             <div>MC method: {monteCarloMethod}</div>
+            <div>MC mode: {monteCarloMode}</div>
             <div>Risk of ruin estimate: {String(monteCarlo?.riskOfRuin ?? 0)}</div>
             {monteCarloNote && <div className="text-xs text-zinc-500 pt-1">{monteCarloNote}</div>}
           </div>
@@ -231,14 +270,14 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
             </div>
           </div>
         </div>
-        <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
-          <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">Execution model</div>
+        <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3 md:col-span-2">
+          <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">Execution model &amp; costs</div>
           <div className="space-y-1 text-sm text-zinc-300">
             <div>Enabled: {String(execution?.enabled ?? false)}</div>
             <div>Spread bps: {String(execution?.spreadBps ?? 0)}</div>
             <div>Latency bars: {String(execution?.latencyBars ?? 0)}</div>
-            <div>Total fees: {String(execution?.totalFees ?? 0)}</div>
-            <div>Total slippage cost: {String(execution?.totalSlippageCost ?? 0)}</div>
+            <div>Total fees: {String(execution?.totalFees ?? costAttr?.totalFees ?? 0)}</div>
+            <div>Total slippage cost: {String(execution?.totalSlippageCost ?? costAttr?.totalSlippageCost ?? 0)}</div>
             <div>Avg holding min: {String(execution?.avgHoldingMinutes ?? 0)}</div>
             <div>
               Forward bridge:{" "}
@@ -254,8 +293,120 @@ export function AnalyticsView({ results }: AnalyticsViewProps) {
               </div>
             )}
           </div>
+          {costAttr && (
+            <div className="mt-3 pt-3 border-t border-zinc-700/50 space-y-1 text-xs text-zinc-400">
+              <div className="text-zinc-500 uppercase tracking-wider mb-1">Cost attribution</div>
+              <div>Total execution costs: {String(costAttr.totalExecutionCosts ?? "—")}</div>
+              <div>Costs / net return ratio: {String(costAttr.executionCostsToNetReturnRatio ?? "—")}</div>
+              <div>Costs / Σ|trade PnL| ratio: {String(costAttr.executionCostsToGrossAbsPnlRatio ?? "—")}</div>
+              <div>Avg fee / trade: {String(costAttr.avgFeePerTrade ?? "—")}</div>
+              <div>Avg slippage / trade: {String(costAttr.avgSlippagePerTrade ?? "—")}</div>
+              {defs && (
+                <ul className="list-disc pl-4 mt-2 text-zinc-500 space-y-0.5">
+                  {Object.entries(defs).map(([k, v]) => (
+                    <li key={k}>
+                      <span className="text-zinc-400">{k}:</span> {v}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
       </div>
+
+      {batchSummary && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+          <div className="text-xs uppercase tracking-wider text-amber-200 mb-2">Batch / matrix run</div>
+          <div className="text-sm text-amber-100 mb-2">{String(batchSummary.multipleTestingWarning ?? "")}</div>
+          <div className="text-xs text-zinc-400 mb-2">
+            Batch ID: {String(batchSummary.batchId ?? "—")} | Runs: {String(batchSummary.runCount ?? 0)}
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left">
+              <thead>
+                <tr className="border-b border-zinc-700 text-zinc-500">
+                  <th className="py-1 pr-2">runId</th>
+                  <th className="py-1 pr-2">Inst</th>
+                  <th className="py-1 pr-2">TF</th>
+                  <th className="py-1 pr-2 text-right">Ret $</th>
+                  <th className="py-1 pr-2 text-right">PF</th>
+                  <th className="py-1 pr-2 text-right">Trades</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(Array.isArray(batchSummary.runs) ? batchSummary.runs : []).map((row, idx) => {
+                  const r = row as Record<string, unknown>;
+                  return (
+                    <tr key={idx} className="border-b border-zinc-800/80 text-zinc-300">
+                      <td className="py-1 pr-2 font-mono truncate max-w-[120px]">{String(r.runId ?? "")}</td>
+                      <td className="py-1 pr-2">{String(r.instrument ?? "")}</td>
+                      <td className="py-1 pr-2">{String(r.timeframe ?? "")}</td>
+                      <td className="py-1 pr-2 text-right">{String(r.totalReturnUsd ?? "")}</td>
+                      <td className="py-1 pr-2 text-right">{formatProfitFactor(Number(r.profitFactor))}</td>
+                      <td className="py-1 pr-2 text-right">{String(r.tradeCount ?? "")}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {foldsRaw.length > 0 && (
+        <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
+          <div className="text-xs uppercase tracking-wider text-zinc-500 mb-2">Walk-forward / OOS folds</div>
+          {guardHints.length > 0 && (
+            <div className="mb-3 rounded border border-amber-500/20 bg-amber-500/5 p-2 text-xs text-amber-100">
+              <div className="text-amber-200 font-medium mb-1">Guardrails (heuristic)</div>
+              <ul className="list-disc pl-4 space-y-0.5">
+                {guardHints.map((h, i) => (
+                  <li key={i}>{h}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <div className="space-y-2">
+            {foldsRaw.map((f) => {
+              const id = String(f.id ?? "");
+              const open = foldOpen === id;
+              const tm = f.testMetrics && typeof f.testMetrics === "object" ? (f.testMetrics as Record<string, unknown>) : {};
+              return (
+                <div key={id} className="border border-zinc-700/40 rounded-md overflow-hidden">
+                  <button
+                    type="button"
+                    className="w-full text-left px-3 py-2 text-sm bg-zinc-800/50 hover:bg-zinc-800 flex justify-between gap-2"
+                    onClick={() => setFoldOpen(open ? null : id)}
+                  >
+                    <span className="font-mono text-zinc-200">{id}</span>
+                    <span className="text-zinc-500 text-xs">
+                      test {String(f.testStart ?? "")} → {String(f.testEnd ?? "")} | trades {String(tm.tradeCount ?? "—")}
+                    </span>
+                  </button>
+                  {open && (
+                    <div className="px-3 py-2 text-xs text-zinc-400 space-y-1 border-t border-zinc-700/40">
+                      <div>
+                        Train: {String(f.trainStart ?? "")} — {String(f.trainEnd ?? "")} ({String(f.trainBarCount ?? "")} bars)
+                      </div>
+                      <div>
+                        Test: {String(f.testStart ?? "")} — {String(f.testEnd ?? "")} ({String(f.testBarCount ?? "")} bars)
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 mt-2 text-zinc-300">
+                        <div>Test return $: {String(tm.totalReturnUsd ?? "—")}</div>
+                        <div>PF: {formatProfitFactor(Number(tm.profitFactor))}</div>
+                        <div>Sharpe: {String(tm.sharpeRatio ?? "—")}</div>
+                        <div>Max DD %: {String(tm.maxDrawdownPct ?? "—")}</div>
+                        <div>Win %: {String(tm.winRate ?? "—")}</div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {heatmap && (
         <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">

@@ -16,7 +16,7 @@ import {
   serverTimestamp,
   type CollectionReference,
 } from "firebase/firestore";
-import { getFirebaseApp, getFirebaseAuth } from "./firebase";
+import { getFirebaseApp, getFirebaseAuth, ensureAnonymousSession } from "./firebase";
 
 export type ItemType = "strategies" | "indicators" | "modules";
 
@@ -228,13 +228,21 @@ function getCollection(type: ItemType): CollectionReference {
 }
 
 async function getActorUid(): Promise<string> {
-  try {
-    const auth = getFirebaseAuth();
-    if (auth.currentUser?.uid) return auth.currentUser.uid;
-  } catch {
-    // no-op
+  const auth = getFirebaseAuth();
+  if (auth.currentUser?.uid) return auth.currentUser.uid;
+
+  const session = await ensureAnonymousSession();
+  if ("user" in session && session.user?.uid) {
+    return session.user.uid;
   }
-  throw new Error("Authentication required. Please sign in before data operations.");
+
+  const detail = "error" in session ? session.error : "unknown";
+  throw new Error(
+    "Authentication required — výsledek runu se neuloží do Run history. " +
+      `Detail: ${detail}. ` +
+      "V Firebase Console zapni Authentication → Sign-in method → Anonymous. " +
+      "Na http://localhost:3000 se anonymní přihlášení zkouší samo; jinde přidej NEXT_PUBLIC_FIREBASE_ANONYMOUS_SIGNIN=1 do frontend/.env.local a restartuj npm run dev."
+  );
 }
 
 export async function listItems(type: ItemType): Promise<FirestoreItem[]> {
@@ -368,6 +376,8 @@ export interface SavedBacktestRun {
   executionSummary?: Record<string, unknown> | null;
   qualityGate?: Record<string, unknown> | null;
   experiment?: Record<string, unknown> | null;
+  batchSummary?: Record<string, unknown> | null;
+  methodologyNotes?: Record<string, string> | null;
   deletedAt?: { seconds?: number; nanoseconds?: number } | null;
   deletedBy?: string | null;
   deleteReason?: string | null;
@@ -466,6 +476,17 @@ function flattenExperimentPatch(
   return out;
 }
 
+/** Only these keys may be written into `experiment.*` from the client (defense in depth). */
+const GOVERNANCE_EXPERIMENT_ALLOWLIST = new Set([
+  "lifecycleStatus",
+  "reviewerApproved",
+  "reviewerNote",
+  "reviewNotes",
+  "promoteDecision",
+  "compareGroupId",
+  "compare_group_id",
+]);
+
 export async function updateBacktestRunGovernance(
   strategyId: string,
   resultId: string,
@@ -473,7 +494,10 @@ export async function updateBacktestRunGovernance(
 ): Promise<void> {
   const actorUid = await getActorUid();
   const ref = doc(getDb(), "strategies", strategyId, "results", resultId);
-  const flattenedPatch = flattenExperimentPatch(governancePatch);
+  const filtered = Object.fromEntries(
+    Object.entries(governancePatch).filter(([k]) => GOVERNANCE_EXPERIMENT_ALLOWLIST.has(k))
+  );
+  const flattenedPatch = flattenExperimentPatch(filtered);
   await updateDoc(ref, {
     ...flattenedPatch,
     governanceUpdatedAt: serverTimestamp(),

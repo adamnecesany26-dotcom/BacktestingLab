@@ -1,10 +1,19 @@
 "use client";
 
-import { useState } from "react";
-import { EquityChart } from "@/components/charts/EquityChart";
+import dynamic from "next/dynamic";
+import { useCallback, useState } from "react";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
-import { TradeHighlight } from "@/components/results/TradeHighlight";
 import { RunHistory } from "@/components/results/RunHistory";
+
+/** Client-only + stable chunk loading (avoids dev ChunkLoadError on lightweight-charts async splits). */
+const EquityChart = dynamic(
+  () => import("@/components/charts/EquityChart").then((m) => ({ default: m.EquityChart })),
+  { ssr: false, loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf equity…</div> }
+);
+const TradeHighlight = dynamic(
+  () => import("@/components/results/TradeHighlight").then((m) => ({ default: m.TradeHighlight })),
+  { ssr: false, loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf…</div> }
+);
 import { StatBlocks } from "@/components/results/StatBlocks";
 import { AnalyticsView } from "@/components/results/AnalyticsView";
 import type { RunResponse } from "@shared/types";
@@ -22,6 +31,8 @@ interface ResultsViewProps {
   onDeleteAllRuns: () => void;
   onUpdateLifecycle: (runDocId: string, patch: Record<string, unknown>) => Promise<void>;
   strategyName?: string;
+  /** Current editor snapshot of main.py (or best-effort) for reproducibility bundle */
+  strategyMainPy?: string;
 }
 
 export function ResultsView({
@@ -34,8 +45,66 @@ export function ResultsView({
   onDeleteAllRuns,
   onUpdateLifecycle,
   strategyName,
+  strategyMainPy = "",
 }: ResultsViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>("equity");
+  const [bundleBusy, setBundleBusy] = useState(false);
+
+  const handleReproBundle = useCallback(async () => {
+    if (!results) return;
+    setBundleBusy(true);
+    try {
+      const { zipSync, strToU8 } = await import("fflate");
+      const manifest = results.manifest ?? {};
+      const fp = String((manifest as Record<string, unknown>).datasetFingerprint ?? "n/a");
+      const readme = [
+        "Backtesting reproducibility bundle",
+        "",
+        "Limits:",
+        "- strategy_main.py is the editor snapshot at export (may differ from Firestore if unsaved).",
+        "- Engine/Docker image and data files must match the original run environment.",
+        "",
+        `datasetFingerprint (manifest): ${fp}`,
+      ].join("\n");
+      const zipped = zipSync({
+        "README_bundle.txt": strToU8(readme),
+        "manifest.json": strToU8(JSON.stringify(manifest, null, 2)),
+        "results_summary.json": strToU8(
+          JSON.stringify(
+            {
+              runId: results.runId,
+              metrics: results.metrics,
+              validation: results.validation,
+              monteCarlo: results.monteCarlo,
+              executionSummary: results.executionSummary,
+              batchSummary: results.batchSummary,
+              qualityGate: results.qualityGate,
+              experiment: results.experiment,
+            },
+            null,
+            2
+          )
+        ),
+        "strategy_main.py": strToU8(
+          strategyMainPy.trim()
+            ? strategyMainPy
+            : "# No editor content passed — open main.py and export again.\n"
+        ),
+      });
+      const blob = new Blob([new Uint8Array(zipped)], { type: "application/zip" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `repro-bundle-${(results.runId ?? "run").toString().slice(0, 24)}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error(e);
+      alert("ZIP export selhal (chybí balíček fflate?). Spusť npm install ve frontend/. ");
+    } finally {
+      setBundleBusy(false);
+    }
+  }, [results, strategyMainPy]);
 
   if (!results) {
     return (
@@ -78,12 +147,22 @@ export function ResultsView({
         >
           ← Zpět na editor
         </button>
-        <button
-          onClick={onExport}
-          className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 font-medium text-sm"
-        >
-          Export
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={onExport}
+            className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 font-medium text-sm"
+          >
+            Export JSON
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleReproBundle()}
+            disabled={bundleBusy}
+            className="px-4 py-2 rounded-lg bg-emerald-800/60 hover:bg-emerald-700/70 font-medium text-sm disabled:opacity-50"
+          >
+            {bundleBusy ? "…" : "Repro bundle (ZIP)"}
+          </button>
+        </div>
       </div>
 
       <div className="flex gap-1 px-6 shrink-0">
