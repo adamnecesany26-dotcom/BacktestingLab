@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { RunHistory } from "@/components/results/RunHistory";
 
@@ -15,11 +15,18 @@ const TradeHighlight = dynamic(
   { ssr: false, loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf…</div> }
 );
 import { StatBlocks } from "@/components/results/StatBlocks";
+import { QualityGateBanner } from "@/components/results/QualityGateBanner";
 import { AnalyticsView } from "@/components/results/AnalyticsView";
-import type { RunResponse } from "@shared/types";
+import { RunModuleViewChart } from "@/components/results/RunModuleViewChart";
+import type { ModuleOutput, RunResponse } from "@shared/types";
+import {
+  computeDetailedChartWindow,
+  filterModuleOutputToOhlcWindow,
+  type DetailedViewMode,
+} from "@/lib/detailedTradesWindow";
 import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "highlight" | "detailed" | "analytics" | "runHistory";
+type TabId = "equity" | "highlight" | "detailed" | "runView" | "analytics" | "runHistory";
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -49,6 +56,44 @@ export function ResultsView({
 }: ResultsViewProps) {
   const [activeTab, setActiveTab] = useState<TabId>("equity");
   const [bundleBusy, setBundleBusy] = useState(false);
+  const [detailedMode, setDetailedMode] = useState<DetailedViewMode>("by_trades");
+  const [detailedPage, setDetailedPage] = useState(0);
+  const [tradesPerView, setTradesPerView] = useState(15);
+  const [monthsPerView, setMonthsPerView] = useState(3);
+
+  useEffect(() => {
+    setDetailedPage(0);
+  }, [detailedMode, tradesPerView, monthsPerView]);
+
+  const mergedOutput: ModuleOutput = useMemo(() => {
+    if (!results) return { markers: [], lines: [], zones: [] };
+    const hasModuleOutputs = !!results.moduleOutputs && Object.keys(results.moduleOutputs).length > 0;
+    if (!hasModuleOutputs) return { markers: [], lines: [], zones: [] };
+    return {
+      markers: Object.values(results.moduleOutputs!).flatMap((o) => o.markers ?? []),
+      lines: Object.entries(results.moduleOutputs!).flatMap(([mod, o]) =>
+        (o.lines ?? []).map((l) => ({ ...l, name: `${mod}: ${l.name ?? "line"}` }))
+      ),
+      zones: Object.values(results.moduleOutputs!).flatMap((o) => o.zones ?? []),
+    };
+  }, [results]);
+
+  const detailedWindow = useMemo(() => {
+    if (!results?.ohlc?.length) return null;
+    return computeDetailedChartWindow(
+      results.ohlc,
+      results.trades ?? [],
+      detailedMode,
+      detailedPage,
+      tradesPerView,
+      monthsPerView
+    );
+  }, [results, detailedMode, detailedPage, tradesPerView, monthsPerView]);
+
+  const detailedChartOutput = useMemo(() => {
+    if (!detailedWindow?.windowOhlc.length) return mergedOutput;
+    return filterModuleOutputToOhlcWindow(mergedOutput, detailedWindow.windowOhlc);
+  }, [mergedOutput, detailedWindow]);
 
   const handleReproBundle = useCallback(async () => {
     if (!results) return;
@@ -119,21 +164,11 @@ export function ResultsView({
     );
   }
 
-  const hasModuleOutputs = !!results.moduleOutputs && Object.keys(results.moduleOutputs).length > 0;
-  const mergedOutput = hasModuleOutputs
-    ? {
-        markers: Object.values(results.moduleOutputs!).flatMap((o) => o.markers ?? []),
-        lines: Object.entries(results.moduleOutputs!).flatMap(([mod, o]) =>
-          (o.lines ?? []).map((l) => ({ ...l, name: `${mod}: ${l.name ?? "line"}` }))
-        ),
-        zones: Object.values(results.moduleOutputs!).flatMap((o) => o.zones ?? []),
-      }
-    : { markers: [] as any[], lines: [] as any[], zones: [] as any[] };
-
   const tabs: { id: TabId; label: string }[] = [
     { id: "equity", label: "Equity" },
     { id: "highlight", label: "Highlight" },
     { id: "detailed", label: "Detailed" },
+    { id: "runView", label: "Run view" },
     { id: "analytics", label: "Analytics" },
     { id: "runHistory", label: "Run history" },
   ];
@@ -181,13 +216,23 @@ export function ResultsView({
         ))}
       </div>
 
+      {results.qualityGate != null && (
+        <div className="px-6 pt-3 shrink-0">
+          <QualityGateBanner qualityGate={results.qualityGate} />
+        </div>
+      )}
+
       <div className="px-6 pt-3 pb-2 shrink-0 border-b border-zinc-800">
         <StatBlocks results={results} />
       </div>
 
       <div
         className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
-          activeTab === "highlight" || activeTab === "detailed" || activeTab === "runHistory" || activeTab === "analytics"
+          activeTab === "highlight" ||
+            activeTab === "detailed" ||
+            activeTab === "runView" ||
+            activeTab === "runHistory" ||
+            activeTab === "analytics"
             ? "min-h-[560px]"
             : "min-h-[480px]"
         }`}
@@ -215,15 +260,71 @@ export function ResultsView({
           <TradeHighlight ohlc={results.ohlc ?? []} trades={results.trades} chartHeight={360} />
         )}
         {activeTab === "detailed" &&
-          (results.ohlc ? (
+          (results.ohlc && detailedWindow ? (
             <div className="py-4 h-full overflow-auto">
-              <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
+              <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4 space-y-3">
+                <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+                  <span className="text-zinc-500 shrink-0">Výřez:</span>
+                  <select
+                    value={detailedMode}
+                    onChange={(e) => setDetailedMode(e.target.value as DetailedViewMode)}
+                    className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200"
+                  >
+                    <option value="by_trades">Počet obchodů</option>
+                    <option value="by_months">Období (měsíce)</option>
+                  </select>
+                  {detailedMode === "by_trades" ? (
+                    <label className="flex items-center gap-1.5">
+                      <span className="text-zinc-500">Najednou</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={tradesPerView}
+                        onChange={(e) => setTradesPerView(Math.min(100, Math.max(1, Number(e.target.value) || 15)))}
+                        className="w-16 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-zinc-200"
+                      />
+                    </label>
+                  ) : (
+                    <label className="flex items-center gap-1.5">
+                      <span className="text-zinc-500">Měsíců</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={36}
+                        value={monthsPerView}
+                        onChange={(e) => setMonthsPerView(Math.min(36, Math.max(1, Number(e.target.value) || 3)))}
+                        className="w-16 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-zinc-200"
+                      />
+                    </label>
+                  )}
+                  <div className="flex gap-1 ml-auto">
+                    <button
+                      type="button"
+                      disabled={!detailedWindow.hasPrev}
+                      onClick={() => setDetailedPage((p) => Math.max(0, p - 1))}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-40 disabled:pointer-events-none"
+                    >
+                      ← Předchozí
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!detailedWindow.hasNext}
+                      onClick={() => setDetailedPage((p) => p + 1)}
+                      className="px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-40 disabled:pointer-events-none"
+                    >
+                      Další →
+                    </button>
+                  </div>
+                </div>
+                <p className="text-xs text-zinc-500">{detailedWindow.summary}</p>
                 <ModuleOutputChart
-                  ohlc={results.ohlc}
+                  ohlc={detailedWindow.windowOhlc}
                   moduleName="Detailed"
-                  output={mergedOutput}
-                  trades={results.trades}
+                  output={detailedChartOutput}
+                  trades={detailedWindow.visibleTrades}
                   height={520}
+                  rrrTradeStyle
                 />
               </div>
             </div>
@@ -232,6 +333,13 @@ export function ResultsView({
               Detailed view není dostupný, protože run nevrátil OHLC data.
             </div>
           ))}
+        {activeTab === "runView" && (
+          <div className="py-4 h-full overflow-auto">
+            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
+              <RunModuleViewChart results={results} height={540} />
+            </div>
+          </div>
+        )}
         {activeTab === "runHistory" && (
           <div className="py-4 h-full overflow-auto">
             <RunHistory

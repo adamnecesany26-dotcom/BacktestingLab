@@ -1,5 +1,17 @@
 # Premium / Mid / Discount indikátor
 
+## Rychlý přehled
+
+**K čemu to je:** Rozdělí graf na tři **vodorovné pásy** – levná spodní část (**Discount**), střed (**Mid**), drahá horní část (**Premium**) podle posledního **major swing low** a **high**.
+
+**Závislost:** Modul **Swing HL** (major swingy).
+
+**Soubor ke kopírování:** `examples/premium_discount.py` → v aplikaci jako **indikátor** (sekce Indikátory), ne modul.
+
+**Ve View:** Uvidíš tři zóny od okamžiku, kdy je range jasný, až do konce dat.
+
+---
+
 Indikátor určuje, zda je cena v **Premium**, **Mid range** nebo **Discount** na základě posledního Major Swing Low a Major Swing High.
 
 ## Logika

@@ -32,8 +32,67 @@ export function instrumentTimeframeToMinutes(tf: string | undefined | null): num
 }
 
 /**
- * Options for select: always "Původní (native)" then ladder rungs strictly coarser than native.
+ * Po agregaci svíček ve View musí `data_timeframe` odpovídat **skutečnému** rozestupu OHLC v requestu,
+ * ne rozlišení souboru — jinak Swing HL předpokládá jemnější bary než dostane a může vrátit prázdné swingy.
  */
+export function effectiveViewDataTimeframe(
+  chartTimeframe: string,
+  instrumentTimeframe: string | undefined | null
+): string {
+  const native = (instrumentTimeframe ?? "").trim() || "1d";
+  if (!chartTimeframe || chartTimeframe === "native") return native;
+  const id = chartTimeframe.trim();
+  if (id === "1D") return "1d";
+  if (id === "1W") return "1w";
+  if (id === "1Mo") return "1M";
+  return id.toLowerCase();
+}
+
+const TRADING_DAYS_PER_YEAR = 252;
+const MINUTES_PER_DAY = 1440;
+
+/**
+ * Počet svíček pro Shuffle okno — odpovídá výběru „Období“ (years) a TF grafu.
+ * Dřív: min(126, 20% řady) → u kratších serií ~20 barů (1–2 měsíce na 1D) a nesoulad s 6M.
+ */
+export function shuffleWindowBarCount(
+  fullLen: number,
+  yearsSelected: number,
+  chartTimeframe: string,
+  nativeTf?: string | null
+): number {
+  if (fullLen < 2) return fullLen;
+  if (yearsSelected <= 0) {
+    const quarter = Math.max(200, Math.floor(fullLen * 0.25));
+    return Math.min(fullLen, quarter);
+  }
+
+  let chartMinutes: number;
+  if (!chartTimeframe || chartTimeframe === "native") {
+    chartMinutes = instrumentTimeframeToMinutes(nativeTf);
+  } else {
+    const rung = VIEW_CHART_TF_LADDER.find((x) => x.id === chartTimeframe);
+    chartMinutes = rung?.minutes ?? MINUTES_PER_DAY;
+  }
+
+  let barsPerYear: number;
+  if (chartMinutes >= 40000) {
+    barsPerYear = 12;
+  } else if (chartMinutes >= 8000) {
+    barsPerYear = 52;
+  } else if (chartMinutes >= MINUTES_PER_DAY - 60) {
+    barsPerYear = TRADING_DAYS_PER_YEAR;
+  } else {
+    barsPerYear = Math.max(
+      TRADING_DAYS_PER_YEAR,
+      Math.round((TRADING_DAYS_PER_YEAR * MINUTES_PER_DAY) / chartMinutes)
+    );
+  }
+
+  const want = Math.ceil(yearsSelected * barsPerYear);
+  return Math.min(fullLen, Math.max(20, want));
+}
+
 export function buildViewChartTimeframeOptions(nativeTf: string | undefined | null): { value: string; label: string }[] {
   const nativeMin = instrumentTimeframeToMinutes(nativeTf);
   const nativeLabel = (nativeTf ?? "data").trim() || "data";

@@ -110,6 +110,7 @@ class Trade(BaseModel):
     holdingMinutes: Optional[float] = None
     entryReason: Optional[str] = None
     exitReason: Optional[str] = None
+    zoneMeta: Optional[dict[str, Any]] = None
 
 
 class EquityPoint(BaseModel):

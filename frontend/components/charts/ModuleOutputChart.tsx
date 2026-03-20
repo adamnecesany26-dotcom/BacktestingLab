@@ -1,11 +1,15 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { OhlcBar, ModuleOutput, Trade } from "@shared/types";
+import { isViewRegimeHistogramLine } from "@/lib/api";
+import type { OhlcBar, ModuleOutput, ModuleZone, Trade } from "@shared/types";
 
 type VisibilityKey =
   | "entry_markers"
   | "exit_markers"
+  | "trade_rrr_body"
+  | "trade_mfe"
+  | "trade_mae"
   | "swing_hl"
   | "internal_hl"
   | "major_hl"
@@ -19,6 +23,9 @@ type VisibilityKey =
 const DEFAULT_VISIBILITY: Record<VisibilityKey, boolean> = {
   entry_markers: true,
   exit_markers: true,
+  trade_rrr_body: true,
+  trade_mfe: true,
+  trade_mae: true,
   swing_hl: true,
   internal_hl: true,
   major_hl: true,
@@ -51,12 +58,121 @@ function findBarDate(ohlc: OhlcBar[], tradeDate: string): string | null {
   return null;
 }
 
+/** Nejbližší bar podle času (intraday) – stejná idea jako Trade Highlight. */
+function findNearestBarDate(ohlc: OhlcBar[], tradeDate: string): string | null {
+  if (!ohlc.length || !tradeDate.trim()) return findBarDate(ohlc, tradeDate);
+  const target = Date.parse(tradeDate);
+  if (!Number.isFinite(target)) return findBarDate(ohlc, tradeDate);
+  let best: string | null = null;
+  let bestDiff = Infinity;
+  for (const bar of ohlc) {
+    const t = Date.parse(bar.date);
+    if (!Number.isFinite(t)) continue;
+    const d = Math.abs(t - target);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = bar.date;
+    }
+  }
+  return best ?? findBarDate(ohlc, tradeDate);
+}
+
+function hexToRgba(hex: string, alpha: number): string {
+  const m = hex.replace("#", "").trim();
+  if (m.length !== 6 || !/^[0-9a-fA-F]+$/.test(m)) return hex;
+  const r = parseInt(m.slice(0, 2), 16);
+  const g = parseInt(m.slice(2, 4), 16);
+  const b = parseInt(m.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function resolveInducementBarIndex(
+  ohlc: OhlcBar[],
+  ind: { date?: string; index?: number }
+): number {
+  const raw = ind.index;
+  if (typeof raw === "number" && !Number.isNaN(raw)) {
+    return Math.max(0, Math.min(Math.floor(raw), ohlc.length - 1));
+  }
+  const d = (ind.date ?? "").trim();
+  if (!d) return -1;
+  const barDate = findNearestBarDate(ohlc, d);
+  if (!barDate) return -1;
+  return ohlc.findIndex((b) => b.date === barDate);
+}
+
+function buildInducementMarkerTraceDateAxis(
+  ohlc: OhlcBar[],
+  items: { value: number; date?: string; index?: number }[],
+  colorHex: string,
+  name: string
+): any | null {
+  if (!ohlc.length || items.length === 0) return null;
+  const x: string[] = [];
+  const y: number[] = [];
+  for (const item of items) {
+    const idx = resolveInducementBarIndex(ohlc, { date: item.date, index: item.index });
+    if (idx < 0) continue;
+    x.push(ohlc[idx].date);
+    y.push(item.value);
+  }
+  if (x.length === 0) return null;
+  return {
+    type: "scatter",
+    mode: "markers",
+    x,
+    y,
+    marker: {
+      size: 11,
+      symbol: "circle",
+      color: hexToRgba(colorHex, 0.4),
+      line: { color: "rgba(255,255,255,0.4)", width: 1 },
+    },
+    name,
+    showlegend: true,
+    hovertemplate: "Inducement %{y:.4f}<extra></extra>",
+  };
+}
+
+function buildZoneTouchMarkerTraceDateAxis(ohlc: OhlcBar[], zones: ModuleZone[] | undefined): any | null {
+  if (!ohlc.length || !zones?.length) return null;
+  const x: string[] = [];
+  const y: number[] = [];
+  for (const z of zones) {
+    if (!z.has_touch) continue;
+    const bi = z.touch_bar_index;
+    const pr = z.touch_marker_price;
+    if (typeof bi !== "number" || typeof pr !== "number" || !Number.isFinite(pr)) continue;
+    const idx = Math.max(0, Math.min(Math.floor(bi), ohlc.length - 1));
+    x.push(ohlc[idx].date);
+    y.push(pr);
+  }
+  if (x.length === 0) return null;
+  return {
+    type: "scatter",
+    mode: "markers",
+    x,
+    y,
+    marker: {
+      size: 14,
+      symbol: "circle",
+      color: "rgba(147, 197, 253, 0.55)",
+      line: { color: "rgba(191, 219, 254, 0.9)", width: 1.5 },
+    },
+    name: "Touch zóny",
+    showlegend: true,
+    hovertemplate: "Touch zóny %{y:.4f}<extra></extra>",
+  };
+}
+
 interface ModuleOutputChartProps {
   ohlc: OhlcBar[];
   moduleName: string;
   output: ModuleOutput;
   trades?: Trade[];
   height?: number;
+  /** RRR styl: kruhy entry/exit, tělo obchodu + MFE (modře) + MAE (fialově) z polí trade.mfe / trade.mae */
+  rrrTradeStyle?: boolean;
 }
 
 const MARKER_COLORS: Record<string, string> = {
@@ -81,12 +197,27 @@ function getZoneLineColor(name?: string): string {
   return "#3b82f6";
 }
 
+/** Odvodí počet desetinných míst z OHLC (forex / jemné ceny). */
+function inferPriceDecimalPlaces(ohlc: OhlcBar[]): number {
+  let maxDec = 2;
+  const slice = ohlc.length > 400 ? ohlc.slice(0, 400) : ohlc;
+  for (const b of slice) {
+    for (const v of [b.open, b.high, b.low, b.close]) {
+      if (typeof v !== "number" || !Number.isFinite(v)) continue;
+      const frac = String(v).split(".")[1];
+      if (frac) maxDec = Math.max(maxDec, Math.min(8, frac.length));
+    }
+  }
+  return maxDec;
+}
+
 export function ModuleOutputChart({
   ohlc,
   moduleName,
   output,
   trades = [],
   height = 480,
+  rrrTradeStyle = false,
 }: ModuleOutputChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [visibilityPanelOpen, setVisibilityPanelOpen] = useState(false);
@@ -129,24 +260,38 @@ export function ModuleOutputChart({
 
   const entryX: string[] = [];
   const entryY: number[] = [];
+  const entryMarkerColors: string[] = [];
   const exitX: string[] = [];
   const exitY: number[] = [];
+  const exitMarkerColors: string[] = [];
   const tradeShapes: any[] = [];
+  const EPS = 1e-9;
+
+  const resolveBar = (iso: string) =>
+    rrrTradeStyle ? findNearestBarDate(ohlc, iso) : findBarDate(ohlc, iso);
+
   for (const t of trades) {
     const entryDate = t.entryDate ?? t.date ?? "";
     const exitDate = t.exitDate ?? t.date ?? "";
-    const entryPrice = t.entryPrice ?? t.price;
-    const exitPrice = t.exitPrice ?? t.price;
-    if (!Number.isFinite(entryPrice) || !Number.isFinite(exitPrice)) continue;
-    const entryBarDate = findBarDate(ohlc, entryDate);
-    const exitBarDate = findBarDate(ohlc, exitDate);
+    const entryP = t.entryPrice ?? t.price;
+    const exitP = t.exitPrice ?? t.price;
+    if (!Number.isFinite(entryP) || !Number.isFinite(exitP)) continue;
+
+    const entryBarDate = resolveBar(entryDate);
+    const exitBarDate = resolveBar(exitDate);
     if (entryBarDate) {
       entryX.push(entryBarDate);
-      entryY.push(entryPrice);
+      entryY.push(entryP);
+      entryMarkerColors.push(
+        rrrTradeStyle ? (t.type === "buy" ? "#22c55e" : "#ef4444") : "#3b82f6"
+      );
     }
     if (exitBarDate) {
       exitX.push(exitBarDate);
-      exitY.push(exitPrice);
+      exitY.push(exitP);
+      exitMarkerColors.push(
+        rrrTradeStyle ? (t.type === "buy" ? "#ef4444" : "#22c55e") : "#f97316"
+      );
     }
     if (!entryBarDate || !exitBarDate) continue;
 
@@ -156,40 +301,146 @@ export function ModuleOutputChart({
 
     const x0 = entryTs <= exitTs ? entryBarDate : exitBarDate;
     const x1 = entryTs <= exitTs ? exitBarDate : entryBarDate;
-    const y0 = Math.min(entryPrice, exitPrice);
-    const y1 = Math.max(entryPrice, exitPrice);
-    tradeShapes.push({
-      type: "rect",
-      x0,
-      x1,
-      y0,
-      y1,
-      fillcolor: (t.pnl ?? 0) >= 0 ? "rgba(34, 197, 94, 0.20)" : "rgba(239, 68, 68, 0.20)",
-      line: { width: 0 },
-      layer: "below",
-    });
+
+    if (rrrTradeStyle) {
+      const isLong = t.type === "buy";
+      const mfe = typeof t.mfe === "number" && Number.isFinite(t.mfe) ? t.mfe : 0;
+      const mae = typeof t.mae === "number" && Number.isFinite(t.mae) ? t.mae : 0;
+      const pnl = t.pnl ?? 0;
+      const peakLong = entryP + mfe;
+      const troughLong = entryP - mae;
+      const troughShort = entryP - mfe;
+      const peakShort = entryP + mae;
+      const coreLo = Math.min(entryP, exitP);
+      const coreHi = Math.max(entryP, exitP);
+
+      /** MFE / MAE jen mimo úsek entry–exit: modrá = čistě příznivý výkyv, fialová = čistě nepříznivý; zelená/červená = realizace. */
+      const bodyHi = coreHi;
+      const bodyLo = coreLo;
+
+      if (visibility.trade_mae) {
+        if (isLong && troughLong < bodyLo - EPS) {
+          tradeShapes.push({
+            type: "rect",
+            x0,
+            x1,
+            y0: troughLong,
+            y1: bodyLo,
+            fillcolor: "rgba(168, 85, 247, 0.28)",
+            line: { width: 0 },
+            layer: "below",
+          });
+        } else if (!isLong && peakShort > bodyHi + EPS) {
+          tradeShapes.push({
+            type: "rect",
+            x0,
+            x1,
+            y0: bodyHi,
+            y1: peakShort,
+            fillcolor: "rgba(168, 85, 247, 0.28)",
+            line: { width: 0 },
+            layer: "below",
+          });
+        }
+      }
+
+      if (visibility.trade_mfe) {
+        if (isLong && peakLong > bodyHi + EPS) {
+          tradeShapes.push({
+            type: "rect",
+            x0,
+            x1,
+            y0: bodyHi,
+            y1: peakLong,
+            fillcolor: "rgba(59, 130, 246, 0.28)",
+            line: { width: 0 },
+            layer: "below",
+          });
+        } else if (!isLong && troughShort < bodyLo - EPS) {
+          tradeShapes.push({
+            type: "rect",
+            x0,
+            x1,
+            y0: troughShort,
+            y1: bodyLo,
+            fillcolor: "rgba(59, 130, 246, 0.28)",
+            line: { width: 0 },
+            layer: "below",
+          });
+        }
+      }
+
+      if (visibility.trade_rrr_body) {
+        tradeShapes.push({
+          type: "rect",
+          x0,
+          x1,
+          y0: coreLo,
+          y1: coreHi,
+          fillcolor: pnl >= 0 ? "rgba(34, 197, 94, 0.28)" : "rgba(239, 68, 68, 0.28)",
+          line: { width: 1, color: pnl >= 0 ? "rgba(34,197,94,0.5)" : "rgba(239,68,68,0.5)" },
+          layer: "below",
+        });
+      }
+    } else {
+      const y0 = Math.min(entryP, exitP);
+      const y1 = Math.max(entryP, exitP);
+      tradeShapes.push({
+        type: "rect",
+        x0,
+        x1,
+        y0,
+        y1,
+        fillcolor: (t.pnl ?? 0) >= 0 ? "rgba(34, 197, 94, 0.20)" : "rgba(239, 68, 68, 0.20)",
+        line: { width: 0 },
+        layer: "below",
+      });
+    }
   }
+
   if (visibility.entry_markers && entryX.length > 0) {
-    traces.push({
+    const entryTrace: any = {
       type: "scatter",
       x: entryX,
       y: entryY,
-      mode: "markers",
-      marker: { size: 10, color: "#3b82f6", symbol: "triangle-up", line: { color: "#fff", width: 1 } },
+      mode: rrrTradeStyle ? "markers+text" : "markers",
+      marker: {
+        size: rrrTradeStyle ? 11 : 10,
+        color: rrrTradeStyle ? entryMarkerColors : "#3b82f6",
+        symbol: rrrTradeStyle ? "circle" : "triangle-up",
+        line: { color: "#fff", width: 1 },
+      },
       name: "Entry",
       showlegend: true,
-    });
+    };
+    if (rrrTradeStyle) {
+      entryTrace.text = entryX.map(() => "entry");
+      entryTrace.textposition = "top center";
+      entryTrace.textfont = { size: 9, color: "#d4d4d8", family: "system-ui, sans-serif" };
+    }
+    traces.push(entryTrace);
   }
   if (visibility.exit_markers && exitX.length > 0) {
-    traces.push({
+    const exitTrace: any = {
       type: "scatter",
       x: exitX,
       y: exitY,
-      mode: "markers",
-      marker: { size: 10, color: "#f97316", symbol: "triangle-down", line: { color: "#fff", width: 1 } },
+      mode: rrrTradeStyle ? "markers+text" : "markers",
+      marker: {
+        size: rrrTradeStyle ? 11 : 10,
+        color: rrrTradeStyle ? exitMarkerColors : "#f97316",
+        symbol: rrrTradeStyle ? "circle" : "triangle-down",
+        line: { color: "#fff", width: 1 },
+      },
       name: "Exit",
       showlegend: true,
-    });
+    };
+    if (rrrTradeStyle) {
+      exitTrace.text = exitX.map(() => "exit");
+      exitTrace.textposition = "bottom center";
+      exitTrace.textfont = { size: 9, color: "#d4d4d8", family: "system-ui, sans-serif" };
+    }
+    traces.push(exitTrace);
   }
 
   const markers = output.markers ?? [];
@@ -288,50 +539,31 @@ export function ModuleOutputChart({
       date: ind.date ?? "",
       value: ind.value,
       zoneName: z.name ?? "",
+      index: (ind as { index?: number }).index,
     }))
-  ).filter((p) => p.date);
+  );
   const inducementDemand = inducementPointsByZone.filter((p) => p.zoneName === "Demand");
   const inducementSupply = inducementPointsByZone.filter((p) => p.zoneName === "Supply");
   const inducementOther = inducementPointsByZone.filter((p) => p.zoneName !== "Demand" && p.zoneName !== "Supply");
 
-  if (visibility.inducement_points && inducementDemand.length > 0) {
-    traces.push({
-      type: "scatter",
-      x: inducementDemand.map((p) => p.date),
-      y: inducementDemand.map((p) => p.value),
-      mode: "markers",
-      marker: { size: 10, color: "#3b82f6", symbol: "diamond", line: { color: "#fff", width: 1 } },
-      name: "Inducement (D)",
-      showlegend: true,
-    });
+  if (visibility.inducement_points) {
+    const tD = buildInducementMarkerTraceDateAxis(ohlc, inducementDemand, "#3b82f6", "Inducement (D)");
+    if (tD) traces.push(tD);
+    const tS = buildInducementMarkerTraceDateAxis(ohlc, inducementSupply, "#a855f7", "Inducement (S)");
+    if (tS) traces.push(tS);
+    const tO = buildInducementMarkerTraceDateAxis(ohlc, inducementOther, "#64748b", "Inducement");
+    if (tO) traces.push(tO);
   }
-  if (visibility.inducement_points && inducementSupply.length > 0) {
-    traces.push({
-      type: "scatter",
-      x: inducementSupply.map((p) => p.date),
-      y: inducementSupply.map((p) => p.value),
-      mode: "markers",
-      marker: { size: 10, color: "#a855f7", symbol: "diamond", line: { color: "#fff", width: 1 } },
-      name: "Inducement (S)",
-      showlegend: true,
-    });
-  }
-  if (visibility.inducement_points && inducementOther.length > 0) {
-    traces.push({
-      type: "scatter",
-      x: inducementOther.map((p) => p.date),
-      y: inducementOther.map((p) => p.value),
-      mode: "markers",
-      marker: { size: 10, color: "#64748b", symbol: "diamond", line: { color: "#fff", width: 1 } },
-      name: "Inducement",
-      showlegend: true,
-    });
+  if (visibility.demand_supply_zones) {
+    const tt = buildZoneTouchMarkerTraceDateAxis(ohlc, zones);
+    if (tt) traces.push(tt);
   }
 
   const lines = output.lines ?? [];
   const lineColors = ["#3b82f6", "#f97316", "#a855f7", "#06b6d4"];
   if (visibility.lines) {
     lines.forEach((line, i) => {
+      if (isViewRegimeHistogramLine(line)) return;
       const pts = line.data ?? [];
       if (pts.length > 0) {
         traces.push({
@@ -404,9 +636,11 @@ export function ModuleOutputChart({
       const ipCount = z.inducement_count ?? 0;
       const ipPoints = z.inducement_points ?? 0;
       const hasIp = (ipCount > 0 || ipPoints > 0) && (z.name === "Demand" || z.name === "Supply");
+      const adBelow = Math.max(0, z.active_demand_zones_below ?? 0);
       if (base !== null && (z.name === "Demand" || z.name === "Supply")) label += ` B:${base}`;
       if (im !== null && (z.name === "Demand" || z.name === "Supply")) label += ` IM:${im}`;
       if (hasIp) label += ` IP:${ipCount},${ipPoints}`;
+      if (z.name === "Demand" && adBelow > 0) label += ` ↓${adBelow}`;
       const t1 = new Date(z.date_start).getTime();
       const t2 = new Date(z.date_end).getTime();
       const midDate = new Date((t1 + t2) / 2).toISOString();
@@ -423,9 +657,18 @@ export function ModuleOutputChart({
     }
   }
 
+  const rrrVisibilityOptions: { key: VisibilityKey; label: string; hasData: boolean }[] = rrrTradeStyle
+    ? [
+        { key: "trade_rrr_body", label: "RRR: realizace (zelená / červená)", hasData: trades.length > 0 },
+        { key: "trade_mfe", label: "RRR: MFE jen mimo tělo (modře)", hasData: trades.length > 0 },
+        { key: "trade_mae", label: "RRR: MAE jen mimo tělo (fialově)", hasData: trades.length > 0 },
+      ]
+    : [];
+
   const visibilityOptions: { key: VisibilityKey; label: string; hasData: boolean }[] = [
     { key: "entry_markers", label: "Entry (vstupy)", hasData: entryX.length > 0 },
     { key: "exit_markers", label: "Exit (výstupy)", hasData: exitX.length > 0 },
+    ...rrrVisibilityOptions,
     { key: "swing_hl", label: "Swing HL", hasData: highMarkers.length > 0 || lowMarkers.length > 0 },
     { key: "internal_hl", label: "Internal HL", hasData: internalHighMarkers.length > 0 || internalLowMarkers.length > 0 },
     { key: "major_hl", label: "Major HL", hasData: majorHighMarkers.length > 0 || majorLowMarkers.length > 0 },
@@ -449,10 +692,15 @@ export function ModuleOutputChart({
       gridcolor: "#27272a",
       rangeslider: { visible: true, thickness: 0.05, bgcolor: "#27272a" },
       fixedrange: false,
+      ...(rrrTradeStyle
+        ? {
+            rangebreaks: [{ bounds: ["sat", "mon"] }],
+          }
+        : {}),
     },
     yaxis: {
       gridcolor: "#27272a",
-      tickformat: ".2f",
+      tickformat: rrrTradeStyle ? `.${inferPriceDecimalPlaces(ohlc)}f` : ".2f",
       fixedrange: false,
     },
     dragmode: "zoom",

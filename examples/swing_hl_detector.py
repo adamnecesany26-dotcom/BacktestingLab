@@ -71,6 +71,8 @@ TF_CONFIG = {
 
 VIEW_PARAMS = {
     "timeframe": "1d",
+    # TF vstupních OHLC (např. 30m); ve View doplní instrument — pro resampling na `timeframe`
+    "data_timeframe": "",
     "atr_period": 10,
     "atr_multiplier": 1.6, #nechat!
     "min_bars_between_swings": 3, #nechat!
@@ -177,6 +179,15 @@ def _to_date_str(ts: Any) -> str:
     return str(ts)[:10]
 
 
+def _marker_iso_date(ts: Any) -> str:
+    if ts is None:
+        return ""
+    try:
+        return pd.Timestamp(ts).isoformat()
+    except (ValueError, TypeError, OSError):
+        return _to_date_str(ts)
+
+
 def _get_pivot_points(ohlc: pd.DataFrame) -> list[dict]:
     """Vrati vsechny pivot high/low (3-bar pattern). Bez potvrzeni pullbackem."""
     if ohlc is None or len(ohlc) < 3:
@@ -258,8 +269,9 @@ def _get_swings_core(
             cand_low = None
             cand_low_idx = None
 
-        look_for_high = last_swing_type is None or last_swing_type == "low" or last_swing_type == "high"
-        look_for_low = last_swing_type is None or last_swing_type == "high" or last_swing_type == "low"
+        # Striktní H-L-H-L: po high jen low, po low jen high (None = start, hledáme obě nohy prvního swingu).
+        look_for_high = last_swing_type is None or last_swing_type == "low"
+        look_for_low = last_swing_type is None or last_swing_type == "high"
 
         if look_for_high:
             is_pivot_high = high[i] > high[i - 1] and high[i] > high[i + 1]
@@ -284,36 +296,12 @@ def _get_swings_core(
             and can_confirm
             and i > cand_high_idx
         ):
-            effective_last_high = (swings[-1]["price"] if swings and swings[-1]["type"] == "high"
-                                  else (last_swing_price if last_swing_type == "high" else None))
-            is_new_extreme = (last_swing_type == "high" and effective_last_high is not None
-                              and cand_high > effective_last_high)
+            # Se striktním střídáním je zde vždy last_swing_type None nebo "low" — stačí pullback pod high.
             confirmed_by_pullback = low[i] <= cand_high - threshold
-            if (last_swing_type != "high" and confirmed_by_pullback) or (is_new_extreme and i > cand_high_idx):
+            if confirmed_by_pullback:
                 start = max(0, last_swing_idx + 1)
                 is_extremum = all(high[j] <= cand_high for j in range(start, cand_high_idx + 1))
                 if is_extremum:
-                    if is_new_extreme and effective_last_high is not None:
-                        last_high_price = effective_last_high
-                        search_start = max(0, last_swing_idx + min_bars)
-                        search_end = cand_high_idx
-                        if search_end > search_start:
-                            min_low_idx = min(
-                                range(search_start, search_end),
-                                key=lambda j: low[j],
-                            )
-                            inferred_low = float(low[min_low_idx])
-                            min_inferred = max(threshold, min_pullback, atr_val)
-                            if last_high_price - inferred_low >= min_inferred:
-                                swings.append({
-                                    "type": "low",
-                                    "price": inferred_low,
-                                    "index": min_low_idx,
-                                    "timestamp": index[min_low_idx],
-                                })
-                                last_swing_idx = min_low_idx
-                                last_swing_type = "low"
-                                last_swing_price = inferred_low
                     swings.append({
                         "type": "high",
                         "price": cand_high,
@@ -336,36 +324,11 @@ def _get_swings_core(
             and can_confirm
             and i > cand_low_idx
         ):
-            effective_last_low = (swings[-1]["price"] if swings and swings[-1]["type"] == "low"
-                                 else (last_swing_price if last_swing_type == "low" else None))
-            is_new_extreme = (last_swing_type == "low" and effective_last_low is not None
-                              and cand_low < effective_last_low)
             confirmed_by_pullback = high[i] >= cand_low + threshold
-            if (last_swing_type != "low" and confirmed_by_pullback) or (is_new_extreme and i > cand_low_idx):
+            if confirmed_by_pullback:
                 start = max(0, last_swing_idx + 1)
                 is_extremum = all(low[j] >= cand_low for j in range(start, cand_low_idx + 1))
                 if is_extremum:
-                    if is_new_extreme and effective_last_low is not None:
-                        last_low_price = effective_last_low
-                        search_start = max(0, last_swing_idx + min_bars)
-                        search_end = cand_low_idx
-                        if search_end > search_start:
-                            max_high_idx = max(
-                                range(search_start, search_end),
-                                key=lambda j: high[j],
-                            )
-                            inferred_high = float(high[max_high_idx])
-                            min_inferred = max(threshold, min_pullback, atr_val)
-                            if inferred_high - last_low_price >= min_inferred:
-                                swings.append({
-                                    "type": "high",
-                                    "price": inferred_high,
-                                    "index": max_high_idx,
-                                    "timestamp": index[max_high_idx],
-                                })
-                                last_swing_idx = max_high_idx
-                                last_swing_type = "high"
-                                last_swing_price = inferred_high
                     swings.append({
                         "type": "low",
                         "price": cand_low,
@@ -501,6 +464,27 @@ def _map_swing_index_to_original(swing: dict, original_index: pd.DatetimeIndex) 
     return int(idx)
 
 
+def _map_pivot_from_work_to_original(pivot: dict, original_ohlc: pd.DataFrame) -> dict:
+    """Pivot z work (agregované) OHLC → index a cena na nativním baru pro inducement / View."""
+    idx = _map_swing_index_to_original(
+        {"timestamp": pivot.get("timestamp"), "index": pivot.get("index", 0)},
+        original_ohlc.index,
+    )
+    idx = min(max(0, idx), len(original_ohlc) - 1)
+    high_col = "high" if "high" in original_ohlc.columns else "High"
+    low_col = "low" if "low" in original_ohlc.columns else "Low"
+    if pivot.get("type") == "high":
+        price = float(original_ohlc[high_col].iloc[idx])
+    else:
+        price = float(original_ohlc[low_col].iloc[idx])
+    return {
+        "type": pivot["type"],
+        "index": idx,
+        "price": price,
+        "timestamp": original_ohlc.index[idx],
+    }
+
+
 # Resample pravidla s label='right', closed='right' (W, ME)
 _RESAMPLE_RIGHT_LABEL = frozenset({"1w", "1W", "1M", "1ME", "W", "ME", "M"})
 
@@ -576,11 +560,13 @@ def get_swings(
     Pri len(ohlc) > max_bars pouziva rolling window: kazde okno = poslednich max_bars baru,
     swingy se sbiraji a deduplikuji. Umoznuje spolehlive zobrazeni na cele periode (View 2Y+).
 
-    params["timeframe"]: "1m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - skalovani parametru podle TF.
-    params["data_timeframe"]: TF vstupnich dat (odhadne se z dat, pokud chybi).
-    Swing H/L: min. 5m – pri jemnejsim TF se data resampluji.
+    params["timeframe"]: "1m"|"5m"|"15m"|"30m"|"1h"|"4h"|"1d" - cilovy TF vypoctu; pri jemnejsich datech se OHLC resampluje nahoru.
+    params["data_timeframe"]: TF vstupnich dat (odhadne se z dat, pokud chybi) – pro spravny resample (napr. View 30m + timeframe 1d).
+    Swing H/L: min. 5m – pri jemnejsim TF nez 5m se data nejdriv resampluji na 5m.
     params["max_bars"]: max. baru v jednom okne (pro 1d doporuceno 180 = 6M).
     params["include_internals"]: True -> vrati {"swings": [...], "internals": [...]}.
+    params["omit_swings_overlapping_major"]: default True – swing na stejném místě jako major se vyhodí (BOS/get_bos).
+        Pro View markery nastav False (viz detect v Swing HL / S_D_Zones).
 
     Strategie: swings = get_swings(ohlc, {"timeframe": params.get("swing_tf", "1d")})
 
@@ -589,11 +575,29 @@ def get_swings(
     params = dict(params or {})
     tf = str(params.pop("timeframe", "1d")).lower()
     data_tf = params.pop("data_timeframe", None)
+    if isinstance(data_tf, str) and not str(data_tf).strip():
+        data_tf = None
     include_internals = params.pop("include_internals", False)
+    omit_swings_overlapping_major = bool(params.pop("omit_swings_overlapping_major", True))
 
     original_ohlc = ohlc
-    work_ohlc = _ensure_min_tf(ohlc, MIN_TF_SWING, tf, data_tf)
-    work_tf = MIN_TF_SWING if work_ohlc is not ohlc else tf
+    base_ohlc = _ensure_min_tf(ohlc, MIN_TF_SWING, tf, data_tf)
+    src_tf = (str(data_tf).lower() if data_tf else None) or _infer_data_timeframe(ohlc)
+    if not src_tf or src_tf not in TF_FINE_TO_COARSE:
+        src_tf = _infer_data_timeframe(base_ohlc) or tf
+    src_minutes = TF_FINE_TO_COARSE.get(src_tf, 0) if src_tf in TF_FINE_TO_COARSE else 0
+    tf_minutes = TF_FINE_TO_COARSE.get(tf, 1440)
+    if src_minutes > 0 and tf_minutes > src_minutes:
+        coarse = _resample_ohlc(base_ohlc, tf, data_tf or src_tf)
+        if coarse is not None and len(coarse) >= 3:
+            work_ohlc = coarse
+            work_tf = tf
+        else:
+            work_ohlc = base_ohlc
+            work_tf = MIN_TF_SWING if base_ohlc is not ohlc else tf
+    else:
+        work_ohlc = base_ohlc
+        work_tf = MIN_TF_SWING if base_ohlc is not ohlc else tf
     base = TF_CONFIG.get(work_tf, TF_CONFIG["1d"])
     params = {**base, **params}
 
@@ -615,7 +619,7 @@ def get_swings(
             out.append(s)
         return out
 
-    maj_params = {"timeframe": work_tf, "data_timeframe": data_tf, **params}
+    maj_params = {"timeframe": tf, "data_timeframe": data_tf, **params}
     major_swings = get_major_swings(original_ohlc, maj_params)
 
     if max_bars <= 0 or len(work_ohlc) <= max_bars:
@@ -623,9 +627,12 @@ def get_swings(
         swings = _map_swings_to_original(swings)
         atr_series = _compute_atr(work_ohlc, atr_period)
         swings = _deduplicate_swings(swings, original_ohlc, atr_series)
-        swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
+        swings = _enforce_strict_hl_alternation(swings)
+        if omit_swings_overlapping_major:
+            swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
         if include_internals:
-            out = _add_internals(swings, original_ohlc, major_swings)
+            pivot_src = work_ohlc if work_ohlc is not original_ohlc else None
+            out = _add_internals(swings, original_ohlc, major_swings, pivot_src)
             out["major_swings"] = major_swings
             return out
         return swings
@@ -659,9 +666,12 @@ def get_swings(
     all_swings = _map_swings_to_original(all_swings)
     atr_series = _compute_atr(work_ohlc, atr_period)
     swings = _deduplicate_swings(all_swings, original_ohlc, atr_series)
-    swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
+    swings = _enforce_strict_hl_alternation(swings)
+    if omit_swings_overlapping_major:
+        swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
     if include_internals:
-        out = _add_internals(swings, original_ohlc, major_swings)
+        pivot_src = work_ohlc if work_ohlc is not original_ohlc else None
+        out = _add_internals(swings, original_ohlc, major_swings, pivot_src)
         out["major_swings"] = major_swings
         return out
     return swings
@@ -688,6 +698,7 @@ def get_major_swings(ohlc: pd.DataFrame, params: dict | None = None) -> list[dic
     maj_params = {**base, **params}
     maj_params["timeframe"] = major_tf
     swings, _ = _get_swings_core(resampled, maj_params)
+    swings = _enforce_strict_hl_alternation(swings)
     out = []
     for s in swings:
         idx, price = _map_major_swing_to_original(s, resampled, ohlc, major_tf)
@@ -753,16 +764,28 @@ def _pivot_overlaps_major(pivot: dict, major_swings: list[dict] | None) -> bool:
     return False
 
 
-def _add_internals(swings: list[dict], ohlc: pd.DataFrame, major_swings: list[dict] | None = None) -> dict:
-    """Pivot body, ktere nejsou na miste swingu ani Major. Vraci {"swings": [...], "internals": [...]}."""
-    pivots = _get_pivot_points(ohlc)
+def _add_internals(
+    swings: list[dict],
+    original_ohlc: pd.DataFrame,
+    major_swings: list[dict] | None = None,
+    pivot_source_ohlc: pd.DataFrame | None = None,
+) -> dict:
+    """
+    Pivot body, ktere nejsou na miste swingu ani Major. Vraci {"swings": [...], "internals": [...]}.
+    pivot_source_ohlc: agregované OHLC (stejné jako work_ohlc ve get_swings); internály se počítají
+    na něm a mapují se na original_ohlc pro inducement a potvrzení na nativních barech.
+    """
+    src = pivot_source_ohlc if pivot_source_ohlc is not None else original_ohlc
+    pivots = _get_pivot_points(src)
+    if pivot_source_ohlc is not None:
+        pivots = [_map_pivot_from_work_to_original(p, original_ohlc) for p in pivots]
     swing_keys = {(s["index"], s["type"]) for s in swings}
     internals = [
         p
         for p in pivots
         if (p["index"], p["type"]) not in swing_keys
         and not _pivot_overlaps_major(p, major_swings)
-        and _confirm_internal_by_next_candle(ohlc, p)
+        and _confirm_internal_by_next_candle(original_ohlc, p)
     ]
     return {"swings": swings, "internals": internals}
 
@@ -770,6 +793,34 @@ def _add_internals(swings: list[dict], ohlc: pd.DataFrame, major_swings: list[di
 DEDUP_INDEX_TOLERANCE = 2
 DEDUP_PRICE_ATR_TOLERANCE = 0.5
 MAJOR_SWING_INDEX_TOLERANCE = 3
+
+
+def _enforce_strict_hl_alternation(swings: list[dict]) -> list[dict]:
+    """
+    Po deduplikaci / sloučení oken může zůstat HH nebo LL. Sloučí po sobě jdoucí stejný typ:
+    high → ponechá vyšší high (při shodě ceny novější index), low → nižší low.
+    Výsledek je striktně střídavá řada H-L-H-L podle indexu.
+    """
+    if len(swings) < 2:
+        return [dict(s) for s in swings]
+    ordered = sorted(swings, key=lambda x: (x["index"], x.get("type", "")))
+    out: list[dict] = [dict(ordered[0])]
+    for s in ordered[1:]:
+        cur = dict(s)
+        if cur["type"] == out[-1]["type"]:
+            if cur["type"] == "high":
+                if cur["price"] > out[-1]["price"] or (
+                    cur["price"] == out[-1]["price"] and cur["index"] > out[-1]["index"]
+                ):
+                    out[-1] = cur
+            else:
+                if cur["price"] < out[-1]["price"] or (
+                    cur["price"] == out[-1]["price"] and cur["index"] > out[-1]["index"]
+                ):
+                    out[-1] = cur
+        else:
+            out.append(cur)
+    return out
 
 
 def _deduplicate_swings(
@@ -1236,31 +1287,31 @@ def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     Interface pro View chart - vrati markery ve formatu aplikace.
     [{"date": "YYYY-MM-DD", "type": "high"|"low"|"major_high"|"major_low"|"internal_high"|"internal_low", "value": float}, ...]
     """
-    result = get_swings(ohlc, params)
-    if isinstance(result, dict):
-        swings = result["swings"]
-        internals = result["internals"]
-    else:
-        swings = result
-        internals = []
+    p = dict(params or {})
+    p["include_internals"] = True
+    p["omit_swings_overlapping_major"] = False
+    result = get_swings(ohlc, p)
+    swings = result["swings"]
+    internals = result["internals"]
+    major_swings = result.get("major_swings") or []
 
-    p = params or {}
-    maj_params = {"timeframe": p.get("timeframe", "1d"), "data_timeframe": p.get("data_timeframe"), **p}
-    major_swings = get_major_swings(ohlc, maj_params)
+    if not major_swings:
+        maj_params = {"timeframe": p.get("timeframe", "1d"), "data_timeframe": p.get("data_timeframe"), **p}
+        major_swings = get_major_swings(ohlc, maj_params)
 
     results = []
     for s in major_swings:
         ts = s.get("timestamp")
-        date_str = _to_date_str(ts) if ts is not None else ""
+        date_str = _marker_iso_date(ts) if ts is not None else ""
         if date_str:
             results.append({"date": date_str, "type": s["type"], "value": s["price"]})
     for s in swings:
         ts = s["timestamp"]
-        date_str = _to_date_str(ts)
+        date_str = _marker_iso_date(ts)
         results.append({"date": date_str, "type": s["type"], "value": s["price"]})
     for s in internals:
         ts = s["timestamp"]
-        date_str = _to_date_str(ts)
+        date_str = _marker_iso_date(ts)
         results.append({
             "date": date_str,
             "type": f"internal_{s['type']}",

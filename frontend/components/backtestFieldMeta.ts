@@ -274,13 +274,16 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     title: "Gate max DD % (největší propustný propad)",
     whatItMeans:
       "**Drawdown (DD)** v procentech = **nejhlubší propad** účtu (nebo equity křivky) od nedávného vrcholu dolů — jako kdybys na chvíli z kapsy vytáhl hodně peněz a účet „klesl pod bod, kde byl nahoře“. " +
-      "Toto pole říká: **pokud je propad hlubší než X %, běh neprošel branou**. Je to tvoje řečené **„takhle hluboko už nechci klesnout“** v rámci simulace.",
+      "Toto pole říká: **pokud je propad hlubší než X %, běh neprošel branou**. Je to tvoje řečené **„takhle hluboko už nechci klesnout“** v rámci simulace. " +
+      "**Důležité:** brána **nezastaví** backtest uprostřed — engine **dopočítá celý běh** a teprve pak označí PASS/FAIL (viz banner ve výsledcích). " +
+      "U **futures / násobiče** může simulace skončit i se **záporným equity**; drawdown pak může být **i nad 100 %** (propad od vrcholu přes celý kapitál).",
     whyItMatters:
       "Strategie může být celkově v plusu, ale projít **děsivým údolím** — v reálu bys ji mezitím možná vypnul ze strachu. Gate tě chrání před „ziskovými“ výsledky, které psychicky nebo kapitálově neunesíš.",
     howToUse: [
       "Nastav podle toho, **kolik procent poklesu** by tě v reálném účtu ještě nechalo spát. Konzervativněji = menší číslo (přísnější).",
       "20–30 % bývá rozumný rozptyl pro začátek; agresivnější styl může mít vyšší toleranci — ale buď upřímný k sobě.",
       "Číslo je v **procentech** podle metriky engine (viz výsledky / Analytics).",
+      "Chceš-li **nepřekročit** DD už během simulace, musíš to řešit v **logice strategie** (velikost pozice, stop-loss) — gate to za tebe nevypne.",
     ],
     recommendedDefault: "20–25 % pro opatrnější filtr; 30 % pokud víš, že strategie občas hlubší sjezdy dělá záměrně.",
     withoutIt:

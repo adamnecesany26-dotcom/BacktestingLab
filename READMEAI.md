@@ -306,6 +306,8 @@ Backtesting_app/
 
 **`chart_timeframe`:** `null` / omit / `"native"` = use source bar size. Otherwise resample OHLC on the server before chart + module (`1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `1D`, `1W`, `1Mo`) — must be **coarser** than inferred native bar spacing (median delta, gaps &lt; 48h ignored). Implemented in `view.py` and `docker/view_engine.py` (pandas `resample`).
 
+**Module `timeframe` vs `data_timeframe` (Swing HL, S/D):** `chart_timeframe` only changes the candle series drawn in View. Structure (swings, BOS, zones) should use **`timeframe`** in `VIEW_PARAMS` as the **analysis** bar size (e.g. `1d`) while **`data_timeframe`** describes the **native** spacing of the loaded file (e.g. `30m`). `StrategyViewChart` sets `data_timeframe` from the selected instrument’s `timeframe` so modules can resample inside `get_swings` / `get_bos` without forcing analysis TF to match the file.
+
 **Response:**
 ```json
 {

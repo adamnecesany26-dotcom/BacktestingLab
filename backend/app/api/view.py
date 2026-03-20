@@ -41,6 +41,48 @@ def _to_iso(value) -> str:
         return str(value)
 
 
+def _is_regime_histogram_row(p: Any) -> bool:
+    if not isinstance(p, dict) or "date" not in p:
+        return False
+    if isinstance(p.get("states"), dict):
+        st = p["states"]
+        return all(k in st for k in ("trend", "chop", "high_vol"))
+    return all(k in p for k in ("trend", "chop", "high_vol"))
+
+
+def _normalize_regime_probs(p: dict) -> tuple[float, float, float]:
+    if isinstance(p.get("states"), dict):
+        st = p["states"]
+        t = float(st.get("trend", 0))
+        c = float(st.get("chop", 0))
+        h = float(st.get("high_vol", 0))
+    else:
+        t = float(p.get("trend", 0))
+        c = float(p.get("chop", 0))
+        h = float(p.get("high_vol", 0))
+    s = t + c + h
+    if s > 0:
+        return t / s, c / s, h / s
+    return 0.0, 0.0, 0.0
+
+
+def _try_build_regime_histogram_line(name: str, raw_list: list) -> dict | None:
+    """Vrátí {'name', 'regime_histogram': True, 'data': [{date, trend, chop, high_vol}, ...]} nebo None."""
+    if not isinstance(raw_list, list) or len(raw_list) == 0:
+        return None
+    if not all(_is_regime_histogram_row(p) for p in raw_list if isinstance(p, dict)):
+        return None
+    pts: list[dict] = []
+    for p in raw_list:
+        if not isinstance(p, dict) or "date" not in p:
+            continue
+        t, c, h = _normalize_regime_probs(p)
+        pts.append({"date": _to_iso(p["date"]), "trend": t, "chop": c, "high_vol": h})
+    if not pts:
+        return None
+    return {"name": str(name), "regime_histogram": True, "data": pts}
+
+
 def _get_data_dir() -> Path:
     backend_root = Path(__file__).resolve().parent.parent.parent
     primary = backend_root.parent / "data"
@@ -424,7 +466,23 @@ def _run_view_code(
                     if isinstance(data, list):
                         pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
                     elif isinstance(data, dict) and "data" in data:
-                        pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data["data"] if isinstance(p, dict)]
+                        raw_data = data["data"]
+                        forced = data.get("kind") == "regime_histogram"
+                        if isinstance(raw_data, list) and (
+                            forced
+                            or (len(raw_data) > 0 and _is_regime_histogram_row(raw_data[0]))
+                        ):
+                            rh = _try_build_regime_histogram_line(name, raw_data)
+                            if rh:
+                                lines.append(rh)
+                                continue
+                            if forced:
+                                continue
+                        pts = [
+                            {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+                            for p in raw_data
+                            if isinstance(p, dict)
+                        ]
                         color = data.get("color")
                         segments = data.get("segments")
                     if pts:

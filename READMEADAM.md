@@ -11,6 +11,7 @@ Tento soubor je **osobní mapa produktu**: co aplikace umí, kde to najdeš v UI
 | **READMEAI.md** | Kontrakty a data flow pro AI / vývojáře; tabulka „kde měnit kód“. |
 | **SCRIPTS.md** | Jak spustit backend, frontend, Docker; časté problémy. |
 | **examples/\*/README.md**, **strategies/\*/README.md** | Dokumentace konkrétního modulu/strategie + níže odkaz na platformu. |
+| **SD_def.md**, **SD_de.md** | Definice S/D zón (geometrie) vs. obchodní spec strategie `sd_zone_strategy` (MTF, vstupy, filtry). |
 
 Při větší změně produktu aktualizuj konzistentně **README.md** (technické), **READMEAI.md** (kontrakty), **READMEADAM.md** + **`guideContent.ts`** + **`backtestFieldMeta.ts`** (uživatelský popis).
 
@@ -38,6 +39,8 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
    - **Editor** — kód `main.py`, indikátorů, modulů.  
    - **View** — přepínač View mód: svíčky + výstupy `detect` / `get_line` / `get_zones` bez plného backtestu (`StrategyViewChart`).
 
+   **S/D modul (`S_D_Zones` / `SD_identificator`):** Jeden zdroj kódu je [`examples/sd_zones.py`](examples/sd_zones.py) — vlož ho do obou názvů modulu v aplikaci, pokud používáš oba. Modul načítá swingy/BOS z **`HL_identificator` před `Swing_HL`** (`_load_swing_hl_module`). Strategie [`sd_zone_strategy`](strategies/sd_zone_strategy/main.py) používá **stejné pořadí** při importu z `modules/`, aby při dvou kopiích swing modulu View a backtest nečetly rozdílné swingy/BOS.
+
 3. **Pravý panel (`BacktestSettings`)**  
    Veškerá konfigurace backtestu, edge finding, Run.
 
@@ -45,7 +48,7 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
    Logy ze serveru / Dockeru během běhu, progress.
 
 5. **Po Runu**  
-   Přepne se na **Results** (`ResultsView`): záložky Equity → Highlight → Detailed → Analytics → Run history, exporty.
+   Přepne se na **Results** (`ResultsView`): záložky Equity → Highlight → Detailed → **Run view** → Analytics → Run history, exporty.
 
 ---
 
@@ -68,6 +71,10 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
 - Futures: tick size, value per tick.  
 - Stocks: position size.  
 - Forex: lot, pip (dle dostupnosti v UI).
+
+### Kontrola dat (prázdné řádky, NaN, podezřelé mezery)
+
+Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|.csv|.parquet`, nahlásí prázdné řádky v souboru, `NaN` v OHLCV a časové mezery delší než „běžná“ pauza (výchozí až ~28 h nebo 4× medián mezi bary), pokud nejdou vysvětlit víkendem nebo vánočním rozsahem (24.–31. 12. / 1.–2. 1.). Úspěch = exit kód 0.
 
 ### Simulation
 
@@ -129,7 +136,16 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
 
 ### Highlight / Detailed
 
-- Výběr obchodu, svíčky, zvýraznění vstupů/výstupů, tabulka obchodů.
+- **Highlight** — jeden obchod, okno entry–exit.  
+- **Detailed** — výřez času (obchody / měsíce), RRR styl, moduly + obchody.
+
+### Run view
+
+- OHLC z runu + **stejné sloučené `moduleOutputs`** jako po backtestu (zóny, markery, čáry) + **všechny obchody** na grafu (entry/exit). Liší se od View v editoru tím, že bere uložené výstupy z runu, ne živý `/api/view`.
+
+### Tabulka obchodů
+
+- V Highlight / přehledech; u strategií typu S/D může obchod obsahovat **`zoneMeta`** (JSON z engine — zóna, impulse, inducement, …).
 
 ### Analytics
 
@@ -150,7 +166,17 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
 - Rychlá kontrola signálů bez backtestu.  
 - Volá se `/api/view` v sandboxu (`view_engine.py`).  
 - **Timeframe svíček** — výběr „Původní (instrument)“ nebo hrubší agregace (`1m` … `1Mo`); server dělá pandas `resample` na OHLC **před** voláním `detect` / `get_line` / `get_zones` (stejný DataFrame jako na grafu).  
+- **`data_timeframe` ve View** — při zvolené agregaci (např. 1D) frontend posílá do modulu `data_timeframe` odpovídající **tomuto** grafu (ne rozlišení souboru), aby Swing HL nesimuloval 30m data nad denními svíčkami.
 - Parametry z `VIEW_PARAMS` + nápověda jako u strategických parametrů (logický TF modulu je nezávislý na agregaci svíček).
+- **Který modul co kreslí:** `detect` → markery (swing high/low, internal, major dle modulu). `get_zones` záleží na souboru: **Swing HL** (`swing_hl_detector.py`) vrací jen **BOS** čáry; **S/D Zóny** (`examples/sd_zones.py`) vrací BOS + Demand/Supply + inducementy. Když ve Viditelnosti vidíš BOS ale ne D/S, často je vybraný jen Swing HL — pro D/S zkopíruj modul z `sd_zones.py`.
+- **`max_base_length` > 0** v S/D modulu může odfiltrovat všechny Demand/Supply zóny, ale **BOS** záznamy v `zones` zůstanou — panel pak ukáže BOS ano, D/S ne.
+- **Base zóny ve View:** `VIEW_PARAMS` v [`examples/sd_zones.py`](examples/sd_zones.py) obsahuje `base_zone_height_covered_min` a `base_body_in_zone_min` (stejné výchozí hodnoty jako v kódu modulu / parametry strategie), aby šířka base šla ladit v UI stejně jako ve strategii.
+
+### Strategie `sd_zone_strategy` — parametry zón a realita exekuce
+
+- **`zone_max_bars` vs. `zone_extend_right_bars`:** při výpočtu zón ve strategii se do modulu vždy posílá `zone_extend_right_bars` **přepsané** z `zone_max_bars` (viz `_sd_module_params_for_tf`). Hodnota `zone_extend_right_bars` z panelu modulu v backtestu tedy pro geometrii/životnost zóny **neplatí** — pro srovnání s View nastav stejnou číslici jako `zone_max_bars` ve strategii, nebo spoléhej na jeden zdroj v `PARAMS`.
+- **Limitní vstupy:** strategie sama nemodeluje spread u limitů; obecné náklady řeší globální nastavení simulace (slippage / execution model v UI), ne „limit přesně u bid/ask“.
+- **Výstup z pozice:** rozhodnutí target vs. stop jde z **jednoho** OHLC baru; pokud by v reálu v jednom baru prošly obě úrovně, pořadí ticků uvnitř baru simulace nerozliší (viz `_check_exit` ve `strategies/sd_zone_strategy/main.py`).
 
 ---
 

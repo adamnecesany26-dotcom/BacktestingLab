@@ -105,6 +105,8 @@ export interface Trade {
   holdingMinutes?: number;
   entryReason?: string;
   exitReason?: string;
+  /** Volitelná metadata ze strategie (např. S/D zóna) */
+  zoneMeta?: Record<string, unknown>;
 }
 
 /** Equity point with date */
@@ -158,9 +160,14 @@ export interface ModuleZone {
   name?: string;
   base_length?: number;
   impulse_score?: number;
-  inducements?: { date: string; value: number; type: string }[];
+  inducements?: { date: string; value: number; type: string; index?: number }[];
   inducement_count?: number;
   inducement_points?: number;
+  has_touch?: boolean;
+  touch_bar_index?: number;
+  touch_marker_price?: number;
+  touch_date?: string;
+  active_demand_zones_below?: number;
   has_gap?: boolean;
   gap_type?: string;
   gap_date?: string;
@@ -168,10 +175,19 @@ export interface ModuleZone {
   gap_value_high?: number;
 }
 
+/** Jedna řada z get_line — běžná čára nebo režimový histogram (View / run výstup) */
+export type ModuleLineOutput =
+  | { name: string; data: { date: string; value: number }[]; color?: string }
+  | {
+      name: string;
+      regime_histogram: true;
+      data: { date: string; trend: number; chop: number; high_vol: number }[];
+    };
+
 /** Module output (markers, lines, zones from detect/get_line/get_zones) */
 export interface ModuleOutput {
   markers?: { date: string; type: string; value: number }[];
-  lines?: { name: string; data: { date: string; value: number }[]; color?: string }[];
+  lines?: ModuleLineOutput[];
   zones?: ModuleZone[];
 }
 

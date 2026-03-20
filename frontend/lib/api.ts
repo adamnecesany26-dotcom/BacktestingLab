@@ -127,9 +127,24 @@ export async function getAvailableData(): Promise<{
   return res.json();
 }
 
-export interface ViewLine {
+/** Řada bodů {date, value} pro běžné indikátorové čáry (ne režimový histogram) */
+export interface ViewLineSeries {
   name: string;
   data: { date: string; value: number }[];
+  color?: string;
+}
+
+/** HMM / režim — spodní histogram ve StrategyViewChart (barva = dominantní stav) */
+export interface ViewRegimeHistogramLine {
+  name: string;
+  regime_histogram: true;
+  data: { date: string; trend: number; chop: number; high_vol: number }[];
+}
+
+export type ViewLine = ViewLineSeries | ViewRegimeHistogramLine;
+
+export function isViewRegimeHistogramLine(line: ViewLine): line is ViewRegimeHistogramLine {
+  return "regime_histogram" in line && line.regime_histogram === true;
 }
 
 /** Inducement point (pasivní likvidita) */
@@ -154,6 +169,10 @@ export interface ViewZone {
   touches?: number;
   strength?: number;
   has_touch?: boolean;
+  touch_bar_index?: number;
+  touch_marker_price?: number;
+  touch_date?: string;
+  active_demand_zones_below?: number;
   inducements?: ViewInducement[];
   inducement_count?: number;
   inducement_points?: number;

@@ -1,3 +1,33 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* --- Vlastní scrollbar (tmavý UI) --- */
+html {
+  scrollbar-color: #52525b #18181b;
+  scrollbar-width: thin;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #18181b;
+  border-radius: 6px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #3f3f46, #52525b);
+  border-radius: 6px;
+  border: 2px solid #18181b;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #52525b, #71717a);
+}
+
+*::-webkit-scrollbar-corner {
+  background: #18181b;
+}

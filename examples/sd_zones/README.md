@@ -1,5 +1,17 @@
 # Supply/Demand zóny v-1.0 – kompletní dokumentace
 
+## Rychlý přehled
+
+**K čemu to je:** Vykreslí **zelené Demand** a **červené Supply** „obdélníky“ podle průrazů struktury (**BOS**). Ukáže také oranžové **BOS čáry**, dotyky zóny, inducementy a další detaily ve View.
+
+**Co musíš mít vedle:** Modul **Swing HL** (stejná aplikace ho umí stáhnout automaticky přes závislost ve View). Ve strategii musí být **Swing HL + tento modul** oba zaškrtnuté.
+
+**Soubor ke kopírování:** `examples/sd_zones.py` → modul např. **S/D Zones** nebo **S_D_Zones**.
+
+**Parametry:** V aplikaci u modulu (ikona ozubeného kola) – např. délka životnosti zóny vpravo, prahy pro překryvy, ATR u dotyku. Delší popis je níže v tabulkách.
+
+---
+
 Modul pro detekci Supply a Demand zón na základě BOS (Break of Structure). Zóny reprezentují cenové oblasti, kde došlo k silnému impulznímu pohybu – místa potenciální reakce při návratu ceny.
 
 ---
@@ -150,19 +162,24 @@ V podobném místě (cenový overlap ≥ 25 %) a blízkém čase (≤ 7 barů) n
 
 ## 6. Parametry (VIEW_PARAMS)
 
-| Parametr | Default | Popis |
-|----------|---------|-------|
-| timeframe | 1d | Časový rámec (předáváno do Swing HL) |
-| atr_period | 10 | ATR perioda pro Swing HL |
-| atr_multiplier | 1.2 | ATR multiplikátor |
-| min_bars_between_swings | 3 | Min. bary mezi swingly |
-| max_bars | 180 | Max. bary pro zpracování |
-| acceptance_bars | 1 | Bary pro potvrzení BOS |
-| zone_overlap_threshold | 0.33 | Prah pro šířku vlevo (33 % H–L v zóně) |
-| zone_body_overlap_threshold | 0.10 | Min. 10 % těla svíčky v zóně |
-| zone_extend_right_bars | 60 | Max. barů rozšíření doprava |
-| zone_min_bars_between_same | 7 | Min. barů mezi zónami stejného typu |
-| zone_price_overlap_threshold | 0.25 | Cenový overlap pro deduplikaci (0–1) |
+Ve View je záměrně **úzká sada** parametrů, které nejvíc mění tvar zón; Swing/BOS jemné doladění (`atr_period`, `sensitivity`, `max_bars`, …) zůstává ve **výchozích hodnotách v kódu** (`params.get(..., default)`). Prahové podíly pro šířku base (`base_zone_height_covered_min`, `base_body_in_zone_min`) jsou v `VIEW_PARAMS` ve shodě se strategií `sd_zone_strategy`. Plná sada zbývajících klíčů je v `PARAMS` strategie.
+
+| Parametr | Default | Popis (stručně) |
+|----------|---------|-----------------|
+| timeframe | 1d | TF struktury a zón |
+| data_timeframe | (doplní View) | Rozlišení vstupního souboru / resampling |
+| zone_extend_right_bars | 60 | Jak dlouho zóna „žije“ doprava (počet barů) |
+| zone_overlap_threshold | 0.33 | Prodlužování vlevo: podíl H–L v pásku zóny |
+| zone_body_overlap_threshold | 0.10 | Totéž pro tělo svíčky (AND s řádkem výše) |
+| zone_touch_vicinity_atr | 0.5 | Dotyk před BOS (násobek ATR) |
+| inducement_max_distance_atr | 2.0 | Inducement max. vzdálenost od zóny (× ATR) |
+| inducement_max_bars | 40 | Inducement jen v prvních N barech od pivotu |
+| base_bar_range_in_zone_min | 0.40 | Jedna z OR podmínek pro šířku base (podíl H–L v zóně) |
+| base_zone_height_covered_min | 0.80 | OR: min. podíl pokrytí výšky zóny knotem (H–L) |
+| base_body_in_zone_min | 0.60 | OR: min. podíl těla uvnitř zóny |
+| max_base_length | 0 | Filtr délky base ve výstupu (0 = vypnuto) |
+
+Detailní vysvětlení je v **`VIEW_PARAMS_META`** v `sd_zones.py` — ve View se zobrazí v panelu parametrů pod názvem pole.
 
 ---
 

@@ -1,5 +1,17 @@
 # Swing High / Low Detector
 
+## Rychlý přehled (čti jako první)
+
+**K čemu to je:** Najde na grafu **swingová high/low** (zvraty ceny), větší **major** swingy na hrubším čase, jemnější **interní** body, a umí spočítat **BOS** (průraz struktury) a **trend** (skóre −100 až +100).
+
+**Kdy to použiješ:** Skoro vždycky jako **základ** – ostatní moduly (S/D zóny, S/R, premium/discount) z něj často berou data. Ve **View** ho vybereš, aby se zobrazily markery a případně trendová čára.
+
+**Závislosti:** Žádný jiný modul nepotřebuje. Tento soubor zkopíruješ do modulu **Swing HL** nebo **HL identificator** v aplikaci.
+
+**Soubor ke kopírování:** `examples/swing_hl_detector.py` (stejný obsah jako tato složka).
+
+---
+
 Modul pro detekci Swing High, Swing Low, Major Swing H/L a Internal H/L. Určen pro BOS (Break of Structure) strategie, S/D zóny a vizualizaci struktury trhu.
 
 ---

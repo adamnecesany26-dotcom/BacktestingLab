@@ -13,7 +13,10 @@ const METH_TIPS: Partial<Record<string, string>> = {
     "Podobně jako Sharpe, ale penalizuje jen downside volatilitu. Stále závisí na frekvenci dat a délce vzorku.",
   profitFactor:
     "Hrubý zisk / hrubá ztráta z uzavřených obchodů. Hodnota ≥999 znamená sentinel „bez ztrátových obchodů“ v tomto vzorku.",
-  maxDrawdown: "Maximální propad equity od lokálního maxima (%) — z analyzeru a křivky.",
+  finalEquity:
+    "Hodnota účtu na konci dle Backtrader brokeru. U futures s násobičem může být po totální ztrátě i mírně záporná — není to „chyba zobrazení“, ale model páky bez tvrdého margin callu.",
+  maxDrawdown:
+    "Max. propad od vrcholu equity (%). Může přesáhnout 100 %, pokud equity klesne pod nulu. Počítá se z křivky i z analyzeru (vezme se horší).",
   expectancyR:
     "Expectancy USD děleno průměrnou velikostí ztráty — hrubý „R“ proxy; není to broker R-multiple bez definovaného risku na obchod.",
 };
@@ -65,7 +68,10 @@ export function StatBlocks({ results }: StatBlocksProps) {
           } else if (key === "profitFactor") {
             value = formatProfitFactor(m[key] as number | undefined);
           } else {
-            const v = m[key] as number | undefined;
+            let v = m[key] as number | undefined;
+            if (key === "maxDrawdown" && v == null) {
+              v = m.maxDrawdownPct as number | undefined;
+            }
             value = v != null ? format(v) : "—";
           }
           const tip = METH_TIPS[key as string];

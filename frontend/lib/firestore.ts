@@ -383,6 +383,36 @@ export interface SavedBacktestRun {
   deleteReason?: string | null;
 }
 
+/**
+ * Firestore rejects `undefined` anywhere in nested objects/arrays.
+ * Preserves Firestore FieldValue, Timestamp, GeoPoint, Date (non-plain objects).
+ */
+export function stripUndefinedForFirestore<T>(value: T): T {
+  if (value === undefined) return value;
+  if (value === null) return value;
+  if (typeof value !== "object") return value;
+  if (value instanceof Date) return value;
+
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== null && proto !== Object.prototype && !Array.isArray(value)) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    const next = (value as unknown[])
+      .filter((x) => x !== undefined)
+      .map((x) => stripUndefinedForFirestore(x));
+    return next as T;
+  }
+
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v === undefined) continue;
+    out[k] = stripUndefinedForFirestore(v);
+  }
+  return out as T;
+}
+
 /** Save backtest result under strategy. Path: /strategies/{strategyId}/results/{backtestId} */
 export async function saveBacktestResult(
   strategyId: string,
@@ -396,7 +426,7 @@ export async function saveBacktestResult(
       : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
   const id = `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${randomPart}`;
   const ref = doc(getDb(), "strategies", strategyId, "results", id);
-  await setDoc(ref, {
+  const docData = stripUndefinedForFirestore({
     strategyName,
     ownerUid,
     savedAt: serverTimestamp(),
@@ -404,7 +434,8 @@ export async function saveBacktestResult(
     deletedBy: null,
     deleteReason: null,
     ...result,
-  });
+  }) as Record<string, unknown>;
+  await setDoc(ref, docData);
   return id;
 }
 

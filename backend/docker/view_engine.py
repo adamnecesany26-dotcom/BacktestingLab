@@ -9,6 +9,7 @@ import inspect
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -25,6 +26,47 @@ def _to_iso(value) -> str:
         return pd.Timestamp(value).isoformat()
     except Exception:
         return str(value)
+
+
+def _is_regime_histogram_row(p: Any) -> bool:
+    if not isinstance(p, dict) or "date" not in p:
+        return False
+    if isinstance(p.get("states"), dict):
+        st = p["states"]
+        return all(k in st for k in ("trend", "chop", "high_vol"))
+    return all(k in p for k in ("trend", "chop", "high_vol"))
+
+
+def _normalize_regime_probs(p: dict) -> tuple[float, float, float]:
+    if isinstance(p.get("states"), dict):
+        st = p["states"]
+        t = float(st.get("trend", 0))
+        c = float(st.get("chop", 0))
+        h = float(st.get("high_vol", 0))
+    else:
+        t = float(p.get("trend", 0))
+        c = float(p.get("chop", 0))
+        h = float(p.get("high_vol", 0))
+    s = t + c + h
+    if s > 0:
+        return t / s, c / s, h / s
+    return 0.0, 0.0, 0.0
+
+
+def _try_build_regime_histogram_line(name: str, raw_list: list) -> dict | None:
+    if not isinstance(raw_list, list) or len(raw_list) == 0:
+        return None
+    if not all(_is_regime_histogram_row(p) for p in raw_list if isinstance(p, dict)):
+        return None
+    pts: list[dict] = []
+    for p in raw_list:
+        if not isinstance(p, dict) or "date" not in p:
+            continue
+        t, c, h = _normalize_regime_probs(p)
+        pts.append({"date": _to_iso(p["date"]), "trend": t, "chop": c, "high_vol": h})
+    if not pts:
+        return None
+    return {"name": str(name), "regime_histogram": True, "data": pts}
 
 
 def _series_as_float(df: pd.DataFrame, primary: str, fallback: str) -> pd.Series:
@@ -225,7 +267,23 @@ def _run_view_code(main_path: Path, module_key: str, df: pd.DataFrame, params: d
                 if isinstance(data, list):
                     pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
                 elif isinstance(data, dict) and "data" in data:
-                    pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data["data"] if isinstance(p, dict)]
+                    raw_data = data["data"]
+                    forced = data.get("kind") == "regime_histogram"
+                    if isinstance(raw_data, list) and (
+                        forced
+                        or (len(raw_data) > 0 and _is_regime_histogram_row(raw_data[0]))
+                    ):
+                        rh = _try_build_regime_histogram_line(name, raw_data)
+                        if rh:
+                            lines.append(rh)
+                            continue
+                        if forced:
+                            continue
+                    pts = [
+                        {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+                        for p in raw_data
+                        if isinstance(p, dict)
+                    ]
                     color = data.get("color")
                 if pts:
                     line_obj = {"name": str(name), "data": pts}
@@ -248,14 +306,59 @@ def _run_view_code(main_path: Path, module_key: str, df: pd.DataFrame, params: d
                     and "value_low" in item
                     and "value_high" in item
                 ):
-                    zones.append({
+                    zone: dict = {
                         "date_start": _to_iso(item["date_start"]),
                         "date_end": _to_iso(item["date_end"]),
                         "value_low": float(item["value_low"]),
                         "value_high": float(item["value_high"]),
                         "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
                         "name": str(item["name"]) if item.get("name") else None,
-                    })
+                    }
+                    if "base_length" in item:
+                        zone["base_length"] = int(item["base_length"])
+                    if "impulse_score" in item:
+                        zone["impulse_score"] = int(item["impulse_score"])
+                    if "touches" in item:
+                        zone["touches"] = int(item["touches"])
+                    if "strength" in item:
+                        zone["strength"] = int(item["strength"])
+                    if "has_touch" in item:
+                        zone["has_touch"] = bool(item["has_touch"])
+                    if "inducements" in item and isinstance(item["inducements"], list):
+                        norm_ind = []
+                        for ind in item["inducements"]:
+                            if not isinstance(ind, dict):
+                                continue
+                            one = dict(ind)
+                            if "date" in one:
+                                one["date"] = _to_iso(one["date"])
+                            if "value" in one:
+                                try:
+                                    one["value"] = float(one["value"])
+                                except (TypeError, ValueError):
+                                    pass
+                            if "index" in one:
+                                try:
+                                    one["index"] = int(one["index"])
+                                except (TypeError, ValueError):
+                                    pass
+                            norm_ind.append(one)
+                        zone["inducements"] = norm_ind
+                    if "inducement_count" in item:
+                        zone["inducement_count"] = int(item["inducement_count"])
+                    if "inducement_points" in item:
+                        zone["inducement_points"] = int(item["inducement_points"])
+                    if "has_gap" in item:
+                        zone["has_gap"] = bool(item["has_gap"])
+                    if "gap_type" in item:
+                        zone["gap_type"] = str(item["gap_type"])
+                    if "gap_date" in item:
+                        zone["gap_date"] = _to_iso(item["gap_date"])
+                    if "gap_value_low" in item:
+                        zone["gap_value_low"] = float(item["gap_value_low"])
+                    if "gap_value_high" in item:
+                        zone["gap_value_high"] = float(item["gap_value_high"])
+                    zones.append(zone)
 
     return markers, lines, zones
 
@@ -277,7 +380,9 @@ def main() -> None:
         sys.path.insert(0, str(deps_dir.parent))
 
     data_file = str(req.get("data_file", ""))
-    years = float(req.get("years", 0.25) or 0.25)
+    # years == 0 = celá historie (bez cutoff). Nepoužívat `or 0.25` — 0 je v Pythonu falsy.
+    _yr = req.get("years", None)
+    years = float(0.25 if _yr is None else _yr)
     params = req.get("params") if isinstance(req.get("params"), dict) else {}
 
     df = _load_ohlc(data_path, data_file, years)

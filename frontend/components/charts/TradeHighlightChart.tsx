@@ -10,58 +10,122 @@ interface TradeHighlightChartProps {
   height?: number;
 }
 
-const CONTEXT_BARS = 15;
+const CONTEXT_BARS = 20;
 
-/** Normalize date to YYYY-MM-DD for matching (handles ISO, datetime, timezone). */
-function toYmd(s: string): string {
-  const raw = (s || "").trim();
-  if (!raw) return "";
-  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  return match ? `${match[1]}-${match[2]}-${match[3]}` : raw.slice(0, 10);
+/** Forex / GBP apod. – LW Charts default truncuje na 2 desetinná místa. */
+function inferPriceFormat(bars: OhlcBar[]): { type: "price"; precision: number; minMove: number } {
+  let maxD = 2;
+  const n = bars.length;
+  const sample = n > 600 ? [...bars.slice(0, 300), ...bars.slice(-300)] : bars;
+  for (const b of sample) {
+    for (const v of [b.open, b.high, b.low, b.close]) {
+      if (typeof v !== "number" || !Number.isFinite(v)) continue;
+      const s = v.toFixed(10).replace(/\.?0+$/, "");
+      const dot = s.indexOf(".");
+      if (dot >= 0) {
+        const fracLen = s.length - dot - 1;
+        maxD = Math.max(maxD, Math.min(fracLen, 10));
+      }
+    }
+  }
+  const fxLike = sample.some((b) => {
+    const c = b.close;
+    return typeof c === "number" && c > 0.2 && c < 500;
+  });
+  if (fxLike) maxD = Math.max(maxD, 5);
+  const precision = Math.min(Math.max(maxD, 2), 8);
+  const minMove = Number(Math.pow(10, -precision).toFixed(12));
+  return { type: "price", precision, minMove };
 }
 
-/** Get OHLC slice for a single trade - entry to exit + context bars before/after */
-function getOhlcWindow(ohlc: OhlcBar[], trade: Trade): OhlcBar[] {
-  if (ohlc.length === 0) return [];
+function parseBarTimeMs(s: string): number {
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : NaN;
+}
+
+/**
+ * Najde index baru, jehož čas je nejblíž okamžiku obchodu (entry/exit ISO z engine).
+ * Dříve se používalo jen YYYY-MM-DD → u intraday všechny bary v jednom dni spadly na STEJNÝ
+ * první bar dne → zavádějící šipky vůči skutečným fill cenám.
+ */
+function findNearestBarIndex(ohlc: OhlcBar[], isoWhen: string): number {
+  if (ohlc.length === 0 || !isoWhen.trim()) return -1;
+  const target = Date.parse(isoWhen);
+  if (!Number.isFinite(target)) return -1;
+  let best = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < ohlc.length; i++) {
+    const barMs = parseBarTimeMs(ohlc[i].date);
+    if (!Number.isFinite(barMs)) continue;
+    const d = Math.abs(barMs - target);
+    if (d < bestDiff) {
+      bestDiff = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function toUtcSeconds(value: string, fallbackIndex: number): number {
+  const parsed = Date.parse(value);
+  if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  return Math.floor(Date.UTC(2020, 0, 1 + fallbackIndex) / 1000);
+}
+
+/** LW Charts: čas musí striktně růst (duplicitní sekundy slučují body). */
+function bumpTimeIfNeeded(time: number, prev: number): number {
+  return time <= prev ? prev + 1 : time;
+}
+
+function getOhlcWindowAndLocalIndices(
+  ohlc: OhlcBar[],
+  trade: Trade
+): { window: OhlcBar[]; entryLocal: number; exitLocal: number } {
   const entryDate = trade.entryDate ?? trade.date ?? "";
   const exitDate = trade.exitDate ?? trade.date ?? "";
-  const entryKey = toYmd(entryDate);
-  const exitKey = toYmd(exitDate);
-
-  let entryIdx = ohlc.findIndex((b) => toYmd(b.date) === entryKey);
-  let exitIdx = ohlc.findIndex((b) => toYmd(b.date) === exitKey);
-
+  let entryIdx = findNearestBarIndex(ohlc, entryDate);
+  let exitIdx = findNearestBarIndex(ohlc, exitDate);
   if (entryIdx < 0) entryIdx = 0;
   if (exitIdx < 0) exitIdx = ohlc.length - 1;
-  if (entryIdx > exitIdx) [entryIdx, exitIdx] = [exitIdx, entryIdx];
-
+  if (entryIdx > exitIdx) {
+    const t = entryIdx;
+    entryIdx = exitIdx;
+    exitIdx = t;
+  }
   const start = Math.max(0, entryIdx - CONTEXT_BARS);
   const end = Math.min(ohlc.length, exitIdx + CONTEXT_BARS + 1);
-  return ohlc.slice(start, end);
+  const window = ohlc.slice(start, end);
+  return {
+    window,
+    entryLocal: entryIdx - start,
+    exitLocal: exitIdx - start,
+  };
 }
 
 export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighlightChartProps) {
   const chartRef = useRef<HTMLDivElement>(null);
   const chartInstanceRef = useRef<ReturnType<typeof import("lightweight-charts").createChart> | null>(null);
 
-  const windowOhlc = trade ? getOhlcWindow(ohlc, trade) : [];
+  const pack =
+    trade != null && ohlc.length > 0 ? getOhlcWindowAndLocalIndices(ohlc, trade) : null;
+  const windowOhlc = pack?.window ?? [];
+  const entryLocal = pack?.entryLocal ?? 0;
+  const exitLocal = pack?.exitLocal ?? 0;
 
   useEffect(() => {
-    if (!chartRef.current || windowOhlc.length === 0) return;
+    if (!chartRef.current || windowOhlc.length === 0 || !trade) return;
 
     let mounted = true;
 
     import("lightweight-charts").then(({ createChart }) => {
       if (!mounted || !chartRef.current) return;
 
-      if (chartInstanceRef.current) {
-        chartInstanceRef.current.remove();
-        chartInstanceRef.current = null;
-      }
+      chartInstanceRef.current?.remove();
+      chartInstanceRef.current = null;
 
       const chart = createChart(chartRef.current, {
-        width: chartRef.current.clientWidth,
-        height: height,
+        width: Math.max(chartRef.current.clientWidth, 200),
+        height,
         layout: {
           background: { color: "#18181b" },
           textColor: "#a1a1aa",
@@ -70,6 +134,8 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
           vertLines: { color: "#27272a" },
           horzLines: { color: "#27272a" },
         },
+        rightPriceScale: { borderColor: "#3f3f46" },
+        timeScale: { borderColor: "#3f3f46", rightOffset: 4 },
       });
 
       const candleSeries = chart.addCandlestickSeries({
@@ -79,54 +145,87 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
         borderDownColor: "#ef4444",
       });
 
-      const toUtcSeconds = (value: string, fallbackIndex: number): number => {
-        const parsed = Date.parse(value);
-        if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-        return Math.floor(Date.UTC(2020, 0, 1 + fallbackIndex) / 1000);
-      };
+      const priceFmt = inferPriceFormat(windowOhlc);
+      candleSeries.applyOptions({ priceFormat: priceFmt });
 
-      const candleData = windowOhlc.map((bar, i) => ({
+      const candleData = windowOhlc.map((bar: OhlcBar, i: number) => ({
         time: toUtcSeconds(bar.date, i) as import("lightweight-charts").UTCTimestamp,
         open: bar.open,
         high: bar.high,
         low: bar.low,
         close: bar.close,
       }));
-      candleSeries.setData(candleData);
+      let prevT = -Infinity;
+      const deduped = candleData.map((c: (typeof candleData)[number]) => {
+        const t = bumpTimeIfNeeded(c.time, prevT);
+        prevT = t;
+        return { ...c, time: t as import("lightweight-charts").UTCTimestamp };
+      });
+      candleSeries.setData(deduped);
 
-      if (trade) {
-        const entryYmd = toYmd(trade.entryDate ?? trade.date ?? "");
-        const exitYmd = toYmd(trade.exitDate ?? trade.date ?? "");
-        const entryBar = windowOhlc.find((b) => toYmd(b.date) === entryYmd);
-        const exitBar = windowOhlc.find((b) => toYmd(b.date) === exitYmd);
+      const ei = Math.max(0, Math.min(entryLocal, deduped.length - 1));
+      const xi = Math.max(0, Math.min(exitLocal, deduped.length - 1));
 
-        type Marker = {
-          time: import("lightweight-charts").UTCTimestamp;
-          position: "belowBar" | "aboveBar";
+      type Marker = {
+        time: import("lightweight-charts").UTCTimestamp;
+        position: "belowBar" | "aboveBar";
+        color: string;
+        shape: "arrowUp" | "arrowDown";
+        text: string;
+      };
+      const markers: Marker[] = [];
+      let lastT = -Infinity;
+      const pushMarker = (timeSec: number, m: Omit<Marker, "time">) => {
+        const t = bumpTimeIfNeeded(timeSec, lastT);
+        lastT = t;
+        markers.push({ ...m, time: t as import("lightweight-charts").UTCTimestamp });
+      };
+      pushMarker(Number(deduped[ei].time), {
+        position: trade.type === "buy" ? "belowBar" : "aboveBar",
+        color: trade.type === "buy" ? "#10b981" : "#ef4444",
+        shape: trade.type === "buy" ? "arrowUp" : "arrowDown",
+        text: trade.type === "buy" ? "Long" : "Short",
+      });
+      pushMarker(Number(deduped[xi].time), {
+        position: trade.type === "buy" ? "aboveBar" : "belowBar",
+        color: "#a1a1aa",
+        shape: trade.type === "buy" ? "arrowDown" : "arrowUp",
+        text: "Exit",
+      });
+      candleSeries.setMarkers(markers);
+
+      // Skutečné fill ceny z engine (ne pozice šipek u OHLC)
+      const cs = candleSeries as unknown as {
+        createPriceLine?: (opts: {
+          price: number;
           color: string;
-          shape: "arrowUp" | "arrowDown";
-          text: string;
-        };
-        const markers: Marker[] = [];
-        if (entryBar) {
-          markers.push({
-            time: toUtcSeconds(entryBar.date, 0) as import("lightweight-charts").UTCTimestamp,
-            position: trade.type === "buy" ? "belowBar" : "aboveBar",
-            color: trade.type === "buy" ? "#10b981" : "#ef4444",
-            shape: trade.type === "buy" ? "arrowUp" : "arrowDown",
-            text: trade.type === "buy" ? "Long" : "Short",
+          lineWidth: number;
+          lineStyle?: number;
+          axisLabelVisible: boolean;
+          title: string;
+        }) => { remove: () => void };
+      };
+      if (typeof cs.createPriceLine === "function") {
+        if (trade.entryPrice != null && Number.isFinite(trade.entryPrice)) {
+          cs.createPriceLine({
+            price: trade.entryPrice,
+            color: "rgba(16, 185, 129, 0.85)",
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true,
+            title: `Entry ${trade.entryPrice.toFixed(priceFmt.precision)}`,
           });
         }
-        if (exitBar && exitBar.date !== entryBar?.date) {
-          markers.push({
-            time: toUtcSeconds(exitBar.date, 0) as import("lightweight-charts").UTCTimestamp,
-            position: trade.type === "buy" ? "aboveBar" : "belowBar",
-            color: "#a1a1aa",
-            shape: trade.type === "buy" ? "arrowDown" : "arrowUp",
-            text: "Exit",
+        if (trade.exitPrice != null && Number.isFinite(trade.exitPrice)) {
+          cs.createPriceLine({
+            price: trade.exitPrice,
+            color: "rgba(161, 161, 170, 0.95)",
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true,
+            title: `Exit ${trade.exitPrice.toFixed(priceFmt.precision)}`,
           });
         }
-        candleSeries.setMarkers(markers);
       }
 
       chart.timeScale().fitContent();
@@ -135,12 +234,10 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
 
     return () => {
       mounted = false;
-      if (chartInstanceRef.current) {
-        chartInstanceRef.current.remove();
-        chartInstanceRef.current = null;
-      }
+      chartInstanceRef.current?.remove();
+      chartInstanceRef.current = null;
     };
-  }, [windowOhlc, trade, height]);
+  }, [windowOhlc, trade, height, entryLocal, exitLocal]);
 
   if (!trade) {
     return (

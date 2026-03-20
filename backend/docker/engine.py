@@ -1623,14 +1623,14 @@ def run_backtest(
 
         def notify_trade(self, trade):
             super().notify_trade(trade)
-            _record_trade(trade)
+            _record_trade(trade, self)
 
         def notify_order(self, order):
             super().notify_order(order)
             if getattr(order, "trade", None) and order.trade.isclosed:
-                _record_trade(order.trade)
+                _record_trade(order.trade, self)
 
-    def _record_trade(trade):
+    def _record_trade(trade, recording_strat=None):
         """Record a closed trade to trades_list. Deduplicated (notify_trade + notify_order both fire)."""
         if not trade.isclosed:
             return
@@ -1666,7 +1666,7 @@ def run_backtest(
                 is_long=bool(is_long),
             )
 
-            trades_list.append({
+            d = {
                 "date": _safe_iso(dt_close),
                 "entryDate": _safe_iso(dt_open),
                 "exitDate": _safe_iso(dt_close),
@@ -1695,7 +1695,17 @@ def run_backtest(
                     if dt_open is not None and dt_close is not None
                     else 0.0
                 ),
-            })
+            }
+            if recording_strat is not None:
+                try:
+                    dec = getattr(recording_strat, "decorate_trade_record", None)
+                    if callable(dec):
+                        merged = dec(d, trade)
+                        if isinstance(merged, dict):
+                            d = merged
+                except Exception:
+                    pass
+            trades_list.append(d)
         except Exception:
             pass
 

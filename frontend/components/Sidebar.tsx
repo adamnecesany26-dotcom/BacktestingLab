@@ -18,17 +18,20 @@ const CREATE_LABELS: Record<ItemType, string> = {
 /** Virtual file key for viewing imported indicator/module: "indicator:id" or "module:id" */
 export type VirtualFileKey = string;
 
+const SECTION_ORDER: ItemType[] = ["strategies", "indicators", "modules"];
+
 interface SidebarProps {
   openItem: { type: ItemType; id: string; name: string } | null;
-  selectedType: ItemType | null;
-  items: FirestoreItem[];
+  /** Lists for Projekt accordion (all types at once) */
+  itemsByType: Record<ItemType, FirestoreItem[]>;
+  expandedSections: Record<ItemType, boolean>;
+  onToggleSection: (type: ItemType) => void;
+  onCreateForType: (type: ItemType) => void;
   files: FirestoreFile[];
   /** Applied (confirmed) indicators - shown in left menu when strategy is open */
   appliedIndicators?: FirestoreItem[];
   appliedModules?: FirestoreItem[];
-  onSelectType?: (type: ItemType) => void;
   onSelectItem?: (type: ItemType, item: FirestoreItem) => void;
-  onCreateClick?: () => void;
   onAddFileClick?: () => void;
   onBack?: () => void;
   onSelectFile?: (fileName: string) => void;
@@ -37,15 +40,15 @@ interface SidebarProps {
   selectedFile?: string | null;
 }
 
-/** Sidebar - 3 buttons, or expanded list + create, or item files */
+/** Sidebar — Projekt jako accordion (sekce + vlastní vytvořit), nebo soubory otevřené položky */
 export function Sidebar({
   openItem,
-  selectedType,
-  items,
+  itemsByType,
+  expandedSections,
+  onToggleSection,
+  onCreateForType,
   files,
-  onSelectType,
   onSelectItem,
-  onCreateClick,
   onAddFileClick,
   appliedIndicators = [],
   appliedModules = [],
@@ -155,74 +158,67 @@ export function Sidebar({
     );
   }
 
-  if (selectedType) {
-    const label = LABELS[selectedType];
-    const createLabel = CREATE_LABELS[selectedType];
-    return (
-      <aside className="w-64 flex flex-col border-r border-zinc-800 bg-zinc-900/30">
-        <div className="px-4 py-3 border-b border-zinc-800">
-          <button
-            onClick={() => onBack?.()}
-            className="text-sm text-zinc-400 hover:text-zinc-200 flex items-center gap-2"
-          >
-            ← Zpět
-          </button>
-          <h2 className="font-semibold text-sm mt-2 text-zinc-300">{label}</h2>
-        </div>
-        <div className="flex-1 overflow-auto p-2">
-          <div className="space-y-0.5">
-            {items.length === 0 ? (
-              <p className="text-zinc-500 text-sm py-2">Žádné položky</p>
-            ) : (
-              items.map((item) => (
-                <div
-                  key={item.id}
-                  onClick={() => onSelectItem?.(selectedType, item)}
-                  className="flex items-center gap-2 py-2 px-2 rounded text-sm cursor-pointer hover:bg-zinc-800 text-zinc-400"
-                >
-                  <span>📁</span>
-                  <span className="truncate">{item.name}</span>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
-        <div className="p-3 border-t border-zinc-800">
-          <button
-            onClick={onCreateClick}
-            className="w-full px-4 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-sm"
-          >
-            {createLabel}
-          </button>
-        </div>
-      </aside>
-    );
-  }
-
   return (
     <aside className="w-64 flex flex-col border-r border-zinc-800 bg-zinc-900/30">
       <div className="px-4 py-3 border-b border-zinc-800">
         <h2 className="font-semibold text-sm text-zinc-300">Projekt</h2>
       </div>
-      <div className="flex-1 overflow-auto p-3 space-y-2">
-        <button
-          onClick={() => onSelectType?.("strategies")}
-          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
-        >
-          Strategie
-        </button>
-        <button
-          onClick={() => onSelectType?.("indicators")}
-          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
-        >
-          Indikátory
-        </button>
-        <button
-          onClick={() => onSelectType?.("modules")}
-          className="w-full px-4 py-3 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-medium text-left transition-colors"
-        >
-          Moduly
-        </button>
+      <div className="flex-1 overflow-auto p-2 space-y-1.5">
+        {SECTION_ORDER.map((type) => {
+          const expanded = expandedSections[type];
+          const label = LABELS[type];
+          const createLabel = CREATE_LABELS[type];
+          const list = itemsByType[type] ?? [];
+          return (
+            <div
+              key={type}
+              className="rounded-lg border border-zinc-800/90 overflow-hidden bg-zinc-900/50"
+            >
+              <button
+                type="button"
+                onClick={() => onToggleSection(type)}
+                className="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left text-sm font-medium text-zinc-200 hover:bg-zinc-800/70 transition-colors"
+              >
+                <span>{label}</span>
+                <span
+                  className={`text-zinc-500 text-xs shrink-0 transition-transform duration-200 ${
+                    expanded ? "rotate-180" : ""
+                  }`}
+                  aria-hidden
+                >
+                  ▼
+                </span>
+              </button>
+              {expanded && (
+                <div className="border-t border-zinc-800 px-2 pb-2 pt-1 space-y-2">
+                  <div className="space-y-0.5">
+                    {list.length === 0 ? (
+                      <p className="text-zinc-500 text-xs py-1.5 px-1">Žádné položky</p>
+                    ) : (
+                      list.map((item) => (
+                        <div
+                          key={item.id}
+                          onClick={() => onSelectItem?.(type, item)}
+                          className="flex items-center gap-2 py-1.5 px-2 rounded text-sm cursor-pointer hover:bg-zinc-800 text-zinc-400"
+                        >
+                          <span aria-hidden>📁</span>
+                          <span className="truncate">{item.name}</span>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => onCreateForType(type)}
+                    className="w-full px-3 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium"
+                  >
+                    {createLabel}
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
     </aside>
   );

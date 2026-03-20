@@ -366,7 +366,8 @@ Backtesting_app/
 |---------|-------|
 | **Equity** | `EquityChart` – křivka equity v čase |
 | **Highlight** | `TradeHighlight` – jeden obchod (entry–exit) + seznam obchodů |
-| **Detailed** | `ModuleOutputChart`: OHLC + **sloučené** markery/čáry/zóny ze všech `moduleOutputs` + obchody (ne oddělená záložka „Moduly“) |
+| **Detailed** | `ModuleOutputChart`: OHLC + **sloučené** markery/čáry/zóny ze všech `moduleOutputs` + obchody (výřez času, RRR volitelně) |
+| **Run view** | `RunModuleViewChart`: stejné `moduleOutputs` z runu + všechny obchody na plném OHLC (bez živého `/api/view`) |
 | **Analytics** | Validace (foldy, summary, guardrails), robustnost/sweep heatmapa, Monte Carlo (`method`/`mode`/`note`), regime, portfolio, execution + **costAttribution**, forward bridge, batchSummary, qualityGate, experiment (runDiff, promoteEvidence); **readiness + overfitting** (heuristiky) |
 | **Run history** | `RunHistory` – uložené runy, compare, lifecycle, grafy metrik, sloupec readiness |
 
@@ -475,6 +476,7 @@ Při vývoji indikátoru/modulu můžeš v View módu **měnit parametry bez úp
 
 - **Ikona** – zobrazí se vedle tlačítka „Obnovit“, když je vybraný modul/indikátor/strategie
 - **Drawer** – kliknutím na ikonu se z pravé strany vysune panel (šířka 320px) s parametry
+- **VIEW_PARAMS_META** – volitelný dict ve stejném stylu jako `PARAMS_META` (`title`, `whatItMeans`, `howToUse`); u každého pole se v draweru zobrazí lidský název a text nápovědy (`parseViewParamMeta` v `strategyParams.ts`)
 - **Žádné VIEW_PARAMS** – pokud modul nemá `VIEW_PARAMS`, drawer zobrazí návod, co přidat do kódu
 - **Barva čar** – `get_line` může vracet `{"EMA20": {"data": [...], "color": "#ff0000"}}` pro vlastní barvu čáry
 

@@ -1,51 +1,50 @@
-# S/D Zone Strategy
+# Strategie S/D zón (Supply & Demand)
 
-Strategie obchodující Supply/Demand zóny – Long na Demand, Short na Supply.
+Strategie hledá na grafu **oblasti poptávky (Demand)** a **nabídky (Supply)** podle modulu S/D zón a snaží se u nich **nakoupit** (Demand) nebo **prodat** (Supply) limitem na hraně zóny.
 
-## Požadavky
+## Co musíš mít v aplikaci
 
-- **Moduly**: Swing HL, S/D Zones (oba musí být vybrány v panelu Moduly)
-- **Data**: OHLC s datetime indexem
-- **Instrument**: Futures (1 kontrakt, tick dle broker_config)
+1. Ve strategii vložený kód z tohoto `main.py`.  
+2. V pravém panelu v sekci **Moduly** vybrané **oba**:
+   - **HL identificator** nebo **Swing HL** (strategie zkouší stejné pořadí jako modul S/D: nejdřív `HL_identificator`, pak `Swing_HL`),
+   - **S/D Zones** (název modulu může být třeba `S_D_Zones` nebo `SD_identificator`),
+3. Kliknout **Potvrdit**, aby se moduly zkopírovaly do běhu.
 
-## Logika
+Bez obou modulů strategie zóny nedostane a neobchoduje.
 
-### Vstup
-- **Každá aktivní zóna** má limit order na hranici (Demand: horní, Supply: dolní)
-- Limit order se vyplní když cena **jakkoliv překryje** tuto úroveň (bar high/low)
-- Zóna končí při dotyku ceny (+ 3 bary rezerva pro entry)
+## Jak vstup funguje (zjednodušeně)
 
-### Stop loss
-- **Demand**: dolní hranice zóny (`zone_low`) – trigger když cena navštíví tuto úroveň
-- **Supply**: horní hranice zóny (`zone_high`) – trigger když cena navštíví tuto úroveň
+- U každé platné **Demand** zóny je **limitní nákup** u horní hranice zóny (cena tam „reaguje“).  
+- U **Supply** zóny je **limitní prodej** u dolní hranice.  
+- Když cena zónu **prakticky znehodnotí** (dle logiky modulu), zóna přestane platit.  
+- Zóny se berou z **hrubšího časového rámce** (např. denní), vstupy se řeší na jemnějším (např. 30m) – přesně podle parametrů strategie.
 
-### Profit target (priorita)
-1. **Opposing zóna** – Demand → nejbližší Supply nad, Supply → nejbližší Demand pod (R:R ≥ 1.5)
-2. **Major swing H/L** – Demand → nejbližší major_high, Supply → nejbližší major_low (R:R ≥ 1.5)
-3. **Fallback**: fixní 2.0 RRR
-4. **Max. RRR**: 4.0 – target se ořízne, pokud by RRR přesáhlo 4.0
+## Stop a cíl (profit)
 
-## Parametry
+- **Stop** je u Demand pod zónou, u Supply nad zónou (hrany pivotu).  
+- **Cíl** systém hledá nejdřív u **opačné zóny**, pak u **major swingu**; když to nevyjde, použije se fixnější poměr rizika k zisku (RRR).  
+- Detaily pravidel a parametrů MTF jsou v **`SD_de.md`** a v hlavičce `main.py`.
 
-| Parametr | Výchozí | Popis |
-|----------|---------|-------|
-| timeframe | 1d | Timeframe pro Swing HL a S/D |
-| min_rr_zone | 1.5 | Min. R:R pro target na opposing zónu |
-| min_rr_swing | 1.5 | Min. R:R pro target na major swing |
-| fallback_rr | 2.0 | Fixní RRR pokud ani zóna ani swing nesplní |
-| max_rr | 4.0 | Maximální RRR – target se ořízne na 4.0 R |
-| zone_max_bars | 60 | Max. stáří zóny v barech |
+## Důležité parametry (náhled)
 
-## Použití
+| Oblast | Příklad | Smysl |
+|--------|---------|--------|
+| `zone_timeframes` | např. `1d` | Na jakém TF se staví zóny |
+| `exec_timeframe` | např. `30m` | Na jakém TF běží vstupy |
+| `zone_max_bars` | 60 | Řídí životnost zóny v modulu: při `get_zones` se mapuje na `zone_extend_right_bars` (hodnota z panelu S/D modulu pro tento účel v backtestu neplatí) |
+| Filtry zóny | `min_impulse_score`, inducement, touch | Co všechno musí zóna splnit, aby se obchodovala |
 
-1. Vytvoř strategii v aplikaci
-2. Zkopíruj kód z `main.py`
-3. V panelu Moduly vyber **Swing HL** a **S/D Zones**, klikni Potvrdit
-4. Nastav instrument (NQ, ES, …) a data
-5. Spusť backtest
+Přesný seznam je v `PARAMS` ve zdrojáku a v UI strategie.
+
+**Simulace vs. live:** limitní vstupy bez vlastního spread modelu v kódu strategie (globální slippage/spread z nastavení běhu). Výstup z obchodu z jednoho baru OHLC — při současném průniku cíle a stopu v jedné svíčce nejde o pořadí ticků uvnitř baru. Detaily v hlavičce `main.py` a v [READMEADAM.md](../../READMEADAM.md) (sekce *Strategie sd_zone_strategy*).
+
+## Kroky: spustit backtest
+
+1. Zkopíruj `main.py` do strategie v aplikaci.  
+2. Přidej moduly **Swing HL** + **S/D Zones** a potvrď.  
+3. Vyber futures instrument (NQ, ES, …) a data.  
+4. Nastav parametry (nebo nech výchozí) a spusť **Run**.
 
 ---
 
-## Platforma Backtesting App
-
-Strategie běží v **[Backtesting_app](../../README.md)**. Uživatelská mapa aplikace: **[READMEADAM.md](../../READMEADAM.md)**; příkazy: **[SCRIPTS.md](../../SCRIPTS.md)**; vývojová reference: **[READMEAI.md](../../READMEAI.md)**.
+Platforma: **[Backtesting_app](../../README.md)** · Průvodce UI: **[READMEADAM.md](../../READMEADAM.md)** · Definice zón: **[SD_def.md](../../SD_def.md)** · Obchodní spec: **[SD_de.md](../../SD_de.md)**

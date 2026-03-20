@@ -1,5 +1,17 @@
 # Support/Resistance zóny v-1.2
 
+## Rychlý přehled
+
+**K čemu to je:** Nakreslí **Support** (zeleně) a **Resistance** (červeně) jako vodorovné úrovně. Bere je **jen z major swingů** – ne z každého malého zvratu.
+
+**Jak vznikají:** Buď **dva a více dotyků** stejné oblasti (cena mezitím musela „odejít“), nebo **konsolidace** mezi dvěma major body.
+
+**Závislost:** Modul **Swing HL** (nebo HL identificator).
+
+**Soubor ke kopírování:** `examples/sr_zones.py` → vlastní modul např. **S/R Zones**.
+
+---
+
 Modul pro detekci S/R levelů **pouze z major Swing HL**. Dvě cesty k validní zóně:
 
 - **(A) 2× touch** – cluster major bodů s 2+ validními dotyky (cena odcestovala pryč mezi nimi)

@@ -49,10 +49,25 @@ import {
   type InstrumentType,
 } from "@shared/types";
 
+const EMPTY_SIDEBAR_LISTS: Record<ItemType, FirestoreItem[]> = {
+  strategies: [],
+  indicators: [],
+  modules: [],
+};
+
+const DEFAULT_EXPANDED_SIDEBAR: Record<ItemType, boolean> = {
+  strategies: true,
+  indicators: false,
+  modules: false,
+};
+
 export default function Home() {
   const runLockRef = useRef(false);
-  const [selectedType, setSelectedType] = useState<ItemType | null>(null);
-  const [items, setItems] = useState<FirestoreItem[]>([]);
+  const [sidebarLists, setSidebarLists] =
+    useState<Record<ItemType, FirestoreItem[]>>(EMPTY_SIDEBAR_LISTS);
+  const [expandedSidebar, setExpandedSidebar] =
+    useState<Record<ItemType, boolean>>(DEFAULT_EXPANDED_SIDEBAR);
+  const [createModalType, setCreateModalType] = useState<ItemType | null>(null);
   const [openItem, setOpenItem] = useState<{ type: ItemType; id: string; name: string } | null>(null);
   const [files, setFiles] = useState<{ fileName: string; content: string }[]>([]);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
@@ -172,10 +187,18 @@ export default function Home() {
     };
   }, [addLog]);
 
-  const loadItems = useCallback(async (type: ItemType) => {
-    const list = await listItems(type);
-    setItems(list);
+  const loadSidebarLists = useCallback(async () => {
+    const [strategies, indicators, modules] = await Promise.all([
+      listItems("strategies"),
+      listItems("indicators"),
+      listItems("modules"),
+    ]);
+    setSidebarLists({ strategies, indicators, modules });
   }, []);
+
+  useEffect(() => {
+    void loadSidebarLists();
+  }, [loadSidebarLists]);
 
   const loadFiles = useCallback(async (type: ItemType, id: string) => {
     const f = await getFiles(type, id);
@@ -191,10 +214,6 @@ export default function Home() {
     setFileContent(v);
     setLastSavedContent(v);
   }, []);
-
-  useEffect(() => {
-    if (selectedType) loadItems(selectedType);
-  }, [selectedType, loadItems]);
 
   useEffect(() => {
     if (viewMode) {
@@ -434,9 +453,13 @@ export default function Home() {
     }
   }, [filteredInstruments, backtestParams.instrumentType, selectedInstrument]);
 
-  const handleSelectType = (type: ItemType) => {
-    setSelectedType(type);
-    setOpenItem(null);
+  const toggleSidebarSection = (type: ItemType) => {
+    setExpandedSidebar((prev) => ({ ...prev, [type]: !prev[type] }));
+  };
+
+  const openCreateModalForType = (type: ItemType) => {
+    setCreateModalType(type);
+    setIsCreateModalOpen(true);
   };
 
   const handleSelectItem = (type: ItemType, item: FirestoreItem) => {
@@ -449,17 +472,16 @@ export default function Home() {
     if (openItem) {
       setOpenItem(null);
       setShowResults(false);
-    } else if (selectedType) {
-      setSelectedType(null);
     }
   };
 
   const handleCreateItem = async (name: string, tag?: string) => {
-    if (!selectedType) return;
-    const { id } = await createItem(selectedType, name, tag);
-    await loadItems(selectedType);
+    const type = createModalType;
+    if (!type) return;
+    const { id } = await createItem(type, name, tag);
+    await loadSidebarLists();
     const newItem: FirestoreItem = { id, name, tag, createdAt: null as any };
-    handleSelectItem(selectedType, newItem);
+    handleSelectItem(type, newItem);
   };
 
   const handleAddFile = async (fileName: string) => {
@@ -790,9 +812,8 @@ export default function Home() {
         try {
           await saveBacktestResult(strategyContext.id, strategyContext.name, payload);
           const history = await listBacktestResults(strategyContext.id);
-          if (openItem?.id === strategyContext.id) {
-            setRunHistory(history);
-          }
+          // Vždy aktualizovat historii po uložení (dřívější podmínka openItem?.id často zablokovala UI).
+          setRunHistory(history);
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
           addLog(`Uložení výsledků selhalo: ${msg}`);
@@ -1037,10 +1058,13 @@ export default function Home() {
 
   return (
     <div className="flex h-screen overflow-hidden">
-      {isCreateModalOpen && selectedType && (
+      {isCreateModalOpen && createModalType && (
         <CreateModal
-          type={selectedType}
-          onClose={() => setIsCreateModalOpen(false)}
+          type={createModalType}
+          onClose={() => {
+            setIsCreateModalOpen(false);
+            setCreateModalType(null);
+          }}
           onCreate={handleCreateItem}
         />
       )}
@@ -1053,12 +1077,12 @@ export default function Home() {
       )}
       <Sidebar
         openItem={openItem}
-        selectedType={selectedType}
-        items={items}
+        itemsByType={sidebarLists}
+        expandedSections={expandedSidebar}
+        onToggleSection={toggleSidebarSection}
+        onCreateForType={openCreateModalForType}
         files={files}
-        onSelectType={handleSelectType}
         onSelectItem={handleSelectItem}
-        onCreateClick={() => setIsCreateModalOpen(true)}
         onAddFileClick={() => setIsAddFileModalOpen(true)}
         onBack={handleBack}
         onSelectFile={(f) => {
