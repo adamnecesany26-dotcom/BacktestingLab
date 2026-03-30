@@ -4,12 +4,13 @@ import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { RunHistory } from "@/components/results/RunHistory";
+import { assessOverfitting, readinessFromSeverity } from "@/lib/overfittingSignals";
 
-/** Client-only + stable chunk loading (avoids dev ChunkLoadError on lightweight-charts async splits). */
-const EquityChart = dynamic(
-  () => import("@/components/charts/EquityChart").then((m) => ({ default: m.EquityChart })),
-  { ssr: false, loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf equity…</div> }
-);
+/** Client-only; default export keeps a single webpack async chunk (fewer stale named-export mismatches in dev). */
+const EquityChart = dynamic(() => import("@/components/charts/EquityChart"), {
+  ssr: false,
+  loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf equity…</div>,
+});
 const TradeHighlight = dynamic(
   () => import("@/components/results/TradeHighlight").then((m) => ({ default: m.TradeHighlight })),
   { ssr: false, loading: () => <div className="py-16 text-center text-sm text-zinc-500">Načítám graf…</div> }
@@ -17,16 +18,24 @@ const TradeHighlight = dynamic(
 import { StatBlocks } from "@/components/results/StatBlocks";
 import { QualityGateBanner } from "@/components/results/QualityGateBanner";
 import { AnalyticsView } from "@/components/results/AnalyticsView";
-import { RunModuleViewChart } from "@/components/results/RunModuleViewChart";
 import type { ModuleOutput, RunResponse } from "@shared/types";
 import {
   computeDetailedChartWindow,
   filterModuleOutputToOhlcWindow,
   type DetailedViewMode,
 } from "@/lib/detailedTradesWindow";
+import { getChartTfSelectOptions, resampleOhlcForChartChoice } from "@/lib/chartOhlcResample";
 import type { SavedBacktestRun } from "@/lib/firestore";
 
-type TabId = "equity" | "highlight" | "detailed" | "runView" | "analytics" | "runHistory";
+type TabId = "equity" | "highlight" | "detailed" | "analytics" | "runHistory";
+
+const RESULT_TABS: { id: TabId; label: string; shortcut: string }[] = [
+  { id: "equity", label: "Equity", shortcut: "1" },
+  { id: "highlight", label: "Highlight", shortcut: "2" },
+  { id: "detailed", label: "Detailed", shortcut: "3" },
+  { id: "analytics", label: "Analytics", shortcut: "4" },
+  { id: "runHistory", label: "Run history", shortcut: "5" },
+];
 
 interface ResultsViewProps {
   results: RunResponse | null;
@@ -60,35 +69,93 @@ export function ResultsView({
   const [detailedPage, setDetailedPage] = useState(0);
   const [tradesPerView, setTradesPerView] = useState(15);
   const [monthsPerView, setMonthsPerView] = useState(3);
+  const [chartTf, setChartTf] = useState<string>("source");
+  /** Index do `batchRuns` pro Equity / Detailed / Highlight / analytiku obchodů; poslední run = výchozí */
+  const [batchViewIdx, setBatchViewIdx] = useState(0);
+  const [runNote, setRunNote] = useState("");
+  const [noteExpanded, setNoteExpanded] = useState(false);
+  const [bannerDismissed, setBannerDismissed] = useState<Record<string, boolean>>({});
+
+  const batchRuns = useMemo((): RunResponse[] | null => {
+    const br = results?.batchRuns;
+    if (!Array.isArray(br) || br.length === 0) return null;
+    return br as RunResponse[];
+  }, [results?.batchRuns]);
+
+  const batchRunCount = useMemo(() => {
+    const bs = results?.batchSummary;
+    if (!bs || typeof bs !== "object") return 0;
+    return Math.max(0, Math.floor(Number((bs as Record<string, unknown>).runCount ?? 0)));
+  }, [results?.batchSummary]);
+
+  useEffect(() => {
+    if (batchRuns?.length) {
+      setBatchViewIdx(batchRuns.length - 1);
+    } else {
+      setBatchViewIdx(0);
+    }
+  }, [results?.runId, batchRuns?.length]);
+
+  const viewResults: RunResponse = useMemo(() => {
+    if (batchRuns && batchRuns.length > 0 && batchViewIdx >= 0 && batchViewIdx < batchRuns.length) {
+      return batchRuns[batchViewIdx]!;
+    }
+    return results!;
+  }, [batchRuns, batchViewIdx, results]);
+
+  const batchSummaryRoot =
+    results?.batchSummary && typeof results.batchSummary === "object"
+      ? (results.batchSummary as Record<string, unknown>)
+      : null;
+  const batchAggregates =
+    batchSummaryRoot?.aggregates && typeof batchSummaryRoot.aggregates === "object"
+      ? (batchSummaryRoot.aggregates as Record<string, unknown>)
+      : null;
+
+  const baseOhlc = viewResults?.ohlc ?? [];
+  const chartTfOptions = useMemo(() => getChartTfSelectOptions(baseOhlc), [baseOhlc]);
 
   useEffect(() => {
     setDetailedPage(0);
   }, [detailedMode, tradesPerView, monthsPerView]);
 
+  useEffect(() => {
+    setDetailedPage(0);
+  }, [batchViewIdx]);
+
+  useEffect(() => {
+    setBannerDismissed({});
+  }, [results?.runId]);
+
   const mergedOutput: ModuleOutput = useMemo(() => {
-    if (!results) return { markers: [], lines: [], zones: [] };
-    const hasModuleOutputs = !!results.moduleOutputs && Object.keys(results.moduleOutputs).length > 0;
+    if (!viewResults) return { markers: [], lines: [], zones: [] };
+    const hasModuleOutputs = !!viewResults.moduleOutputs && Object.keys(viewResults.moduleOutputs).length > 0;
     if (!hasModuleOutputs) return { markers: [], lines: [], zones: [] };
     return {
-      markers: Object.values(results.moduleOutputs!).flatMap((o) => o.markers ?? []),
-      lines: Object.entries(results.moduleOutputs!).flatMap(([mod, o]) =>
+      markers: Object.values(viewResults.moduleOutputs!).flatMap((o) => o.markers ?? []),
+      lines: Object.entries(viewResults.moduleOutputs!).flatMap(([mod, o]) =>
         (o.lines ?? []).map((l) => ({ ...l, name: `${mod}: ${l.name ?? "line"}` }))
       ),
-      zones: Object.values(results.moduleOutputs!).flatMap((o) => o.zones ?? []),
+      zones: Object.values(viewResults.moduleOutputs!).flatMap((o) => o.zones ?? []),
     };
-  }, [results]);
+  }, [viewResults]);
 
   const detailedWindow = useMemo(() => {
-    if (!results?.ohlc?.length) return null;
+    if (!baseOhlc.length) return null;
     return computeDetailedChartWindow(
-      results.ohlc,
-      results.trades ?? [],
+      baseOhlc,
+      viewResults?.trades ?? [],
       detailedMode,
       detailedPage,
       tradesPerView,
       monthsPerView
     );
-  }, [results, detailedMode, detailedPage, tradesPerView, monthsPerView]);
+  }, [viewResults?.trades, baseOhlc, detailedMode, detailedPage, tradesPerView, monthsPerView]);
+
+  const chartOhlc = useMemo(() => {
+    if (!detailedWindow?.windowOhlc.length) return [];
+    return resampleOhlcForChartChoice(detailedWindow.windowOhlc, chartTf);
+  }, [detailedWindow?.windowOhlc, chartTf]);
 
   const detailedChartOutput = useMemo(() => {
     if (!detailedWindow?.windowOhlc.length) return mergedOutput;
@@ -107,7 +174,7 @@ export function ResultsView({
         "",
         "Limits:",
         "- strategy_main.py is the editor snapshot at export (may differ from Firestore if unsaved).",
-        "- Engine/Docker image and data files must match the original run environment.",
+        "- Python/backend version, engine script, and data files should match the original run environment.",
         "",
         `datasetFingerprint (manifest): ${fp}`,
       ].join("\n");
@@ -123,13 +190,16 @@ export function ResultsView({
               monteCarlo: results.monteCarlo,
               executionSummary: results.executionSummary,
               batchSummary: results.batchSummary,
+              batchRunsOmitted: (results.batchSummary as Record<string, unknown> | undefined)?.batchRunsOmitted,
               qualityGate: results.qualityGate,
               experiment: results.experiment,
+              runNote: runNote || undefined,
             },
             null,
             2
           )
         ),
+        ...(runNote.trim() ? { "run_note.txt": strToU8(runNote) } : {}),
         "strategy_main.py": strToU8(
           strategyMainPy.trim()
             ? strategyMainPy
@@ -149,7 +219,23 @@ export function ResultsView({
     } finally {
       setBundleBusy(false);
     }
-  }, [results, strategyMainPy]);
+  }, [results, strategyMainPy, runNote]);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      )
+        return;
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const idx = "12345".indexOf(e.key);
+      if (idx >= 0 && idx < RESULT_TABS.length) setActiveTab(RESULT_TABS[idx]!.id);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
 
   if (!results) {
     return (
@@ -163,15 +249,6 @@ export function ResultsView({
       </div>
     );
   }
-
-  const tabs: { id: TabId; label: string }[] = [
-    { id: "equity", label: "Equity" },
-    { id: "highlight", label: "Highlight" },
-    { id: "detailed", label: "Detailed" },
-    { id: "runView", label: "Run view" },
-    { id: "analytics", label: "Analytics" },
-    { id: "runHistory", label: "Run history" },
-  ];
 
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-auto">
@@ -197,40 +274,293 @@ export function ResultsView({
           >
             {bundleBusy ? "…" : "Repro bundle (ZIP)"}
           </button>
+          <button
+            type="button"
+            onClick={() => setNoteExpanded((p) => !p)}
+            className="px-3 py-2 rounded-lg bg-zinc-700/60 hover:bg-zinc-600/70 text-sm text-zinc-300"
+            title="Poznámka k runu"
+          >
+            {noteExpanded ? "Skrýt poznámku" : "📝 Poznámka"}
+          </button>
         </div>
       </div>
 
-      <div className="flex gap-1 px-6 shrink-0">
-        {tabs.map(({ id, label }) => (
+      <div className="grid grid-cols-5 gap-px px-6 shrink-0 rounded-t-xl overflow-hidden border border-zinc-700/70 border-b-0 bg-zinc-800/80">
+        {RESULT_TABS.map(({ id, label, shortcut }) => (
           <button
             key={id}
+            type="button"
             onClick={() => setActiveTab(id)}
-            className={`px-4 py-2 rounded-t-lg text-sm font-medium transition-colors ${
+            className={`w-full py-3 text-[15px] font-medium transition-colors flex items-center justify-center gap-1.5 ${
               activeTab === id
-                ? "bg-zinc-800 text-emerald-400 border-b-2 border-emerald-500"
-                : "bg-zinc-800/50 text-zinc-400 hover:text-zinc-200"
+                ? "bg-zinc-900/95 text-emerald-400 border-b-2 border-emerald-500"
+                : "bg-zinc-800/60 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/90"
             }`}
           >
-            {label}
+            <span>{label}</span>
+            <kbd className="text-[11px] text-zinc-500 font-mono font-normal">{shortcut}</kbd>
           </button>
         ))}
       </div>
 
-      {results.qualityGate != null && (
-        <div className="px-6 pt-3 shrink-0">
-          <QualityGateBanner qualityGate={results.qualityGate} />
+      {noteExpanded && (
+        <div className="mx-6 mt-2 mb-1">
+          <textarea
+            value={runNote}
+            onChange={(e) => setRunNote(e.target.value)}
+            placeholder="Proč tento run? Co testuji? Co jsem zjistil?"
+            className="w-full h-20 bg-zinc-800/80 border border-zinc-700/50 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 resize-y focus:outline-none focus:ring-1 focus:ring-emerald-600/50"
+          />
         </div>
       )}
 
-      <div className="px-6 pt-3 pb-2 shrink-0 border-b border-zinc-800">
-        <StatBlocks results={results} />
+      <div className="px-6 pt-3 space-y-2 shrink-0">
+        {(() => {
+          if (bannerDismissed.trust) return null;
+          const prf = viewResults?.propRedFlags as Record<string, unknown> | undefined;
+          const trust = prf ? String(prf.trustLevel ?? "") : "";
+          const label = prf ? String(prf.trustLabel ?? "") : "";
+          const cc = Number(prf?.criticalCount ?? 0);
+          const wc = Number(prf?.warningCount ?? 0);
+          const valMode = String((viewResults?.validation as Record<string, unknown> | undefined)?.mode ?? "single");
+          if (!trust || (cc === 0 && wc === 0)) return null;
+          const bg =
+            trust === "not_trustworthy"
+              ? "bg-rose-500/15 border-rose-600/40"
+              : trust === "low_trust"
+                ? "bg-amber-500/10 border-amber-500/30"
+                : "bg-yellow-500/8 border-yellow-500/25";
+          const tc =
+            trust === "not_trustworthy" ? "text-rose-200" : trust === "low_trust" ? "text-amber-200" : "text-yellow-200";
+          return (
+            <div className={`relative rounded-xl border shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs ${bg} ${tc}`}>
+              <button
+                type="button"
+                onClick={() => setBannerDismissed((p) => ({ ...p, trust: true }))}
+                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-zinc-200 border border-zinc-600/50"
+              >
+                Schovat
+              </button>
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="font-medium uppercase tracking-wider text-[10px]">Trust: {trust.replace(/_/g, " ")}</span>
+                <span>{label}</span>
+                {cc > 0 && <span className="text-rose-300">{cc} critical</span>}
+                {wc > 0 && <span className="text-amber-300">{wc} warning{wc > 1 ? "s" : ""}</span>}
+                {valMode === "single" && (
+                  <span className="text-zinc-400">Tip: zapni OOS/WF validaci pro vyšší důvěryhodnost.</span>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+        {(() => {
+          if (bannerDismissed.reality) return null;
+          const m = viewResults?.metrics as unknown as Record<string, unknown> | undefined;
+          const tradeCount = Number(m?.tradeCount ?? 0);
+          const execSummary = viewResults?.executionSummary as Record<string, unknown> | undefined;
+          const execEnabled = execSummary ? Boolean(execSummary.enabled) : false;
+          const valObj = viewResults?.validation as Record<string, unknown> | undefined;
+          const valMode = String(valObj?.mode ?? "single");
+          const pnlD = viewResults?.tradePnlDistribution as Record<string, unknown> | undefined;
+          const conc = pnlD?.concentration as Record<string, unknown> | undefined;
+          const top5 = Number(conc?.top5PnlPct ?? NaN);
+
+          const warnings: string[] = [];
+          if (tradeCount > 0 && tradeCount < 30)
+            warnings.push(`Pouze ${tradeCount} obchodů — statisticky nedostatečný vzorek.`);
+          if (!execEnabled)
+            warnings.push("Execution model vypnutý — výsledky nezahrnují slippage, spread ani latenci.");
+          if (valMode === "single" && tradeCount > 0)
+            warnings.push("Jediný run bez OOS/WF validace — přetrénování nelze detekovat.");
+          if (Number.isFinite(top5) && top5 > 60)
+            warnings.push(`Top 5 obchodů nese ${top5.toFixed(0)} % celkového PnL — edge závisí na pár výjimkách.`);
+
+          if (warnings.length === 0) return null;
+          return (
+            <div className="relative rounded-xl border border-amber-600/45 bg-amber-950/30 shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs text-amber-200 space-y-0.5">
+              <button
+                type="button"
+                onClick={() => setBannerDismissed((p) => ({ ...p, reality: true }))}
+                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-amber-100 border border-amber-700/40"
+              >
+                Schovat
+              </button>
+              <div className="font-semibold uppercase tracking-wider text-[10px] text-amber-400/90 mb-1">Reality check</div>
+              {warnings.map((w, i) => (
+                <div key={i} className="flex items-start gap-1.5">
+                  <span className="text-amber-500 shrink-0 mt-px">&#9888;</span>
+                  <span>{w}</span>
+                </div>
+              ))}
+            </div>
+          );
+        })()}
       </div>
 
+      {batchRunCount > 1 && (
+        <div className="px-6 pt-2 shrink-0 space-y-2">
+          {!bannerDismissed.batch && (
+            <div className="relative rounded-xl border border-amber-500/35 bg-amber-500/10 shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs text-amber-100 leading-relaxed">
+              <button
+                type="button"
+                onClick={() => setBannerDismissed((p) => ({ ...p, batch: true }))}
+                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-amber-100 border border-amber-600/40"
+              >
+                Schovat
+              </button>
+              <div>
+                Dávka: <strong>{batchRunCount}</strong> runů. Grafy a záložky Equity / Highlight / Detailed / S/D analytika
+                odpovídají <strong>vybranému instrumentu</strong> níže. Celkový souhrn přes všechny běhy je v blocích metrik a v
+                Analytics (tabulka + agregace).
+              </div>
+            </div>
+          )}
+          {batchRuns && batchRuns.length > 1 ? (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              <label htmlFor="batch-instrument-select" className="text-zinc-400 shrink-0">
+                Zobrazit instrument:
+              </label>
+              <select
+                id="batch-instrument-select"
+                value={batchViewIdx}
+                onChange={(e) => setBatchViewIdx(Number(e.target.value))}
+                className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200 min-w-[12rem] max-w-full"
+              >
+                {batchRuns.map((r, i) => {
+                  const mf = r.manifest && typeof r.manifest === "object" ? (r.manifest as Record<string, unknown>) : {};
+                  const sym = String(mf.instrument ?? `Run ${i + 1}`);
+                  const file = String(mf.dataFile ?? "");
+                  return (
+                    <option key={i} value={i}>
+                      {sym}
+                      {file ? ` — ${file.split("/").pop() ?? file}` : ""}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          ) : batchSummaryRoot?.batchRunsOmitted ? (
+            <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+              {String(batchSummaryRoot.batchRunsOmittedReason ?? "Dílčí runy bez plného payloadu — přepínač instrumentů není k dispozici. Použij tabulku v Analytics nebo spusť méně než 13 instrumentů najednou.")}
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {viewResults.qualityGate != null && !bannerDismissed.qualityGate && (
+        <div className="px-6 pt-2 shrink-0">
+          <QualityGateBanner
+            qualityGate={viewResults.qualityGate}
+            onDismiss={() => setBannerDismissed((p) => ({ ...p, qualityGate: true }))}
+          />
+        </div>
+      )}
+
+      {(() => {
+        if (bannerDismissed.readiness) return null;
+        const m = viewResults?.metrics as unknown as Record<string, unknown> | undefined;
+        const valObj = viewResults?.validation as Record<string, unknown> | undefined;
+        const mc = viewResults?.monteCarlo as Record<string, unknown> | undefined;
+        const rob = viewResults?.robustness as Record<string, unknown> | undefined;
+        const valSummary = valObj?.summary as Record<string, unknown> | undefined;
+        const qg = viewResults?.qualityGate as Record<string, unknown> | undefined;
+        const ovSig = viewResults?.overfittingSignals as Record<string, unknown> | undefined;
+        const bsc = viewResults?.batchSummary as Record<string, unknown> | undefined;
+        const assessment = assessOverfitting({
+          validationMode: String(valObj?.mode ?? "single"),
+          tradeCount: Number(m?.tradeCount ?? 0),
+          riskOfRuin: Number(mc?.riskOfRuin ?? NaN),
+          qualityGatePassed: qg ? (typeof qg.passed === "boolean" ? (qg.passed as boolean) : null) : null,
+          avgDegradation: Number(valSummary?.avgDegradation ?? 0),
+          foldsFailedGates: Number(valSummary?.foldsFailedGates ?? 0),
+          guardHintCount: Array.isArray((valObj?.guardrails as Record<string, unknown> | undefined)?.possibleLeakageHints)
+            ? ((valObj?.guardrails as Record<string, unknown>).possibleLeakageHints as unknown[]).length : 0,
+          sweepTested: Number(rob?.tested ?? 0),
+          stabilityScore: Number(rob?.stabilityScore ?? NaN),
+          batchRunCount: Number(bsc?.runCount ?? 0),
+          paramTestRuns: Number(valSummary?.paramTestTotalRuns ?? 0),
+          profitFactor: m?.profitFactor != null ? Number(m.profitFactor) : null,
+          profitFactorStatus: typeof m?.profitFactorStatus === "string" ? m.profitFactorStatus as string : null,
+          trialCount: Number(ovSig?.trialCount ?? 1),
+          naiveAdjustedAlpha: ovSig?.naiveAdjustedAlpha != null ? Number(ovSig.naiveAdjustedAlpha) : null,
+        });
+        const tier = readinessFromSeverity(assessment.severityScore);
+        const tierColor = tier === "ready" ? "border-emerald-600/50 bg-emerald-950/20 text-emerald-200"
+          : tier === "caution" ? "border-amber-600/50 bg-amber-950/20 text-amber-200"
+          : "border-rose-600/50 bg-rose-950/20 text-rose-200";
+        const tierDot = tier === "ready" ? "bg-emerald-500" : tier === "caution" ? "bg-amber-500" : "bg-rose-500";
+        const valMode = String(valObj?.mode ?? "single");
+        const mcRan = mc != null && Number(mc.simulations ?? 0) > 0;
+        const manifest = viewResults?.manifest as Record<string, unknown> | undefined;
+        const inst = String(manifest?.instrument ?? "");
+        const dataFile = String(manifest?.dataFile ?? "");
+        const shortFile = dataFile.split("/").pop()?.split("\\").pop() ?? dataFile;
+        const execSummary = viewResults?.executionSummary as Record<string, unknown> | undefined;
+        const execOn = execSummary ? Boolean(execSummary.enabled) : false;
+        const topWarnings = assessment.warnings.slice(0, 3);
+        return (
+          <div className="px-6 pt-2 shrink-0">
+            <div className={`relative rounded-xl border shadow-lg shadow-black/15 px-3 py-2.5 pr-20 text-xs ${tierColor} space-y-1`}>
+              <button
+                type="button"
+                onClick={() => setBannerDismissed((p) => ({ ...p, readiness: true }))}
+                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-zinc-200 border border-zinc-600/50"
+              >
+                Schovat
+              </button>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="flex items-center gap-1.5">
+                  <span className={`inline-block w-2 h-2 rounded-full ${tierDot}`} />
+                  <span className="font-medium text-[11px]">{assessment.readinessLabel}</span>
+                </span>
+                <span className="text-zinc-500">|</span>
+                <span className="text-zinc-400">
+                  {valMode === "single"
+                    ? "Single run"
+                    : valMode === "oos_split"
+                      ? "OOS"
+                      : valMode === "walk_forward"
+                        ? "WF"
+                        : valMode === "param_test"
+                          ? "Param test"
+                          : valMode}
+                </span>
+                <span className="text-zinc-400">MC: {mcRan ? "yes" : "no"}</span>
+                <span className="text-zinc-400">Exec: {execOn ? "on" : "off"}</span>
+                {inst && <span className="text-zinc-400">{inst}</span>}
+                {shortFile && <span className="text-zinc-500 truncate max-w-[180px]">{shortFile}</span>}
+                <span className="text-zinc-500 ml-auto">score {assessment.severityScore}</span>
+              </div>
+              {topWarnings.length > 0 && (
+                <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] opacity-90">
+                  {topWarnings.map((w, i) => (
+                    <span key={i}>{w}</span>
+                  ))}
+                  {assessment.warnings.length > 3 && (
+                    <span className="text-zinc-500">+{assessment.warnings.length - 3} more in Analytics</span>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      <details className="mx-6 mt-2 mb-1 shrink-0 rounded-xl border border-zinc-700/50 bg-gradient-to-br from-zinc-900/40 via-zinc-950/30 to-zinc-950/50 shadow-lg shadow-black/15 overflow-hidden">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-zinc-300 hover:text-zinc-100 select-none list-none [&::-webkit-details-marker]:hidden flex items-center justify-between gap-2 border-b border-zinc-800/50">
+          <span>Metriky runu</span>
+          <span className="text-xs text-zinc-500 font-normal">Kliknutím rozbalit / sbalit</span>
+        </summary>
+        <div className="px-4 py-3 border-t border-zinc-800/40">
+          <StatBlocks results={viewResults} batchAggregates={batchRunCount > 1 ? batchAggregates : null} />
+        </div>
+      </details>
+
       <div
-        className={`flex-1 px-6 rounded-b-lg overflow-hidden bg-zinc-900/80 border border-zinc-800 border-t-0 ${
+        className={`flex-1 px-6 mt-2 rounded-b-xl overflow-hidden bg-zinc-900/80 border border-zinc-800 ${
           activeTab === "highlight" ||
             activeTab === "detailed" ||
-            activeTab === "runView" ||
             activeTab === "runHistory" ||
             activeTab === "analytics"
             ? "min-h-[560px]"
@@ -238,29 +568,74 @@ export function ResultsView({
         }`}
       >
         {activeTab === "equity" && (
-          <EquityChart
-            equityCurve={results.equityCurve}
-            equity={results.equityCurve ? undefined : results.equity}
-            height={480}
-            dates={
-              !results.equityCurve?.length && results.ohlc?.length
-                ? (() => {
-                    const first = results.ohlc![0]?.date;
-                    if (!first) return undefined;
-                    const d = new Date(first);
-                    d.setDate(d.getDate() - 1);
-                    const dayBefore = d.toISOString();
-                    return [dayBefore, ...results.ohlc!.map((o) => o.date)];
-                  })()
-                : undefined
-            }
-          />
+          <div className="space-y-2 py-2">
+            <EquityChart
+              equityCurve={viewResults.equityCurve}
+              equity={viewResults.equityCurve ? undefined : viewResults.equity}
+              height={340}
+              dates={
+                !viewResults.equityCurve?.length && viewResults.ohlc?.length
+                  ? (() => {
+                      const first = viewResults.ohlc![0]?.date;
+                      if (!first) return undefined;
+                      const d = new Date(first);
+                      d.setDate(d.getDate() - 1);
+                      const dayBefore = d.toISOString();
+                      return [dayBefore, ...viewResults.ohlc!.map((o) => o.date)];
+                    })()
+                  : undefined
+              }
+            />
+            {(() => {
+              const eq = viewResults.equityCurve ?? (viewResults.equity ?? []).map((v, i) => ({ date: String(i), value: v }));
+              if (!eq || eq.length < 2) return null;
+              let peak = -Infinity;
+              const ddPoints: { date: string; dd: number }[] = [];
+              let maxDdPct = 0;
+              let uwBars = 0;
+              for (const pt of eq) {
+                const val = typeof pt === "object" && pt !== null ? (pt as { date: string; value: number }).value : Number(pt);
+                const date = typeof pt === "object" && pt !== null ? (pt as { date: string; value: number }).date : "";
+                if (val > peak) peak = val;
+                const dd = peak > 0 ? ((peak - val) / peak) * 100 : 0;
+                if (dd > maxDdPct) maxDdPct = dd;
+                if (dd > 0.01) uwBars++;
+                ddPoints.push({ date, dd: -dd });
+              }
+              const uwPct = eq.length > 0 ? ((uwBars / eq.length) * 100).toFixed(0) : "0";
+              return (
+                <div>
+                  <div className="flex items-center gap-3 px-1 mb-1">
+                    <span className="text-[10px] uppercase tracking-wider text-zinc-500">Underwater (drawdown %)</span>
+                    <span className="text-[10px] text-zinc-500">
+                      Max: <span className="text-rose-400 font-mono">{maxDdPct.toFixed(2)}%</span>
+                    </span>
+                    <span className="text-[10px] text-zinc-500">
+                      Pod vodou: <span className="text-amber-400 font-mono">{uwPct}%</span> barů
+                    </span>
+                  </div>
+                  <div className="h-[100px] bg-zinc-900/60 rounded border border-zinc-800/50 relative overflow-hidden">
+                    <svg viewBox={`0 0 ${ddPoints.length} 100`} className="w-full h-full" preserveAspectRatio="none">
+                      {maxDdPct > 0 && (
+                        <path
+                          d={`M0,0 ${ddPoints.map((p, i) => `L${i},${(-p.dd / maxDdPct) * 95}`).join(" ")} L${ddPoints.length - 1},0 Z`}
+                          fill="rgba(239,68,68,0.25)"
+                          stroke="rgba(239,68,68,0.6)"
+                          strokeWidth="0.5"
+                        />
+                      )}
+                    </svg>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
         )}
         {activeTab === "highlight" && (
-          <TradeHighlight ohlc={results.ohlc ?? []} trades={results.trades} chartHeight={360} />
+          <TradeHighlight ohlc={viewResults.ohlc ?? []} trades={viewResults.trades} chartHeight={360} />
         )}
         {activeTab === "detailed" &&
-          (results.ohlc && detailedWindow ? (
+          (viewResults.ohlc && detailedWindow ? (
             <div className="py-4 h-full overflow-auto">
               <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4 space-y-3">
                 <div className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
@@ -272,6 +647,19 @@ export function ResultsView({
                   >
                     <option value="by_trades">Počet obchodů</option>
                     <option value="by_months">Období (měsíce)</option>
+                  </select>
+                  <span className="text-zinc-500 shrink-0">TF grafu:</span>
+                  <select
+                    value={chartTf}
+                    onChange={(e) => setChartTf(e.target.value)}
+                    className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200"
+                    title="Agregace svíček z dat runu (hrubší TF = méně barů). Zóny z modulu zůstávají; touch markery jen u zdrojového TF."
+                  >
+                    {chartTfOptions.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
                   </select>
                   {detailedMode === "by_trades" ? (
                     <label className="flex items-center gap-1.5">
@@ -319,12 +707,14 @@ export function ResultsView({
                 </div>
                 <p className="text-xs text-zinc-500">{detailedWindow.summary}</p>
                 <ModuleOutputChart
-                  ohlc={detailedWindow.windowOhlc}
+                  ohlc={chartOhlc.length ? chartOhlc : detailedWindow.windowOhlc}
                   moduleName="Detailed"
                   output={detailedChartOutput}
                   trades={detailedWindow.visibleTrades}
                   height={520}
-                  rrrTradeStyle
+                  orderLevelsMode
+                  rrrTradeStyle={false}
+                  showZoneTouchByIndex={chartTf === "source"}
                 />
               </div>
             </div>
@@ -333,13 +723,6 @@ export function ResultsView({
               Detailed view není dostupný, protože run nevrátil OHLC data.
             </div>
           ))}
-        {activeTab === "runView" && (
-          <div className="py-4 h-full overflow-auto">
-            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-4">
-              <RunModuleViewChart results={results} height={540} />
-            </div>
-          </div>
-        )}
         {activeTab === "runHistory" && (
           <div className="py-4 h-full overflow-auto">
             <RunHistory
@@ -352,7 +735,7 @@ export function ResultsView({
         )}
         {activeTab === "analytics" && (
           <div className="h-full overflow-auto">
-            <AnalyticsView results={results} />
+            <AnalyticsView results={viewResults} batchSummary={results.batchSummary} />
           </div>
         )}
       </div>

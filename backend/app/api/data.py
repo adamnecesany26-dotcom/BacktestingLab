@@ -52,6 +52,62 @@ def _get_data_dir() -> Path:
     return primary
 
 
+def _is_view_demo_parquet_name(name: str) -> bool:
+    low = name.lower()
+    return "nq_view_demo" in low or "view_demo" in low
+
+
+def _process_parquet_file_to_instrument(
+    f: Path,
+    file_prefix: str,
+    instrument_type: str,
+    timeframe: str,
+    broker_config: dict,
+) -> dict | None:
+    """Register a futures_30m *.parquet file (datetime index or datetime column)."""
+    try:
+        df = pd.read_parquet(f)
+        if df.empty:
+            return None
+        if isinstance(df.index, pd.DatetimeIndex):
+            idx = df.index
+        elif "datetime" in df.columns:
+            idx = pd.to_datetime(df["datetime"], errors="coerce")
+        else:
+            return None
+        valid = idx.notna()
+        if not valid.any():
+            return None
+        min_d = idx[valid].min()
+        max_d = idx[valid].max()
+        span_years = max((max_d - min_d).total_seconds() / (365.25 * 24 * 60 * 60), 0.0)
+        is_view_demo = _is_view_demo_parquet_name(f.name)
+        if is_view_demo:
+            instrument = "NQ"
+            display_name = "Nasdaq-100 E-mini — View demo (2025)"
+        else:
+            name = f.stem
+            parts = name.split("_")
+            instrument = (parts[0] if parts else name).upper()
+            display_name = FUTURES_SYMBOL_METADATA.get(instrument, instrument)
+        item = {
+            "instrument": instrument,
+            "displayName": display_name,
+            "timeframe": timeframe,
+            "file": f"{file_prefix}{f.name}",
+            "minDate": pd.Timestamp(min_d).strftime("%Y-%m-%d"),
+            "maxDate": pd.Timestamp(max_d).strftime("%Y-%m-%d"),
+            "yearsAvailable": round(span_years, 1),
+            "instrumentType": instrument_type,
+            "viewDemo": bool(is_view_demo),
+        }
+        if instrument in broker_config and "mult" in broker_config[instrument]:
+            item["brokerConfig"] = broker_config[instrument]
+        return item
+    except Exception:
+        return None
+
+
 def _load_market_data_preview(f: Path) -> pd.DataFrame:
     suffix = f.suffix.lower()
     if suffix == ".txt":
@@ -129,6 +185,7 @@ def _build_data_signature(data_dir: Path) -> tuple:
         files.extend(mock_dir.rglob("*.csv"))
     if futures_30m_dir.exists():
         files.extend(futures_30m_dir.glob("*.txt"))
+        files.extend(futures_30m_dir.glob("*.parquet"))
     files = sorted(files)
     return tuple((str(f.relative_to(data_dir)), int(f.stat().st_mtime_ns)) for f in files)
 
@@ -201,6 +258,14 @@ async def get_available_data():
             if key in seen_files:
                 continue
             item = _process_market_file_to_instrument(f, "futures_30m/", "futures", "30m", broker_config)
+            if item:
+                seen_files.add(key)
+                results.append(item)
+        for f in futures_30m_dir.glob("*.parquet"):
+            key = f"futures_30m/{f.name}"
+            if key in seen_files:
+                continue
+            item = _process_parquet_file_to_instrument(f, "futures_30m/", "futures", "30m", broker_config)
             if item:
                 seen_files.add(key)
                 results.append(item)

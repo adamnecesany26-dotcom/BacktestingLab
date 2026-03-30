@@ -6,8 +6,8 @@ import { Sidebar } from "@/components/Sidebar";
 import { StrategyEditor } from "@/components/editor/StrategyEditor";
 import { CreateModal } from "@/components/CreateModal";
 import { AddFileModal } from "@/components/AddFileModal";
-import { BacktestSettings } from "@/components/BacktestSettings";
-import type { EdgeFindingSettings } from "@/components/BacktestSettings";
+import { BacktestSettings, MAX_INSTRUMENTS_BATCH } from "@/components/BacktestSettings";
+import type { CommissionMode, EdgeFindingSettings } from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
@@ -36,7 +36,9 @@ import {
   parseStrategyParams,
   parseStrategyParamBundle,
   parseViewParamBundle,
-  parseStrategyImportDependencies,
+  mergeStrategyImportDependencyTokens,
+  parseParamModuleChain,
+  resolveModuleIdsForParamChain,
   normalizePythonModuleToken,
   type StrategyParams,
   type StrategyParamsMeta,
@@ -61,8 +63,36 @@ const DEFAULT_EXPANDED_SIDEBAR: Record<ItemType, boolean> = {
   modules: false,
 };
 
+/**
+ * Mirrors backend OHLC export indexing (docker/engine.py): uniform subsample when
+ * fullBarCount > ohlcLength, else one row per bar.
+ */
+function ohlcExportBarIndices(fullBarCount: number, ohlcLength: number): number[] {
+  if (fullBarCount <= 0 || ohlcLength <= 0) return [];
+  if (fullBarCount <= ohlcLength) {
+    return Array.from({ length: fullBarCount }, (_, i) => i);
+  }
+  const step = fullBarCount / ohlcLength;
+  const indices = Array.from({ length: ohlcLength }, (_, i) => Math.floor(i * step));
+  if (indices[ohlcLength - 1] !== fullBarCount - 1) {
+    indices[ohlcLength - 1] = fullBarCount - 1;
+  }
+  return indices;
+}
+
+/** True if panel value differs from PARAMS snapshot taken when strategy was opened (string compare). */
+function strategyParamTouchedFromBaseline(
+  current: StrategyParams[keyof StrategyParams] | undefined,
+  baseline: StrategyParams[keyof StrategyParams] | undefined,
+): boolean {
+  return String(current ?? "") !== String(baseline ?? "");
+}
+
 export default function Home() {
   const runLockRef = useRef(false);
+  const lastParamChainUnresolvedLogKey = useRef<string>("");
+  /** PARAMS parsed from main.py when strategy last loaded — panel overrides apply only if different from this. */
+  const strategyParamsBaselineRef = useRef<StrategyParams>({});
   const [sidebarLists, setSidebarLists] =
     useState<Record<ItemType, FirestoreItem[]>>(EMPTY_SIDEBAR_LISTS);
   const [expandedSidebar, setExpandedSidebar] =
@@ -80,18 +110,28 @@ export default function Home() {
   const [instruments, setInstruments] = useState<DataInstrument[]>([]);
   const [instrumentsLoaded, setInstrumentsLoaded] = useState(false);
   const [dataLoadError, setDataLoadError] = useState<string | null>(null);
-  const [selectedInstrument, setSelectedInstrument] = useState<DataInstrument | null>(null);
+  /** Pořadí = pořadí dílčích runů v batch_config */
+  const [selectedInstrumentFiles, setSelectedInstrumentFiles] = useState<string[]>([]);
   const [indicators, setIndicators] = useState<FirestoreItem[]>([]);
   const [selectedIndicatorIds, setSelectedIndicatorIds] = useState<string[]>([]);
   const [appliedIndicatorIds, setAppliedIndicatorIds] = useState<string[]>([]);
   const [modules, setModules] = useState<FirestoreItem[]>([]);
+  /** View chart resolves VIEW_DEPENDENCIES from Firestore; `modules` is often still [] on first View paint (child effects run before parent's listItems). Sidebar list is loaded at mount — use as fallback so the first fetch sends dependency code. */
+  const modulesForViewChart = useMemo(
+    () => (modules.length > 0 ? modules : sidebarLists.modules),
+    [modules, sidebarLists.modules],
+  );
   const [selectedModuleIds, setSelectedModuleIds] = useState<string[]>([]);
   const [appliedModuleIds, setAppliedModuleIds] = useState<string[]>([]);
+  /** PARAM_MODULE_CHAIN z uloženého main.py (když v editoru není otevřený main.py). */
+  const [savedMainParamModuleChain, setSavedMainParamModuleChain] = useState<string[]>([]);
   const [years, setYears] = useState(1);
   const [backtestParams, setBacktestParams] = useState<{
     initialCapital: number;
     slippagePerc: number;
     commissionPerc: number;
+    commissionMode: CommissionMode;
+    commissionPerContract: number;
     instrumentType: InstrumentType;
     tickSize?: number;
     valuePerTick?: number;
@@ -99,10 +139,13 @@ export default function Home() {
     lotSize?: number;
     pipSize?: number;
     pipValue?: number;
+    runTimeoutSec: number;
   }>({
     initialCapital: 100000,
     slippagePerc: 0.001,
     commissionPerc: 0.0,
+    commissionMode: "percentage",
+    commissionPerContract: 2.25,
     instrumentType: "futures",
     tickSize: 0.25,
     valuePerTick: 5,
@@ -110,12 +153,15 @@ export default function Home() {
     lotSize: 1,
     pipSize: 0.0001,
     pipValue: 10,
+    runTimeoutSec: 3600,
   });
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
   const [strategyParamMeta, setStrategyParamMeta] = useState<StrategyParamsMeta>({});
   const [moduleParams, setModuleParams] = useState<Record<string, StrategyParams>>({});
   const [moduleParamMeta, setModuleParamMeta] = useState<Record<string, StrategyParamsMeta>>({});
+  const [indicatorParams, setIndicatorParams] = useState<Record<string, StrategyParams>>({});
+  const [indicatorParamMeta, setIndicatorParamMeta] = useState<Record<string, StrategyParamsMeta>>({});
   const [edgeSettings, setEdgeSettings] = useState<EdgeFindingSettings>({
     validationMode: "single",
     oosRatio: 0.25,
@@ -136,6 +182,7 @@ export default function Home() {
     spreadBps: 0.5,
     slippageVolMult: 1.0,
     latencyBars: 0,
+    stressMultiplier: 1.0,
     forwardBridgeEnabled: false,
     forwardBridgeMode: "paper_shadow",
     forwardBridgeBaselineEquity: 100000,
@@ -149,6 +196,9 @@ export default function Home() {
     batchEnabled: false,
     batchMaxRuns: 8,
     batchItemsJson: '[{"instrument":"NQ","data_file":"mock/NQ_5Y.csv","timeframe":"1d"}]',
+    paramTestMaxRuns: 24,
+    paramTestTrainOnly: false,
+    paramTestRanges: {},
   });
   const [results, setResults] = useState<RunResponse | null>(null);
   const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
@@ -158,6 +208,9 @@ export default function Home() {
   const [showResults, setShowResults] = useState(false);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
+  /** Levé adresářové menu + pravý panel nastavení — lze schovat kvůli většímu prostoru pro editor / výsledky. */
+  const [leftNavOpen, setLeftNavOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
   const [viewMode, setViewMode] = useState(false);
   const [strategiesForView, setStrategiesForView] = useState<FirestoreItem[]>([]);
   const [autoDetectedForStrategy, setAutoDetectedForStrategy] = useState<string | null>(null);
@@ -165,6 +218,85 @@ export default function Home() {
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
+
+  /** Sloučí statické importy, importlib.import_module("modules.X") a PARAM_MODULE_CHAIN → výběr modulů/indikátorů. */
+  const applyLibraryAutoDetect = useCallback(
+    (code: string, opts?: { log?: boolean }) => {
+      const deps = mergeStrategyImportDependencyTokens(code);
+      const toModuleName = (n: string) =>
+        normalizePythonModuleToken((n || "module").replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_]/g, "_"));
+      const detectedIndicatorIds = indicators
+        .filter((ind) => deps.indicators.includes(toModuleName(ind.name)))
+        .map((ind) => ind.id);
+      const detectedFromImports = modules
+        .filter((mod) => deps.modules.includes(toModuleName(mod.name)))
+        .map((mod) => mod.id);
+      const { ids: chainIds } = resolveModuleIdsForParamChain(
+        parseParamModuleChain(code),
+        modules.map((m) => ({ id: m.id, name: m.name })),
+      );
+      const detectedModuleIds = Array.from(new Set([...detectedFromImports, ...chainIds]));
+      setSelectedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
+      setSelectedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
+      if (opts?.log && (detectedIndicatorIds.length > 0 || detectedModuleIds.length > 0)) {
+        addLog(
+          `Auto-detect (import / importlib / PARAM_MODULE_CHAIN): ${detectedIndicatorIds.length} indikátorů, ${detectedModuleIds.length} modulů — potvrďte výběr.`,
+        );
+      }
+    },
+    [indicators, modules, addLog],
+  );
+
+  const effectiveParamModuleChain = useMemo(() => {
+    if (openItem?.type === "strategies" && selectedFile === "main.py") {
+      return parseParamModuleChain(fileContent);
+    }
+    return savedMainParamModuleChain;
+  }, [openItem?.type, selectedFile, fileContent, savedMainParamModuleChain]);
+
+  const { ids: chainModuleIds, unresolved: unresolvedParamChainModules } = useMemo(
+    () => resolveModuleIdsForParamChain(effectiveParamModuleChain, modules),
+    [effectiveParamModuleChain, modules],
+  );
+
+  const moduleIdsForParamPanels = useMemo(() => {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of appliedModuleIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+    for (const id of chainModuleIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    }
+    return out;
+  }, [appliedModuleIds, chainModuleIds]);
+
+  const transitiveModuleIdSet = useMemo(() => {
+    const applied = new Set(appliedModuleIds);
+    return new Set(chainModuleIds.filter((id) => !applied.has(id)));
+  }, [appliedModuleIds, chainModuleIds]);
+
+  const moduleParamPanels = useMemo(
+    () =>
+      moduleIdsForParamPanels
+        .map((id) => {
+          const mod = modules.find((m) => m.id === id);
+          if (!mod) return null;
+          return {
+            id: mod.id,
+            name: mod.name,
+            fromParamChain: transitiveModuleIdSet.has(id),
+          };
+        })
+        .filter((x): x is { id: string; name: string; fromParamChain: boolean } => x != null),
+    [moduleIdsForParamPanels, modules, transitiveModuleIdSet],
+  );
 
   /** Firestore writes need auth; on localhost we try anonymous sign-in automatically. */
   useEffect(() => {
@@ -273,6 +405,7 @@ export default function Home() {
   /** Parse PARAMS from main.py when strategy loads - reset when strategy changes */
   useEffect(() => {
     if (!openItem || openItem.type !== "strategies") {
+      strategyParamsBaselineRef.current = {};
       setStrategyParams({});
       setStrategyParamMeta({});
       setAutoDetectedForStrategy(null);
@@ -280,6 +413,7 @@ export default function Home() {
     }
     getFileContent(openItem.type, openItem.id, "main.py").then((c) => {
       const bundle = parseStrategyParamBundle(c ?? "");
+      strategyParamsBaselineRef.current = { ...bundle.params };
       setStrategyParams(bundle.params);
       setStrategyParamMeta(bundle.meta);
     });
@@ -294,9 +428,31 @@ export default function Home() {
     setAutoDetectedForStrategy(null);
   }, [openItem?.type, openItem?.id]);
 
-  /** Load VIEW_PARAMS for applied modules */
+  /** PARAM_MODULE_CHAIN ze uloženého main.py (živá úprava main.py řídí effectiveParamModuleChain). */
   useEffect(() => {
-    if (!openItem || openItem.type !== "strategies" || appliedModuleIds.length === 0) {
+    if (!openItem || openItem.type !== "strategies") {
+      setSavedMainParamModuleChain([]);
+      lastParamChainUnresolvedLogKey.current = "";
+      return;
+    }
+    void getFileContent("strategies", openItem.id, "main.py").then((c) => {
+      setSavedMainParamModuleChain(parseParamModuleChain(c ?? ""));
+    });
+  }, [openItem?.type, openItem?.id]);
+
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies" || unresolvedParamChainModules.length === 0) return;
+    const key = `${openItem.id}::${unresolvedParamChainModules.join("|")}`;
+    if (lastParamChainUnresolvedLogKey.current === key) return;
+    lastParamChainUnresolvedLogKey.current = key;
+    addLog(
+      `PARAM_MODULE_CHAIN: v knihovně Moduly chybí tyto názvy (musí přesně odpovídat názvu položky): ${unresolvedParamChainModules.join(", ")}`,
+    );
+  }, [openItem?.type, openItem?.id, unresolvedParamChainModules, addLog]);
+
+  /** Load VIEW_PARAMS for applied modules + PARAM_MODULE_CHAIN transitive modules */
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies" || moduleIdsForParamPanels.length === 0) {
       setModuleParams({});
       setModuleParamMeta({});
       return;
@@ -304,14 +460,12 @@ export default function Home() {
     const load = async () => {
       const next: Record<string, StrategyParams> = {};
       const nextMeta: Record<string, StrategyParamsMeta> = {};
-      for (const modId of appliedModuleIds) {
+      for (const modId of moduleIdsForParamPanels) {
         const mod = modules.find((m) => m.id === modId);
         if (!mod) continue;
         const content = await getFileContent("modules", modId, "main.py");
         const bundle = parseViewParamBundle(content ?? "");
-        if (Object.keys(bundle.params).length > 0) {
-          next[mod.name] = bundle.params;
-        }
+        next[mod.name] = bundle.params;
         if (Object.keys(bundle.meta).length > 0) {
           nextMeta[mod.name] = bundle.meta;
         }
@@ -319,9 +473,36 @@ export default function Home() {
       setModuleParams(next);
       setModuleParamMeta(nextMeta);
     };
-    load();
-  }, [openItem?.type, openItem?.id, appliedModuleIds, modules]);
+    void load();
+  }, [openItem?.type, openItem?.id, moduleIdsForParamPanels, modules]);
 
+  /** Load VIEW_PARAMS for applied indicators (collapsible panel v backtest nastavení) */
+  useEffect(() => {
+    if (!openItem || openItem.type !== "strategies" || appliedIndicatorIds.length === 0) {
+      setIndicatorParams({});
+      setIndicatorParamMeta({});
+      return;
+    }
+    const load = async () => {
+      const next: Record<string, StrategyParams> = {};
+      const nextMeta: Record<string, StrategyParamsMeta> = {};
+      for (const indId of appliedIndicatorIds) {
+        const ind = indicators.find((i) => i.id === indId);
+        if (!ind) continue;
+        const content = await getFileContent("indicators", indId, "main.py");
+        const bundle = parseViewParamBundle(content ?? "");
+        next[ind.name] = bundle.params;
+        if (Object.keys(bundle.meta).length > 0) {
+          nextMeta[ind.name] = bundle.meta;
+        }
+      }
+      setIndicatorParams(next);
+      setIndicatorParamMeta(nextMeta);
+    };
+    load();
+  }, [openItem?.type, openItem?.id, appliedIndicatorIds, indicators]);
+
+  /** První průchod po otevření strategie — vždy main.py ze úložiště (editor může mít jiný soubor otevřený). */
   useEffect(() => {
     if (
       openItem?.type !== "strategies" ||
@@ -331,55 +512,22 @@ export default function Home() {
     ) {
       return;
     }
-
-    const toModuleName = (n: string) =>
-      normalizePythonModuleToken((n || "module").replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_]/g, "_"));
-
-    const detect = async () => {
-      const code =
-        selectedFile === "main.py" && fileContent
-          ? fileContent
-          : (await getFileContent("strategies", openItem.id, "main.py")) ?? "";
-      const deps = parseStrategyImportDependencies(code);
-      const detectedIndicatorIds = indicators
-        .filter((ind) => deps.indicators.includes(toModuleName(ind.name)))
-        .map((ind) => ind.id);
-      const detectedModuleIds = modules
-        .filter((mod) => deps.modules.includes(toModuleName(mod.name)))
-        .map((mod) => mod.id);
-
-      setSelectedIndicatorIds((prev) => Array.from(new Set([...detectedIndicatorIds, ...prev])));
-      setSelectedModuleIds((prev) => Array.from(new Set([...detectedModuleIds, ...prev])));
+    void (async () => {
+      const code = (await getFileContent("strategies", openItem.id, "main.py")) ?? "";
+      applyLibraryAutoDetect(code, { log: true });
       setAutoDetectedForStrategy(openItem.id);
-      if (detectedIndicatorIds.length > 0 || detectedModuleIds.length > 0) {
-        addLog(
-          `Auto-detect importů: ${detectedIndicatorIds.length} indikátorů, ${detectedModuleIds.length} modulů. Pro run je ještě potvrďte.`
-        );
-      }
-    };
-    detect();
-  }, [
-    openItem?.type,
-    openItem?.id,
-    autoDetectedForStrategy,
-    indicators,
-    modules,
-    selectedFile,
-    fileContent,
-    addLog,
-  ]);
+    })();
+  }, [openItem?.type, openItem?.id, autoDetectedForStrategy, indicators, modules, applyLibraryAutoDetect]);
 
-  const applyInstrumentSelection = useCallback((inv: DataInstrument) => {
-    setSelectedInstrument(inv);
-    setYears((y) => Math.min(y, inv.yearsAvailable));
-    if (backtestParams.instrumentType === "futures" && inv.brokerConfig) {
-      setBacktestParams((prev) => ({
-        ...prev,
-        tickSize: inv.brokerConfig?.tick_size ?? prev.tickSize,
-        valuePerTick: inv.brokerConfig?.tick_value ?? prev.valuePerTick,
-      }));
-    }
-  }, [backtestParams.instrumentType]);
+  /** Při úpravách main.py v editoru znovu sloučit závislosti (debounce — bez log spamu). */
+  useEffect(() => {
+    if (openItem?.type !== "strategies" || !openItem?.id || selectedFile !== "main.py") return;
+    if (indicators.length === 0 && modules.length === 0) return;
+    const t = window.setTimeout(() => {
+      applyLibraryAutoDetect(fileContent, { log: false });
+    }, 500);
+    return () => window.clearTimeout(t);
+  }, [fileContent, selectedFile, openItem?.type, openItem?.id, indicators.length, modules.length, applyLibraryAutoDetect]);
 
   useEffect(() => {
     getAvailableData()
@@ -387,11 +535,6 @@ export default function Home() {
         setInstruments(d.instruments);
         setInstrumentsLoaded(true);
         setDataLoadError(null);
-        if (d.instruments.length > 0 && !selectedInstrument) {
-          const inv = d.instruments[0];
-          applyInstrumentSelection(inv);
-          setYears(Math.min(1, inv.yearsAvailable));
-        }
       })
       .catch((error) => {
         setInstruments([]);
@@ -406,7 +549,7 @@ export default function Home() {
   const buildMergedParams = useCallback((): RunRequest["params"] => {
     const flat: Record<string, number | boolean | string | Record<string, unknown>> = { ...strategyParams };
     const mods: Record<string, Record<string, number | boolean | string>> = {};
-    for (const modId of appliedModuleIds) {
+    for (const modId of moduleIdsForParamPanels) {
       const mod = modules.find((m) => m.id === modId);
       if (!mod) continue;
       const p = moduleParams[mod.name];
@@ -419,11 +562,7 @@ export default function Home() {
     }
     if (Object.keys(flat).length === 0) return undefined;
     return flat;
-  }, [strategyParams, appliedModuleIds, modules, moduleParams]);
-
-  const handleSelectInstrument = (inv: DataInstrument) => {
-    applyInstrumentSelection(inv);
-  };
+  }, [strategyParams, moduleIdsForParamPanels, modules, moduleParams]);
 
   /** Instruments filtered by selected instrument type */
   const filteredInstruments = useMemo(
@@ -431,27 +570,66 @@ export default function Home() {
     [instruments, backtestParams.instrumentType]
   );
 
-  /** Reset selection when current instrument is not in filtered list (e.g. switched Futures → Stocks) */
+  const selectedInstruments = useMemo(() => {
+    return selectedInstrumentFiles
+      .map((f) => filteredInstruments.find((i) => i.file === f))
+      .filter((x): x is DataInstrument => !!x);
+  }, [selectedInstrumentFiles, filteredInstruments]);
+
+  const selectedInstrument = selectedInstruments[0] ?? null;
+
+  const minYearsAcrossSelected = useMemo(
+    () =>
+      selectedInstruments.length > 0
+        ? Math.min(...selectedInstruments.map((i) => i.yearsAvailable))
+        : 5,
+    [selectedInstruments],
+  );
+
+  /** Drž výběr v souladu s aktuálním typem (Futures/…) a zajisti nejméně jeden instrument */
   useEffect(() => {
-    if (!selectedInstrument) return;
-    const isInFiltered = filteredInstruments.some(
-      (i) => i.file === selectedInstrument.file && i.instrument === selectedInstrument.instrument
-    );
-    if (!isInFiltered) {
-      const next = filteredInstruments[0] ?? null;
-      setSelectedInstrument(next);
-      if (filteredInstruments[0]) {
-        if (backtestParams.instrumentType === "futures" && filteredInstruments[0].brokerConfig) {
-          setBacktestParams((prev) => ({
-            ...prev,
-            tickSize: filteredInstruments[0].brokerConfig?.tick_size ?? prev.tickSize,
-            valuePerTick: filteredInstruments[0].brokerConfig?.tick_value ?? prev.valuePerTick,
-          }));
-        }
-        setYears((y) => Math.min(y, filteredInstruments[0].yearsAvailable));
+    setSelectedInstrumentFiles((prev) => {
+      const valid = prev.filter((f) => filteredInstruments.some((i) => i.file === f));
+      if (valid.length === prev.length && prev.length > 0) return prev;
+      if (valid.length > 0) return valid;
+      const first = filteredInstruments[0];
+      return first ? [first.file] : [];
+    });
+  }, [filteredInstruments]);
+
+  /** Omez délku (roky) podle nejužšího limitu vybraných instrumentů */
+  useEffect(() => {
+    if (selectedInstruments.length === 0) return;
+    const cap = minYearsAcrossSelected;
+    setYears((y) => Math.min(y, cap));
+  }, [selectedInstruments.length, minYearsAcrossSelected]);
+
+  /** Tick z brokerConfig jen při přesně jednom vybraném futures instrumentu */
+  useEffect(() => {
+    if (selectedInstrumentFiles.length !== 1 || backtestParams.instrumentType !== "futures") return;
+    const inv = filteredInstruments.find((i) => i.file === selectedInstrumentFiles[0]);
+    if (!inv?.brokerConfig) return;
+    setBacktestParams((prev) => ({
+      ...prev,
+      tickSize: inv.brokerConfig?.tick_size ?? prev.tickSize,
+      valuePerTick: inv.brokerConfig?.tick_value ?? prev.valuePerTick,
+    }));
+  }, [selectedInstrumentFiles, filteredInstruments, backtestParams.instrumentType]);
+
+  const toggleInstrumentFile = useCallback((file: string) => {
+    setSelectedInstrumentFiles((prev) => {
+      if (prev.includes(file)) {
+        const next = prev.filter((f) => f !== file);
+        return next.length > 0 ? next : prev;
       }
-    }
-  }, [filteredInstruments, backtestParams.instrumentType, selectedInstrument]);
+      if (prev.length >= MAX_INSTRUMENTS_BATCH) return prev;
+      return [...prev, file];
+    });
+  }, []);
+
+  const selectAllInstrumentFiles = useCallback(() => {
+    setSelectedInstrumentFiles(filteredInstruments.slice(0, MAX_INSTRUMENTS_BATCH).map((i) => i.file));
+  }, [filteredInstruments]);
 
   const toggleSidebarSection = (type: ItemType) => {
     setExpandedSidebar((prev) => ({ ...prev, [type]: !prev[type] }));
@@ -543,8 +721,18 @@ export default function Home() {
       runLockRef.current = false;
       return;
     }
+    const chainBundledNames = moduleIdsForParamPanels
+      .filter((id) => transitiveModuleIdSet.has(id))
+      .map((id) => modules.find((m) => m.id === id)?.name)
+      .filter((n): n is string => !!n);
+    if (chainBundledNames.length > 0) {
+      addLog(`Run: moduly z PARAM_MODULE_CHAIN (přibaleny + jejich VIEW_PARAMS): ${chainBundledNames.join(", ")}`);
+    }
     if (edgeSettings.validationMode === "single") {
       addLog("WARNING: běžíte pouze single run. Pro první edge doporučeno OOS split nebo walk-forward.");
+    }
+    if (edgeSettings.validationMode === "param_test" && edgeSettings.sweepMode !== "none") {
+      addLog("WARNING: Param test + robustness sweep — velmi mnoho simulací; výsledky interpretuj opatrně.");
     }
     if (edgeSettings.sweepMode !== "none" && edgeSettings.validationMode === "single") {
       addLog("WARNING: sweep bez OOS/WF může vést k overfittingu.");
@@ -575,7 +763,7 @@ export default function Home() {
         allFiles[`indicators/${toModuleName(ind.name)}.py`] = content;
       }
     }
-    for (const modId of appliedModuleIds) {
+    for (const modId of moduleIdsForParamPanels) {
       const mod = modules.find((m) => m.id === modId);
       if (!mod) continue;
       const content = await getFileContent("modules", modId, "main.py");
@@ -589,13 +777,20 @@ export default function Home() {
       return;
     }
 
-    // Params z aktuálního main.py (ne z cache) – odpovídá kódu, který posíláme
+    // Aktuální PARAMS z main.py (včetně neuložených úprav v editoru); panel přepíše jen klíče, které uživatel změnil oproti načtení strategie.
     const mainContent = allFiles["main.py"];
-    const runStrategyParams = mainContent ? parseStrategyParams(mainContent) : strategyParams;
+    const parsedFromMain = mainContent ? parseStrategyParams(mainContent) : {};
+    const baseline = strategyParamsBaselineRef.current;
+    const runStrategyParams: StrategyParams = { ...parsedFromMain };
+    for (const key of Object.keys(strategyParams)) {
+      if (strategyParamTouchedFromBaseline(strategyParams[key], baseline[key])) {
+        runStrategyParams[key] = strategyParams[key];
+      }
+    }
     const runParams = (() => {
       const flat: Record<string, number | boolean | string | Record<string, unknown>> = { ...runStrategyParams };
       const mods: Record<string, Record<string, number | boolean | string>> = {};
-      for (const modId of appliedModuleIds) {
+      for (const modId of moduleIdsForParamPanels) {
         const mod = modules.find((m) => m.id === modId);
         if (!mod) continue;
         const p = moduleParams[mod.name];
@@ -639,7 +834,7 @@ export default function Home() {
         null;
       const branchSeq = branchRuns.length + 1;
 
-      const appliedModules = appliedModuleIds.reduce<
+      const appliedModules = moduleIdsForParamPanels.reduce<
         { id: string; name: string; params?: Record<string, number | boolean | string> }[]
       >((acc, id) => {
         const mod = modules.find((m) => m.id === id);
@@ -658,7 +853,16 @@ export default function Home() {
             finalEquity: Number(latestRun.metrics.finalEquity ?? 0),
             totalReturnUsd: Number(latestRun.metrics.totalReturnUsd ?? 0),
             maxDrawdownPct: Number(latestRun.metrics.maxDrawdownPct ?? latestRun.metrics.maxDrawdown ?? 0),
-            profitFactor: Number(latestRun.metrics.profitFactor ?? 0),
+            profitFactor: (() => {
+              const p = latestRun.metrics.profitFactor;
+              if (p === null || p === undefined) return null;
+              const n = Number(p);
+              return Number.isFinite(n) ? n : null;
+            })(),
+            profitFactorStatus:
+              typeof latestRun.metrics.profitFactorStatus === "string"
+                ? latestRun.metrics.profitFactorStatus
+                : undefined,
             winRate: Number(latestRun.metrics.winRate ?? 0),
             sortinoRatio: Number(latestRun.metrics.sortinoRatio ?? 0),
             calmarRatio: Number(latestRun.metrics.calmarRatio ?? 0),
@@ -682,7 +886,29 @@ export default function Home() {
         }
       }
       let batchConfig: Record<string, unknown> | undefined = undefined;
-      if (edgeSettings.batchEnabled) {
+      if (selectedInstruments.length > 1) {
+        if (edgeSettings.portfolioEnabled) {
+          addLog("Vícero instrumentů v Basic nelze kombinovat s portfoliem — vyber jeden instrument nebo vypni portfolio.");
+          runLockRef.current = false;
+          return;
+        }
+        if (edgeSettings.batchEnabled) {
+          addLog(
+            "Máš vybráno více instrumentů v Basic — vypni „Batch / matrix runs (JSON)“ v Edge finding, nebo ponech jen jeden instrument.",
+          );
+          runLockRef.current = false;
+          return;
+        }
+        batchConfig = {
+          max_runs: Math.min(MAX_INSTRUMENTS_BATCH, selectedInstruments.length),
+          items: selectedInstruments.map((inv) => ({
+            instrument: inv.instrument,
+            timeframe: inv.timeframe,
+            data_file: inv.file,
+            years: Math.min(years, inv.yearsAvailable),
+          })),
+        };
+      } else if (edgeSettings.batchEnabled) {
         if (edgeSettings.portfolioEnabled) {
           addLog("Batch run nelze kombinovat s portfolio režimem — vypni jedno z nich.");
           runLockRef.current = false;
@@ -703,6 +929,40 @@ export default function Home() {
           return;
         }
       }
+      if (edgeSettings.batchEnabled && edgeSettings.validationMode === "param_test") {
+        addLog("Param test nelze kombinovat s batch/matrix runs — vypni jedno z nich.");
+        runLockRef.current = false;
+        return;
+      }
+      if (selectedInstruments.length > 1 && edgeSettings.validationMode === "param_test") {
+        addLog("Param test je podporován jen pro jeden instrument — v Basic nech jeden výběr.");
+        runLockRef.current = false;
+        return;
+      }
+      const validationConfigPayload: RunRequest["validation_config"] = (() => {
+        if (edgeSettings.validationMode === "oos_split") {
+          return { oos_ratio: edgeSettings.oosRatio };
+        }
+        if (edgeSettings.validationMode === "walk_forward") {
+          return { folds: edgeSettings.wfFolds, test_ratio: edgeSettings.wfTestRatio };
+        }
+        if (edgeSettings.validationMode === "param_test") {
+          const ranges: Record<string, { min: number; max: number; enabled: boolean }> = {};
+          for (const [k, r] of Object.entries(edgeSettings.paramTestRanges)) {
+            if (r?.enabled) {
+              ranges[k] = { min: r.min, max: r.max, enabled: true };
+            }
+          }
+          return {
+            param_test: {
+              max_runs: Math.min(48, Math.max(4, Math.floor(edgeSettings.paramTestMaxRuns))),
+              param_ranges: ranges,
+              train_only: edgeSettings.paramTestTrainOnly ?? false,
+            },
+          };
+        }
+        return undefined;
+      })();
       const runRequest: RunRequest = {
         files: allFiles,
         instrument: selectedInstrument.instrument,
@@ -719,16 +979,12 @@ export default function Home() {
         lot_size: backtestParams.lotSize,
         pip_size: backtestParams.pipSize,
         pip_value: backtestParams.pipValue,
+        run_timeout_sec: backtestParams.runTimeoutSec,
         params: runParams,
         applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
         run_id: requestRunId,
         validation_mode: edgeSettings.validationMode,
-        validation_config:
-          edgeSettings.validationMode === "oos_split"
-            ? { oos_ratio: edgeSettings.oosRatio }
-            : edgeSettings.validationMode === "walk_forward"
-              ? { folds: edgeSettings.wfFolds, test_ratio: edgeSettings.wfTestRatio }
-              : undefined,
+        validation_config: validationConfigPayload,
         quality_gates: {
           min_trades: edgeSettings.minTradesGate,
           max_dd: edgeSettings.maxDdGate,
@@ -749,20 +1005,25 @@ export default function Home() {
           : undefined,
         regime_config: edgeSettings.regimeEnabled ? { enabled: true } : undefined,
         portfolio_config: portfolioConfig,
-        execution_model: edgeSettings.executionEnabled
-          ? {
-              enabled: true,
-              spread_bps: edgeSettings.spreadBps,
-              slippage_vol_mult: edgeSettings.slippageVolMult,
-              latency_bars: edgeSettings.latencyBars,
-              forward_bridge: edgeSettings.forwardBridgeEnabled
-                ? {
-                    mode: edgeSettings.forwardBridgeMode,
-                    baseline_final_equity: edgeSettings.forwardBridgeBaselineEquity,
-                  }
-                : undefined,
-            }
-          : undefined,
+        execution_model: {
+          commission_mode: backtestParams.commissionMode,
+          commission_per_contract: backtestParams.commissionPerContract,
+          ...(edgeSettings.executionEnabled
+            ? {
+                enabled: true,
+                spread_bps: edgeSettings.spreadBps,
+                slippage_vol_mult: edgeSettings.slippageVolMult,
+                latency_bars: edgeSettings.latencyBars,
+                stress_multiplier: edgeSettings.stressMultiplier > 1.0 ? edgeSettings.stressMultiplier : undefined,
+                forward_bridge: edgeSettings.forwardBridgeEnabled
+                  ? {
+                      mode: edgeSettings.forwardBridgeMode,
+                      baseline_final_equity: edgeSettings.forwardBridgeBaselineEquity,
+                    }
+                  : undefined,
+              }
+            : {}),
+        },
         batch_config: batchConfig,
         experiment: {
           hypothesis: edgeSettings.experimentHypothesis || strategyContext.name,
@@ -807,6 +1068,12 @@ export default function Home() {
       setResults(data);
       setShowResults(true);
       addLog(`Hotovo. ${data.metrics.tradeCount} obchodů, equity: ${data.metrics.finalEquity.toFixed(2)}`);
+      const bs = data.batchSummary;
+      if (bs && typeof bs === "object" && Number((bs as { runCount?: number }).runCount) > 1) {
+        addLog(
+          `Dávka instrumentů: ${(bs as { runCount?: number }).runCount} runů — souhrn řádků je v Analytics (batchSummary).`,
+        );
+      }
       if (strategyContext) {
         const payload = buildSavePayload(data, runRequest);
         try {
@@ -853,9 +1120,15 @@ export default function Home() {
       const d = first ? new Date(first) : null;
       if (d) d.setDate(d.getDate() - 1);
       const dayBefore = d?.toISOString() ?? "0";
+      const eq = data.equity!;
+      const fullBarCount = Math.max(0, eq.length - 1);
+      const barIdx = ohlcExportBarIndices(fullBarCount, data.ohlc.length);
       equityCurve = [
-        { date: dayBefore, value: data.equity[0] ?? 0 },
-        ...data.ohlc.map((o, i) => ({ date: o.date, value: data.equity![i + 1] ?? 0 })),
+        { date: dayBefore, value: eq[0] ?? 0 },
+        ...data.ohlc.map((o, k) => ({
+          date: o.date,
+          value: eq[(barIdx[k] ?? k) + 1] ?? 0,
+        })),
       ];
     } else if (!equityCurve?.length && data.equity?.length) {
       equityCurve = data.equity.map((v, i) => ({ date: String(i), value: v }));
@@ -997,7 +1270,7 @@ export default function Home() {
               {selectedFile.startsWith("indicator:")
                 ? `📊 ${indicators.find((i) => i.id === selectedFile.replace("indicator:", ""))?.name ?? selectedFile}`
                 : selectedFile.startsWith("module:")
-                  ? `📦 ${modules.find((m) => m.id === selectedFile.replace("module:", ""))?.name ?? selectedFile}`
+                  ? `📦 ${modulesForViewChart.find((m) => m.id === selectedFile.replace("module:", ""))?.name ?? selectedFile}`
                   : selectedFile}
             </span>
           </>
@@ -1008,10 +1281,10 @@ export default function Home() {
           <div className="h-full p-4 overflow-auto">
             <StrategyViewChart
               instruments={instruments}
-              modules={modules}
+              modules={modulesForViewChart}
               indicators={indicators}
               strategies={strategiesForView}
-              defaultDataFile={selectedInstrument?.file ?? "mock/NQ_5Y.csv"}
+              strategyZoneSyncCode={openItem?.type === "strategies" ? fileContent : null}
               initialItemId={
                 selectedFile?.startsWith("module:")
                   ? selectedFile.replace("module:", "")
@@ -1075,28 +1348,44 @@ export default function Home() {
           existingFiles={files.map((f) => f.fileName)}
         />
       )}
-      <Sidebar
-        openItem={openItem}
-        itemsByType={sidebarLists}
-        expandedSections={expandedSidebar}
-        onToggleSection={toggleSidebarSection}
-        onCreateForType={openCreateModalForType}
-        files={files}
-        onSelectItem={handleSelectItem}
-        onAddFileClick={() => setIsAddFileModalOpen(true)}
-        onBack={handleBack}
-        onSelectFile={(f) => {
-          setSelectedFile(f);
-          setShowResults(false);
-        }}
-        onSelectImported={(key) => {
-          setSelectedFile(key);
-          setShowResults(false);
-        }}
-        appliedIndicators={indicators.filter((i) => appliedIndicatorIds.includes(i.id))}
-        appliedModules={modules.filter((m) => appliedModuleIds.includes(m.id))}
-        selectedFile={selectedFile}
-      />
+      <div
+        className={`shrink-0 overflow-hidden border-r border-zinc-800 transition-[width] duration-200 ease-out ${
+          leftNavOpen ? "w-64" : "w-0"
+        }`}
+      >
+        <Sidebar
+          openItem={openItem}
+          itemsByType={sidebarLists}
+          expandedSections={expandedSidebar}
+          onToggleSection={toggleSidebarSection}
+          onCreateForType={openCreateModalForType}
+          files={files}
+          onSelectItem={handleSelectItem}
+          onAddFileClick={() => setIsAddFileModalOpen(true)}
+          onBack={handleBack}
+          onSelectFile={(f) => {
+            setSelectedFile(f);
+            setShowResults(false);
+          }}
+          onSelectImported={(key) => {
+            setSelectedFile(key);
+            setShowResults(false);
+          }}
+          appliedIndicators={indicators.filter((i) => appliedIndicatorIds.includes(i.id))}
+          appliedModules={modules.filter((m) => appliedModuleIds.includes(m.id))}
+          selectedFile={selectedFile}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={() => setLeftNavOpen((v) => !v)}
+        className="shrink-0 w-7 flex flex-col justify-center items-center border-r border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800/90 text-zinc-500 hover:text-zinc-300 text-xs font-mono transition-colors"
+        title={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
+        aria-expanded={leftNavOpen}
+        aria-label={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
+      >
+        {leftNavOpen ? "◄" : "►"}
+      </button>
       <div className="flex flex-1 flex-col min-w-0">
         <div className="flex-1 flex min-h-0">
           <div className="flex-1 flex flex-col min-w-0 border-r border-zinc-800 relative">
@@ -1109,41 +1398,65 @@ export default function Home() {
             )}
             {centerContent}
           </div>
-          <div className="w-96 flex flex-col min-h-0 overflow-y-auto bg-zinc-900/50 p-4">
-            <BacktestSettings
-              instruments={filteredInstruments}
-              instrumentsLoaded={instrumentsLoaded}
-              dataLoadError={dataLoadError}
-              selectedInstrument={selectedInstrument}
-              onSelectInstrument={handleSelectInstrument}
-              years={years}
-              onYearsChange={(y) => setYears(Math.max(1, Math.min(y, selectedInstrument?.yearsAvailable ?? 5)))}
-              params={backtestParams}
-              onParamsChange={(p) => setBacktestParams((prev) => ({ ...prev, ...p }))}
-              indicators={indicators}
-              selectedIndicatorIds={selectedIndicatorIds}
-              onSelectIndicators={setSelectedIndicatorIds}
-              modules={modules}
-              selectedModuleIds={selectedModuleIds}
-              onSelectModules={setSelectedModuleIds}
-              onConfirmSelection={handleConfirmSelection}
-              onRun={handleRun}
-              isRunning={isRunning}
-              canRun={openItem?.type === "strategies"}
-              strategyParams={strategyParams}
-              strategyParamMeta={strategyParamMeta}
-              onStrategyParamsChange={setStrategyParams}
-              moduleParams={moduleParams}
-              moduleParamMeta={moduleParamMeta}
-              onModuleParamsChange={(name, params) =>
-                setModuleParams((prev) => ({ ...prev, [name]: params }))
-              }
-              moduleNamesForParams={appliedModuleIds
-                .map((id) => modules.find((m) => m.id === id)?.name)
-                .filter((n): n is string => !!n)}
-              edgeSettings={edgeSettings}
-              onEdgeSettingsChange={setEdgeSettings}
-            />
+          <button
+            type="button"
+            onClick={() => setRightPanelOpen((v) => !v)}
+            className="shrink-0 w-7 flex flex-col justify-center items-center bg-zinc-900/80 hover:bg-zinc-800/90 text-zinc-500 hover:text-zinc-300 text-xs font-mono transition-colors border-l border-zinc-800"
+            title={rightPanelOpen ? "Skrýt nastavení backtestu" : "Zobrazit nastavení backtestu"}
+            aria-expanded={rightPanelOpen}
+            aria-label={rightPanelOpen ? "Skrýt pravý panel" : "Zobrazit pravý panel"}
+          >
+            {rightPanelOpen ? "►" : "◄"}
+          </button>
+          <div
+            className={`shrink-0 flex flex-col min-h-0 overflow-hidden bg-zinc-900/50 transition-[width] duration-200 ease-out ${
+              rightPanelOpen ? "w-96 border-l border-zinc-800" : "w-0 border-l-0"
+            }`}
+          >
+            <div className="w-96 h-full min-h-0 overflow-y-auto p-4">
+              <BacktestSettings
+                instruments={filteredInstruments}
+                instrumentsLoaded={instrumentsLoaded}
+                dataLoadError={dataLoadError}
+                selectedInstrument={selectedInstrument}
+                selectedInstrumentFiles={selectedInstrumentFiles}
+                onToggleInstrumentFile={toggleInstrumentFile}
+                onSelectAllInstrumentsInList={selectAllInstrumentFiles}
+                years={years}
+                onYearsChange={(y) => setYears(Math.max(1, Math.min(y, minYearsAcrossSelected)))}
+                params={backtestParams}
+                onParamsChange={(p) => setBacktestParams((prev) => ({ ...prev, ...p }))}
+                indicators={indicators}
+                selectedIndicatorIds={selectedIndicatorIds}
+                onSelectIndicators={setSelectedIndicatorIds}
+                modules={modules}
+                selectedModuleIds={selectedModuleIds}
+                onSelectModules={setSelectedModuleIds}
+                onConfirmSelection={handleConfirmSelection}
+                onRun={handleRun}
+                isRunning={isRunning}
+                canRun={openItem?.type === "strategies"}
+                strategyParams={strategyParams}
+                strategyParamMeta={strategyParamMeta}
+                onStrategyParamsChange={setStrategyParams}
+                moduleParams={moduleParams}
+                moduleParamMeta={moduleParamMeta}
+                onModuleParamsChange={(name, params) =>
+                  setModuleParams((prev) => ({ ...prev, [name]: params }))
+                }
+                moduleParamPanels={moduleParamPanels}
+                indicatorParams={indicatorParams}
+                indicatorParamMeta={indicatorParamMeta}
+                onIndicatorParamsChange={(name, params) =>
+                  setIndicatorParams((prev) => ({ ...prev, [name]: params }))
+                }
+                indicatorNamesForParams={appliedIndicatorIds
+                  .map((id) => indicators.find((i) => i.id === id)?.name)
+                  .filter((n): n is string => !!n)}
+                edgeSettings={edgeSettings}
+                onEdgeSettingsChange={setEdgeSettings}
+              />
+            </div>
           </div>
         </div>
         <LogPanel

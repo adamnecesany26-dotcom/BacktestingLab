@@ -7,10 +7,11 @@ const STORAGE_KEY = "backtest_quality_gate_expanded";
 
 type GateCheck = {
   metric?: string;
-  value?: number;
+  value?: number | null;
   threshold?: number;
   mode?: string;
   passed?: boolean;
+  note?: string;
 };
 
 const METRIC_LABELS: Record<string, string> = {
@@ -23,11 +24,18 @@ const METRIC_LABELS: Record<string, string> = {
 
 function formatCheckLine(c: GateCheck): string {
   const name = METRIC_LABELS[String(c.metric)] ?? String(c.metric ?? "?");
-  const val = typeof c.value === "number" ? c.value : NaN;
+  const val = typeof c.value === "number" && Number.isFinite(c.value) ? c.value : NaN;
   const thr = typeof c.threshold === "number" ? c.threshold : NaN;
   const mode = String(c.mode ?? "");
-  const vStr = Number.isFinite(val) ? (name.includes("%") ? `${val.toFixed(2)} %` : val.toFixed(4)) : "—";
+  const vStr = Number.isFinite(val) ? (name.includes("%") ? `${val.toFixed(2)} %` : val.toFixed(4)) : "N/A";
   const tStr = Number.isFinite(thr) ? (name.includes("%") ? `${thr.toFixed(2)} %` : thr.toFixed(4)) : "—";
+  const note = typeof c.note === "string" && c.note.trim() ? c.note.trim() : "";
+  if (c.metric === "profitFactor" && !Number.isFinite(val) && note) {
+    if (mode === "min") {
+      return `${name}: N/A — ${note} (požadováno ≥ ${tStr})`;
+    }
+    return `${name}: N/A — ${note}`;
+  }
   if (mode === "min") {
     return `${name}: ${vStr} (požadováno ≥ ${tStr})`;
   }
@@ -39,10 +47,12 @@ function formatCheckLine(c: GateCheck): string {
 
 interface QualityGateBannerProps {
   qualityGate: RunResponse["qualityGate"];
+  /** Trvale schovat panel (např. session v ResultsView). */
+  onDismiss?: () => void;
 }
 
 /** Upozornění: brány se vyhodnocují až po celém běhu — neomezují průběh simulace. Lze sbalit. */
-export function QualityGateBanner({ qualityGate }: QualityGateBannerProps) {
+export function QualityGateBanner({ qualityGate, onDismiss }: QualityGateBannerProps) {
   const [expanded, setExpanded] = useState(true);
 
   useEffect(() => {
@@ -80,13 +90,13 @@ export function QualityGateBanner({ qualityGate }: QualityGateBannerProps) {
 
   return (
     <div
-      className={`rounded-lg border text-sm ${
+      className={`rounded-xl border text-sm shadow-lg shadow-black/15 ${
         passed
-          ? "border-emerald-700/60 bg-emerald-950/40 text-emerald-100"
-          : "border-amber-700/70 bg-amber-950/35 text-amber-100"
+          ? "border-emerald-700/50 bg-gradient-to-br from-emerald-950/50 to-zinc-950/40 text-emerald-100"
+          : "border-amber-700/50 bg-gradient-to-br from-amber-950/45 to-zinc-950/40 text-amber-100"
       }`}
     >
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2 border-b border-zinc-700/40">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-zinc-700/40">
         <div className="font-semibold flex flex-wrap items-center gap-2">
           <span>Quality gate</span>
           <span
@@ -97,13 +107,25 @@ export function QualityGateBanner({ qualityGate }: QualityGateBannerProps) {
             {passed ? "PASS" : "FAIL"}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={toggle}
-          className="text-xs px-2 py-1 rounded-md bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 border border-zinc-600"
-        >
-          {expanded ? "Skrýt" : "Zobrazit"}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={toggle}
+            className="text-xs px-2 py-1 rounded-md bg-zinc-800/80 hover:bg-zinc-700 text-zinc-300 border border-zinc-600"
+          >
+            {expanded ? "Skrýt" : "Zobrazit"}
+          </button>
+          {onDismiss ? (
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="text-xs px-2 py-1 rounded-md bg-zinc-800/60 hover:bg-rose-900/40 text-zinc-400 hover:text-rose-200 border border-zinc-700"
+              title="Schovat upozornění"
+            >
+              ✕
+            </button>
+          ) : null}
+        </div>
       </div>
 
       {expanded && (

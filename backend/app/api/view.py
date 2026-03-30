@@ -4,7 +4,9 @@ Used for visual testing of modules/indicators (e.g. H/L detection).
 """
 
 import re
+import sys
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 import asyncio
@@ -39,6 +41,23 @@ def _to_iso(value) -> str:
         return pd.Timestamp(value).isoformat()
     except Exception:
         return str(value)
+
+
+def _view_line_point(p: Any) -> dict | None:
+    """Bod čáry: date, value; volitelně state, score (trend Swing HL)."""
+    if not isinstance(p, dict) or "date" not in p:
+        return None
+    pt: dict[str, Any] = {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+    st = p.get("state")
+    if st is not None:
+        pt["state"] = str(st)
+    sc = p.get("score")
+    if sc is not None:
+        try:
+            pt["score"] = float(sc)
+        except (TypeError, ValueError):
+            pass
+    return pt
 
 
 def _is_regime_histogram_row(p: Any) -> bool:
@@ -105,13 +124,28 @@ def _resolve_safe_data_path(data_dir: Path, data_file: str) -> Path:
     return path
 
 
-def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
-    """Load and normalize OHLC from CSV/parquet. Returns DataFrame with datetime index."""
-    data_dir = _get_data_dir()
-    path = _resolve_safe_data_path(data_dir, data_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Data file not found: {data_file}")
+_VIEW_OHLC_CACHE_MAX = max(1, int(float(os.environ.get("VIEW_OHLC_CACHE_MAX", "32") or 32)))
+_VIEW_OHLC_CACHE: "OrderedDict[tuple[str, int, float, str, str], pd.DataFrame]" = OrderedDict()
 
+
+def _slice_ohlc_by_iso(df: pd.DataFrame, start_iso: str | None, end_iso: str | None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df
+    if start_iso and str(start_iso).strip():
+        out = out[out.index >= pd.Timestamp(str(start_iso).strip())]
+    if end_iso and str(end_iso).strip():
+        out = out[out.index <= pd.Timestamp(str(end_iso).strip())]
+    return out
+
+
+def _load_ohlc_uncached(
+    path: Path,
+    years: float,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> pd.DataFrame:
+    """Load and normalize OHLC from CSV/parquet. Caller must ensure path exists."""
     if path.suffix.lower() == ".txt":
         df = pd.read_csv(
             path,
@@ -149,14 +183,64 @@ def _load_ohlc(data_file: str, years: float) -> pd.DataFrame:
                 break
         if "volume" not in df.columns:
             df["volume"] = 1000
+            try:
+                df.attrs["volumeIsSyntheticPlaceholder"] = True
+            except Exception:
+                pass
+            print(
+                "[view] CSV has no volume — synthetic volume=1000; chart/module volume logic is not realistic.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            try:
+                df.attrs["volumeIsSyntheticPlaceholder"] = False
+            except Exception:
+                pass
     else:
         df = pd.read_parquet(path)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "datetime" in df.columns:
+                df = df.set_index(pd.to_datetime(df["datetime"], errors="coerce")).sort_index()
+                df = df[~df.index.isna()]
+            else:
+                raise ValueError(f"Parquet must have DatetimeIndex or 'datetime' column: {path.name}")
 
     if years > 0 and len(df) > 0:
         cutoff = df.index.max() - pd.Timedelta(days=years * 365.25)
         df = df[df.index >= cutoff]
 
+    df = _slice_ohlc_by_iso(df, start_iso, end_iso)
     return df
+
+
+def _load_ohlc(
+    data_file: str,
+    years: float,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> pd.DataFrame:
+    """Load and normalize OHLC from CSV/parquet. Returns DataFrame with datetime index."""
+    data_dir = _get_data_dir()
+    path = _resolve_safe_data_path(data_dir, data_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {data_file}")
+    try:
+        st = path.stat()
+        mtime_ns = int(st.st_mtime_ns)
+    except OSError:
+        mtime_ns = 0
+    cache_key = (str(path.resolve()), mtime_ns, float(years), start_iso or "", end_iso or "")
+    hit = _VIEW_OHLC_CACHE.get(cache_key)
+    if hit is not None:
+        _VIEW_OHLC_CACHE.move_to_end(cache_key)
+        return hit.copy()
+    df = _load_ohlc_uncached(path, years, start_iso, end_iso)
+    _VIEW_OHLC_CACHE[cache_key] = df
+    _VIEW_OHLC_CACHE.move_to_end(cache_key)
+    while len(_VIEW_OHLC_CACHE) > _VIEW_OHLC_CACHE_MAX:
+        _VIEW_OHLC_CACHE.popitem(last=False)
+    return df.copy()
 
 
 # --- View chart candle timeframe (OHLC resample; only coarser than native bars) ---
@@ -286,7 +370,7 @@ def _resolve_view_worker_timeout_seconds() -> int:
     return max(0, parsed)
 
 
-async def _run_view_code_in_docker(
+async def _run_view_code_in_subprocess(
     *,
     data_file: str,
     years: float,
@@ -318,6 +402,8 @@ async def _run_view_code_in_docker(
         main_path = run_dir / "main.py"
         main_path.write_text(module_code, encoding="utf-8")
         req_path = run_dir / "request.json"
+        main_abs = str((run_dir / "main.py").resolve())
+        deps_abs = str(modules_dir.resolve())
         req_path.write_text(
             json.dumps(
                 {
@@ -325,30 +411,34 @@ async def _run_view_code_in_docker(
                     "years": years,
                     "params": params or {},
                     "chart_timeframe": chart_timeframe,
-                    "main_path": "/app/view/main.py",
-                    "deps_dir": "/app/view/modules",
+                    "start_iso": start_iso,
+                    "end_iso": end_iso,
+                    "main_path": main_abs,
+                    "deps_dir": deps_abs,
                     "actor_id": actor_id,
                 }
             ),
             encoding="utf-8",
         )
 
-        run_path = str(run_dir.resolve()).replace("\\", "/")
-        data_path = str(data_dir.resolve()).replace("\\", "/")
+        data_path_abs = str(data_dir.resolve())
+        req_path_abs = str(req_path.resolve())
+        view_engine_script = backend_root / "docker" / "view_engine.py"
+        if not view_engine_script.is_file():
+            raise RuntimeError(f"view_engine.py not found: {view_engine_script}")
+
         cmd = [
-            "docker", "run",
-            "--rm",
-            "--memory=512m",
-            "--cpus=1",
-            "--pids-limit=128",
-            "--network", "none",
-            "--security-opt", "no-new-privileges:true",
-            "--cap-drop", "ALL",
-            "-v", f"{run_path}:/app/view:rw",
-            "-v", f"{data_path}:/app/data:ro",
-            "backtest-engine",
-            "python", "view_engine.py", "/app/data", "/app/view/request.json",
+            sys.executable,
+            str(view_engine_script),
+            data_path_abs,
+            req_path_abs,
         ]
+        venv = os.environ.copy()
+        _proj = str(project_root.resolve())
+        _backend_s = str(backend_root.resolve())
+        _pp = venv.get("PYTHONPATH", "").strip()
+        _roots = f"{_proj}{os.pathsep}{_backend_s}"
+        venv["PYTHONPATH"] = f"{_roots}{os.pathsep}{_pp}" if _pp else _roots
         proc = await asyncio.to_thread(
             subprocess.run,
             cmd,
@@ -356,13 +446,14 @@ async def _run_view_code_in_docker(
             text=True,
             timeout=timeout_sec if timeout_sec > 0 else None,
             check=False,
+            env=venv,
         )
         if proc.returncode != 0:
             stderr_preview = (proc.stderr or "unknown view engine error").strip()[:500]
-            raise RuntimeError(f"Sandbox view engine failed: {stderr_preview}")
+            raise RuntimeError(f"View engine subprocess failed: {stderr_preview}")
         stdout = (proc.stdout or "").strip()
         if not stdout:
-            raise RuntimeError("Sandbox view engine returned empty output")
+            raise RuntimeError("View engine subprocess returned empty output")
         payload = json.loads(stdout)
         if isinstance(payload, dict) and payload.get("error"):
             raise RuntimeError(str(payload["error"]))
@@ -371,7 +462,7 @@ async def _run_view_code_in_docker(
         lines = payload.get("lines") if isinstance(payload, dict) else None
         zones = payload.get("zones") if isinstance(payload, dict) else None
         if not isinstance(ohlc, list) or not isinstance(markers, list) or not isinstance(lines, list) or not isinstance(zones, list):
-            raise RuntimeError("Sandbox view engine returned invalid payload")
+            raise RuntimeError("View engine returned invalid payload")
         return ohlc, markers, lines, zones
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
@@ -460,11 +551,15 @@ def _run_view_code(
             result = _call_with_params(mod.get_line, df, params)
             if isinstance(result, dict):
                 for name, data in result.items():
-                    pts = []
+                    pts: list[dict] = []
                     color = None
                     segments = None
                     if isinstance(data, list):
-                        pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
+                        pts = [
+                            lp
+                            for p in data
+                            if isinstance(p, dict) and (lp := _view_line_point(p)) is not None
+                        ]
                     elif isinstance(data, dict) and "data" in data:
                         raw_data = data["data"]
                         forced = data.get("kind") == "regime_histogram"
@@ -479,27 +574,43 @@ def _run_view_code(
                             if forced:
                                 continue
                         pts = [
-                            {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+                            lp
                             for p in raw_data
-                            if isinstance(p, dict)
+                            if isinstance(p, dict) and (lp := _view_line_point(p)) is not None
                         ]
                         color = data.get("color")
                         segments = data.get("segments")
                     if pts:
-                        if segments:
+                        if isinstance(segments, list) and len(segments) > 0:
                             for seg in segments:
-                                if isinstance(seg, dict) and "from" in seg and "to" in seg and "color" in seg:
+                                if not isinstance(seg, dict):
+                                    continue
+                                if "from" not in seg or "to" not in seg or "color" not in seg:
+                                    continue
+                                try:
                                     i0, i1 = int(seg["from"]), int(seg["to"]) + 1
-                                    seg_pts = pts[i0:i1]
-                                    if seg_pts:
-                                        lines.append({"name": str(name), "data": seg_pts, "color": str(seg["color"])})
+                                except (TypeError, ValueError):
+                                    continue
+                                if i0 < 0 or i1 > len(pts) or i0 >= i1:
+                                    continue
+                                seg_pts = pts[i0:i1]
+                                if seg_pts:
+                                    lines.append({
+                                        "name": str(name),
+                                        "data": seg_pts,
+                                        "color": str(seg["color"]),
+                                    })
                         else:
                             line_obj = {"name": str(name), "data": pts}
                             if color:
                                 line_obj["color"] = str(color)
                             lines.append(line_obj)
             elif isinstance(result, list):
-                pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in result if isinstance(p, dict)]
+                pts = [
+                    lp
+                    for p in result
+                    if isinstance(p, dict) and (lp := _view_line_point(p)) is not None
+                ]
                 if pts:
                     lines.append({"name": "line", "data": pts})
 
@@ -582,7 +693,7 @@ def _view_worker_process(
     queue,
 ) -> None:
     try:
-        df = _load_ohlc(data_file, years)
+        df = _load_ohlc(data_file, years, None, None)
         markers, lines, zones = _run_view_code(
             code,
             df,
@@ -746,7 +857,7 @@ async def get_view_data(req: ViewRequest, request: Request):
     Returns { ohlc: [...], markers: [...], lines: [{name, data: [...]}, ...] }.
     """
     try:
-        df = _load_ohlc(req.data_file, req.years)
+        df = _load_ohlc(req.data_file, req.years, req.start_iso, req.end_iso)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except FileNotFoundError as e:
@@ -759,7 +870,7 @@ async def get_view_data(req: ViewRequest, request: Request):
 
     if req.module_code and req.module_code.strip():
         try:
-            ohlc, markers, lines, zones = await _run_view_code_in_docker(
+            ohlc, markers, lines, zones = await _run_view_code_in_subprocess(
                 data_file=req.data_file,
                 years=req.years,
                 module_code=req.module_code.strip(),
@@ -767,6 +878,8 @@ async def get_view_data(req: ViewRequest, request: Request):
                 module_dependencies=req.module_dependencies,
                 actor_id=actor_id,
                 chart_timeframe=req.chart_timeframe,
+                start_iso=req.start_iso,
+                end_iso=req.end_iso,
             )
             append_audit_event(
                 action="view.run",
@@ -782,6 +895,7 @@ async def get_view_data(req: ViewRequest, request: Request):
             )
             return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
         except Exception as e:
+            err_short = str(e).strip()[:480]
             append_audit_event(
                 action="view.run",
                 actor_id=actor_id,
@@ -789,7 +903,13 @@ async def get_view_data(req: ViewRequest, request: Request):
                 status="error",
                 details={"data_file": req.data_file, "years": req.years, "error": str(e)[:300]},
             )
-            raise HTTPException(status_code=400, detail="View error: sandbox execution failed.")
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "View error: sandbox execution failed."
+                    + (f" ({err_short})" if err_short else "")
+                ),
+            )
 
     try:
         df_chart = _apply_view_chart_timeframe(df, req.chart_timeframe)

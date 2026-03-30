@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { Trade } from "@shared/types";
 import type { OhlcBar } from "@shared/types";
+import { formatChartAxisUtcLabel, prepareOhlcUtcSecondsSeries } from "@/lib/chartOhlcResample";
 
 interface CandlestickChartProps {
   ohlc: OhlcBar[];
@@ -43,14 +44,9 @@ export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChar
         borderDownColor: "#ef4444",
       });
 
-      const toUtcSeconds = (value: string, fallbackIndex: number): number => {
-        const parsed = Date.parse(value);
-        if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-        return Math.floor(Date.UTC(2020, 0, 1 + fallbackIndex) / 1000);
-      };
-
+      const barTimes = prepareOhlcUtcSecondsSeries(ohlc);
       const candleData = ohlc.map((bar, i) => ({
-        time: toUtcSeconds(bar.date, i) as import("lightweight-charts").UTCTimestamp,
+        time: barTimes[i]! as import("lightweight-charts").UTCTimestamp,
         open: bar.open,
         high: bar.high,
         low: bar.low,
@@ -59,7 +55,7 @@ export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChar
       candleSeries.setData(candleData);
       const ohlcWithTime = ohlc.map((bar, i) => ({
         ...bar,
-        ts: toUtcSeconds(bar.date, i),
+        ts: barTimes[i]!,
       }));
 
       type Marker = {
@@ -73,7 +69,7 @@ export function CandlestickChart({ ohlc, trades, height = 320 }: CandlestickChar
       const findNearestBar = (value: string) => {
         const parsed = Date.parse(value);
         if (Number.isFinite(parsed)) {
-          const target = Math.floor(parsed / 1000);
+          const target = parsed / 1000;
           let best = ohlcWithTime[0];
           let bestDiff = Math.abs(best.ts - target);
           for (let i = 1; i < ohlcWithTime.length; i += 1) {

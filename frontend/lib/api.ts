@@ -5,8 +5,29 @@
 import type { RunRequest, RunResponse, OhlcBar, Trade } from "@shared/types";
 import { getFirebaseAuth } from "@/lib/firebase";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+/**
+ * API base URL.
+ * - If `NEXT_PUBLIC_API_URL` is set (non-empty): direct calls (production / custom).
+ * - If unset in the browser: `""` → same-origin `/api/...` via Next.js rewrites to `127.0.0.1:8000` (recommended local dev on Windows).
+ * - SSR / Node fallback: explicit IPv4 avoids `localhost` → ::1 mismatches with uvicorn.
+ */
+function resolveApiBase(): string {
+  const raw = process.env.NEXT_PUBLIC_API_URL;
+  if (raw !== undefined && String(raw).trim() !== "") {
+    return String(raw).replace(/\/$/, "");
+  }
+  if (typeof window !== "undefined") {
+    return "";
+  }
+  return "http://127.0.0.1:8000";
+}
+
+const API_BASE = resolveApiBase();
 const API_AUTH_KEY = process.env.NEXT_PUBLIC_API_AUTH_KEY ?? "";
+
+function apiBaseLabel(): string {
+  return API_BASE === "" ? "(stejný origin → Next proxy na 127.0.0.1:8000)" : API_BASE;
+}
 
 async function readApiErrorMessage(res: Response): Promise<string> {
   const raw = await res.text();
@@ -112,7 +133,7 @@ export async function runBacktestStreaming(
     }
   }
 
-  if (!result) throw new Error("Backtest nedokončil - zkontrolujte Docker a backend logy");
+  if (!result) throw new Error("Backtest nedokončil - zkontrolujte backend logy a závislosti (pip install -r backend/requirements.txt)");
   return result;
 }
 
@@ -127,10 +148,18 @@ export async function getAvailableData(): Promise<{
   return res.json();
 }
 
-/** Řada bodů {date, value} pro běžné indikátorové čáry (ne režimový histogram) */
+/** Bod čáry; volitelně state/score z trendu Swing HL / HL_identificator */
+export interface ViewLinePoint {
+  date: string;
+  value: number;
+  state?: string;
+  score?: number;
+}
+
+/** Řada bodů pro běžné indikátorové čáry (ne režimový histogram) */
 export interface ViewLineSeries {
   name: string;
-  data: { date: string; value: number }[];
+  data: ViewLinePoint[];
   color?: string;
 }
 
@@ -185,6 +214,11 @@ export interface ViewZone {
 }
 
 /** Fetch OHLC + optional module markers/lines/zones for View chart. */
+export type ViewDataWindow = {
+  startIso?: string | null;
+  endIso?: string | null;
+};
+
 export async function getViewData(
   dataFile: string,
   years: number,
@@ -192,7 +226,9 @@ export async function getViewData(
   params?: Record<string, number | boolean | string> | null,
   moduleDependencies?: Record<string, string> | null,
   /** native = source bar size; else backend resamples OHLC (1m…1Mo) before module + chart */
-  chartTimeframe?: string | null
+  chartTimeframe?: string | null,
+  /** Optional ISO slice after years cutoff — module runs on sliced OHLC */
+  window?: ViewDataWindow | null
 ): Promise<{
   ohlc: OhlcBar[];
   markers: { date: string; type: string; value: number }[];
@@ -200,19 +236,38 @@ export async function getViewData(
   zones?: ViewZone[];
 }> {
   const headers = await getApiHeaders(true);
-  const res = await fetch(`${API_BASE}/api/view`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      data_file: dataFile,
-      years,
-      module_code: moduleCode || null,
-      params: params || null,
-      module_dependencies: moduleDependencies || null,
-      chart_timeframe:
-        chartTimeframe && chartTimeframe !== "native" ? chartTimeframe : null,
-    }),
-  });
+  const body: Record<string, unknown> = {
+    data_file: dataFile,
+    years,
+    module_code: moduleCode || null,
+    params: params || null,
+    module_dependencies: moduleDependencies || null,
+    chart_timeframe:
+      chartTimeframe && chartTimeframe !== "native" ? chartTimeframe : null,
+  };
+  if (window?.startIso) body.start_iso = window.startIso;
+  if (window?.endIso) body.end_iso = window.endIso;
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/api/view`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    const isNetwork =
+      err instanceof TypeError &&
+      (String((err as Error).message).toLowerCase().includes("fetch") ||
+        String((err as Error).message).toLowerCase().includes("network"));
+    if (isNetwork) {
+      throw new Error(
+        `Nelze se spojit s API ${apiBaseLabel()} — zkontrolujte běh uvicorn na :8000, restart ` +
+          `frontendu po změně next.config (proxy). Pokud máte v .env NEXT_PUBLIC_API_URL=http://localhost:8000, zkuste řádek smazat ` +
+          `(proxy přes :3000) nebo použít http://127.0.0.1:8000. LAN/CORS: CORS_ALLOW_LAN_3000 v backend/.env.`
+      );
+    }
+    throw err;
+  }
   if (!res.ok) {
     const message = await readApiErrorMessage(res);
     throw new Error(formatApiError(res.status, message, "/api/view"));

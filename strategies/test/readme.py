@@ -10,7 +10,7 @@
 # =============================================================================
 #
 # Frontend (Next.js) posílá kód strategie na backend (FastAPI). Backend zapíše
-# kód do souboru strategy.py, spustí Docker kontejner s Backtrader engine,
+# kód do souboru strategy.py, spustí hostovský subprocess s Backtrader engine,
 # který:
 #   1. Načte strategii dynamicky (import)
 #   2. Načte OHLCV data (CSV/parquet) podle zvoleného instrumentu
@@ -138,7 +138,7 @@
 #
 # - Nepoužívej externí knihovny kromě backtrader - engine má jen bt, pandas.
 #
-# - Strategie běží v Dockeru - žádný přístup k síti, souborům mimo /app.
+# - Strategie běží jako subprocess na hostu (stejné oprávnění jako backend).
 #
 # - Engine automaticky zaznamenává obchody (entry/exit, PnL). Nemusíš nic
 #   speciálního dělat - stačí volat buy/sell.
@@ -207,4 +207,3 @@
 #                 self.sell(size=1)
 #
 # =============================================================================
-#ahoj

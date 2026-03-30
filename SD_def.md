@@ -45,7 +45,7 @@ V podobném místě (cenový overlap ≥25 %) a blízkém časovém rámci (≤7
 
 **Výška** je vždy podle pivot svíčky (value_low = low, value_high = high).
 
-**Délka base (`base_length`):** počet sousedních barů kolem pivotu, které modul označí za součást konsolidace — pravidla a prahy (`base_bar_range_in_zone_min`, `base_zone_height_covered_min`, `base_body_in_zone_min`) jsou v modulu `get_zones` a v [`SD_de.md`](SD_de.md) §7.1.
+**Délka base (`base_length`):** počet sousedních barů kolem pivotu, které modul označí za součást konsolidace — prahy `base_bar_range_in_zone_min` a `base_body_in_zone_min` (současně) jsou v modulu `get_zones` a v [`SD_de.md`](SD_de.md) §7.1.
 
 ### Formát zóny (get_zones)
 
@@ -75,4 +75,4 @@ Poznámka: dříve byl `date_end` mylně popsaný jako datum pivotu — v implem
 
 - **Zóny** se počítají z OHLC resamplovaného na `zone_timeframe` (výchozí **1D**). **Exekuce** (limit, stop, target, max hold) běží na datech instrumentu (např. **30m** `futures_30m/NQ.txt`).
 - Parametry modulu (ATR, overlap, inducement, …) jsou duplikované v **`PARAMS`** strategie kvůli konfiguraci v panelu Strategie.
-- Po runu: záložka **Run view** v Results — moduly + obchody nad stejným OHLC jako backtest.
+- Po runu: záložka **Detailed** v Results — moduly + obchody; lze přepnout agregovaný TF grafu. Zarovnání denních zón na intraday graf řeší frontend (rozšíření období na první/poslední bar v kalendářních dnech).

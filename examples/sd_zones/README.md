@@ -2,13 +2,13 @@
 
 ## Rychlý přehled
 
-**K čemu to je:** Vykreslí **zelené Demand** a **červené Supply** „obdélníky“ podle průrazů struktury (**BOS**). Ukáže také oranžové **BOS čáry**, dotyky zóny, inducementy a další detaily ve View.
+**K čemu to je:** Vykreslí **zelené Demand** a **červené Supply** „obdélníky“ podle průrazů struktury (**BOS**). Ukáže také oranžové **BOS čáry**, dotyky zóny, inducementy a další detaily ve View. Funkce **`get_line`** přidá **čáru „HL trend“** (stejná logika jako v **HL identificator / Swing HL**) — barevné segmenty podle stavu (STRONG_BULL … STRONG_BEAR), abys viděl trend vedle zón.
 
 **Co musíš mít vedle:** Modul **Swing HL** (stejná aplikace ho umí stáhnout automaticky přes závislost ve View). Ve strategii musí být **Swing HL + tento modul** oba zaškrtnuté.
 
 **Soubor ke kopírování:** `examples/sd_zones.py` → modul např. **S/D Zones** nebo **S_D_Zones**.
 
-**Parametry:** V aplikaci u modulu (ikona ozubeného kola) – např. délka životnosti zóny vpravo, prahy pro překryvy, ATR u dotyku. Delší popis je níže v tabulkách.
+**Parametry:** V UI jen časové rámce, životnost zóny doprava, **dva prahy pro base** (podíl rozpětí + podíl těla v zóně), filtry `max_base_length`, **`require_inducement`**, střih překryvu, **`max_pivot_candle_range_atr`**. Inducement okno a rozšíření doleva jsou **v kódu** jako konstanty — viz §6.
 
 ---
 
@@ -162,24 +162,27 @@ V podobném místě (cenový overlap ≥ 25 %) a blízkém čase (≤ 7 barů) n
 
 ## 6. Parametry (VIEW_PARAMS)
 
-Ve View je záměrně **úzká sada** parametrů, které nejvíc mění tvar zón; Swing/BOS jemné doladění (`atr_period`, `sensitivity`, `max_bars`, …) zůstává ve **výchozích hodnotách v kódu** (`params.get(..., default)`). Prahové podíly pro šířku base (`base_zone_height_covered_min`, `base_body_in_zone_min`) jsou v `VIEW_PARAMS` ve shodě se strategií `sd_zone_strategy`. Plná sada zbývajících klíčů je v `PARAMS` strategie.
+V panelu (View i záložka modulu při backtestu) jsou jen **úzké** `VIEW_PARAMS` — čas, životnost, base (% range + % těla), filtry zóny a volitelný filtr trendu. **Prodlužování zóny doleva, dotyk, daleko-od-zóny, inducement (okno × ATR / počet barů), deduplikace** jsou **konstanty** v `sd_zones.py`. Swing/BOS (`atr_period`, …) často předává strategie. **EMA / vyhlazení trend skóre** nejsou v S/D `VIEW_PARAMS`; berou se z **HL_identificator / Swing_HL** (výchozí jako v `swing_hl_detector`).
 
 | Parametr | Default | Popis (stručně) |
 |----------|---------|-----------------|
 | timeframe | 1d | TF struktury a zón |
 | data_timeframe | (doplní View) | Rozlišení vstupního souboru / resampling |
 | zone_extend_right_bars | 60 | Jak dlouho zóna „žije“ doprava (počet barů) |
-| zone_overlap_threshold | 0.33 | Prodlužování vlevo: podíl H–L v pásku zóny |
-| zone_body_overlap_threshold | 0.10 | Totéž pro tělo svíčky (AND s řádkem výše) |
-| zone_touch_vicinity_atr | 0.5 | Dotyk před BOS (násobek ATR) |
-| inducement_max_distance_atr | 2.0 | Inducement max. vzdálenost od zóny (× ATR) |
-| inducement_max_bars | 40 | Inducement jen v prvních N barech od pivotu |
-| base_bar_range_in_zone_min | 0.40 | Jedna z OR podmínek pro šířku base (podíl H–L v zóně) |
-| base_zone_height_covered_min | 0.80 | OR: min. podíl pokrytí výšky zóny knotem (H–L) |
-| base_body_in_zone_min | 0.60 | OR: min. podíl těla uvnitř zóny |
-| max_base_length | 0 | Filtr délky base ve výstupu (0 = vypnuto) |
+| base_bar_range_in_zone_min | 0.40 | Min. podíl rozpětí H–L uvnitř zóny (pro base) |
+| base_body_in_zone_min | 0.60 | Min. podíl těla uvnitř zóny — musí platit **zároveň** s řádkem výše (u doji stačí rozpětí) |
+| max_base_length | 0 | Max. počet barů base ve výstupu (0 = vypnuto) |
+| require_inducement | 0 | 1 = ve výstupu jen D/S s alespoň jedním inducementem |
+| zone_overlap_trim_ratio | 0.6 | Střih starší zóny při překryvu stejného typu |
+| max_pivot_candle_range_atr | 5 | Odmítnout extrémně široký pivot (0 = vypnuto) |
+| trend_filter_enabled | 0 | 1 = filtrovat D/S podle trend skóre v okně kolem pivotu |
+| trend_window_bars | 5 | Šířka okna (bary TF zón) |
+| trend_window_mode | minmax | minmax nebo mean — viz `VIEW_PARAMS_META` |
+| trend_min_score_demand | 25 | Práh bull kontextu pro Demand |
+| trend_max_score_supply | -25 | Práh bear kontextu pro Supply |
+| range_zone_policy | both | both / none při neutrálním okně |
 
-Detailní vysvětlení je v **`VIEW_PARAMS_META`** v `sd_zones.py` — ve View se zobrazí v panelu parametrů pod názvem pole.
+Detailní vysvětlení je v **`VIEW_PARAMS_META`** v `sd_zones.py`.
 
 ---
 
@@ -195,15 +198,15 @@ Detailní vysvětlení je v **`VIEW_PARAMS_META`** v `sd_zones.py` — ve View s
 - **Příčina**: Modul Swing HL není v aplikovaných modulech nebo má jiný název
 - **Řešení**: Název modulu v aplikaci musí odpovídat `Swing_HL` nebo `HL_identificator` (podle toho, jak je v kódu import). Zkontroluj sekci Moduly před Run.
 
-### Zóny jsou příliš malé / velké
+### Zóny jsou příliš malé / velké (doleva)
 
-- **Příčina**: Parametry `zone_overlap_threshold`, `zone_body_overlap_threshold`
-- **Řešení**: Sniž prah (např. 0.25) pro širší zóny; zvyš (0.40) pro užší. `zone_body_overlap_threshold` ovlivňuje rozšíření doleva.
+- **Příčina**: Prah pro prodlužování vlevo je v kódu (`_ZONE_EXTEND_LEFT_*`).
+- **Řešení**: Uprav konstanty v `sd_zones.py` nebo base prahy (`base_bar_range_in_zone_min`, `base_body_in_zone_min`).
 
 ### Příliš mnoho / málo zón
 
-- **Příčina**: Parametry Swing HL (`min_bars_between_swings`, `sensitivity`), nebo `zone_min_bars_between_same`
-- **Řešení**: Uprav `min_bars_between_swings` v params (vyšší = méně swingů = méně zón). `zone_min_bars_between_same` ovlivňuje deduplikaci.
+- **Příčina**: Swing HL (`min_bars_between_swings`, …) nebo deduplikace (konstanta `_ZONE_MIN_BARS_BETWEEN_SAME` v kódu).
+- **Řešení**: Ladění spíš ve **Swing HL** modulech; případně konstanty v `sd_zones.py`.
 
 ### KeyError: 'high' / 'low' / 'open' / 'close'
 

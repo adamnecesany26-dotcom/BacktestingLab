@@ -9,6 +9,8 @@ Přehled všech důležitých příkazů, jak spustit aplikaci, co dělat při p
 | **README.md** | Architektura, API, Firestore, výsledkové záložky, limity. |
 | **READMEADAM.md** | Co kde v UI najdeš; Edge finding; exporty; nápověda v aplikaci. |
 | **READMEAI.md** | Pro vývoj: kde v kódu měnit chování, kontrakty request/response. |
+| **audit/README.md** | Index uložených auditů (review později). |
+| **docs/QUANT_AUDIT.md** | Technický quant audit dat a engine. |
 | **SCRIPTS.md** (tento soubor) | Jen příkazy a běh lokálně. |
 
 ---
@@ -19,24 +21,11 @@ Před prvním spuštěním potřebuješ:
 
 - **Node.js 18+** – [nodejs.org](https://nodejs.org)
 - **Python 3.11+** – [python.org](https://python.org)
-- **Docker Desktop** – [docker.com](https://docker.com) (musí běžet na pozadí)
-
 ---
 
 ## První spuštění (setup)
 
-### 1. Sestavit Docker obraz (jednou)
-
-```powershell
-cd c:\Users\adamn\Desktop\Backtesting_app\backend\docker
-docker build -t backtest-engine .
-```
-
-**Kdy znovu:** Po změně `engine.py`, `Dockerfile` nebo `requirements.txt` v `backend/docker/`.
-
----
-
-### 2. Backend – virtuální prostředí a závislosti
+### 1. Backend – virtuální prostředí a závislosti
 
 ```powershell
 cd c:\Users\adamn\Desktop\Backtesting_app\backend
@@ -62,7 +51,7 @@ npm install
 
 ## Běžné spuštění aplikace
 
-Potřebuješ **2 terminály** (Docker Desktop musí běžet).
+Potřebuješ **2 terminály** (backend + frontend).
 
 ### Terminál 1 – Backend
 
@@ -112,15 +101,8 @@ http://localhost:3000
 |--------|-------|
 | `uvicorn app.main:app --reload --port 8000` | Spustí API server s auto-reload |
 | `uvicorn app.main:app --port 8000` | Spustí bez reload (produkce) |
-| `python -m pytest` | Spustí testy (pokud existují) |
-
-### Docker
-
-| Příkaz | Popis |
-|--------|-------|
-| `docker build -t backtest-engine .` | Sestaví obraz (v `backend/docker/`) |
-| `docker images` | Zobrazí seznam obrazů |
-| `docker ps -a` | Zobrazí kontejnery (včetně zastavených) |
+| `python -m pytest` | Spustí testy (`backend/tests/`, z adresáře `backend/`) |
+| `python backend/scripts/build_nq_view_demo_2025.py` | Z `data/futures_30m/NQ.txt` vyřízne rok 2025 → `nq_view_demo_2025.parquet` (View demo instrument) |
 
 ---
 
@@ -134,20 +116,12 @@ http://localhost:3000
 
 ---
 
-### Run nefunguje / „Docker failed“
+### Run nefunguje / „Engine subprocess failed“
 
-1. **Docker Desktop běží?** – musí být spuštěný
-2. **Obraz existuje?**
-   ```powershell
-   docker images
-   ```
-   Měl bys vidět `backtest-engine`. Pokud ne:
-   ```powershell
-   cd backend\docker
-   docker build -t backtest-engine .
-   ```
+1. **Závislosti backendu:** `pip install -r backend/requirements.txt` (Backtrader, pyarrow, …)
+2. **Stejný Python:** engine se spouští jako `sys.executable` z venv, ve kterém běží uvicorn
 3. **Data existují?** – soubor `data/mock/NQ_5Y.csv` musí být na místě
-4. **Backend logy** – v terminálu s uvicorn uvidíš chyby z Dockeru
+4. **Backend logy** – v terminálu s uvicorn uvidíš stderr z engine subprocessu
 
 ---
 
@@ -188,7 +162,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8001
 ### Chyba v Python strategii (syntax, runtime)
 
 - Chyba se zobrazí v **LogPanel** (spodní panel)
-- Backend předává stderr z Dockeru
+- Backend předává stderr z engine subprocessu
 - Zkontroluj logy – měl bys vidět traceback
 
 ---
@@ -204,7 +178,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8001
 ### Chci zastavit běžící backtest
 
 - Klikni na **Zastavit** v loading overlay
-- Nebo zavři záložku (request se zruší, backend ukončí Docker)
+- Nebo zavři záložku (request se zruší, backend ukončí engine subprocess)
 
 ---
 
@@ -212,10 +186,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8001
 
 ### Změnil jsem engine.py – co teď?
 
-```powershell
-cd backend\docker
-docker build -t backtest-engine .
-```
+- Uvicorn s `--reload` obvykle nestačí na child proces — zastav backend (Ctrl+C) a spusť znovu `uvicorn …`, aby další Run načetl nový `engine.py`.
 
 Bez přestavby obrazu se změny neprojeví.
 
@@ -267,13 +238,6 @@ pip install -r requirements.txt
 
 ---
 
-### Docker build padá
-
-- Zkontroluj, že jsi v `backend/docker/`
-- Zkontroluj, že existují `Dockerfile`, `engine.py`, `requirements.txt`
-
----
-
 ### Firestore – prázdný seznam strategií
 
 - Normální při prvním spuštění
@@ -293,7 +257,6 @@ pip install -r requirements.txt
 
 ```
 # První setup
-cd backend\docker && docker build -t backtest-engine .
 cd backend && python -m venv venv && .\venv\Scripts\activate && pip install -r requirements.txt
 cd frontend && npm install
 
@@ -311,8 +274,7 @@ cd frontend && npm run dev
 
 ## Kontrolní seznam před prvním Run
 
-- [ ] Docker Desktop běží
-- [ ] Obraz `backtest-engine` je sestaven
+- [ ] `pip install -r backend/requirements.txt`
 - [ ] Backend běží (http://localhost:8000/health → ok)
 - [ ] Frontend běží (http://localhost:3000)
 - [ ] Vytvořena alespoň jedna strategie
@@ -324,5 +286,5 @@ cd frontend && npm run dev
 ## Další čtení
 
 - **[READMEADAM.md](READMEADAM.md)** — co všechno aplikace umí v UI (Edge finding, validace, exporty).
-- **[README.md](README.md)** — API, Docker, Firestore, struktura projektu.
+- **[README.md](README.md)** — API, engine subprocess, Firestore, struktura projektu.
 - **[READMEAI.md](READMEAI.md)** — kde v kódu hledat změny.

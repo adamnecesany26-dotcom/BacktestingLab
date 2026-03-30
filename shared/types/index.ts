@@ -46,7 +46,7 @@ export interface RunRequest {
   /** Optional client-provided run correlation id */
   run_id?: string;
   /** Validation mode for edge-finding workflow */
-  validation_mode?: "single" | "oos_split" | "walk_forward";
+  validation_mode?: "single" | "oos_split" | "walk_forward" | "param_test";
   validation_config?: Record<string, unknown>;
   quality_gates?: Record<string, unknown>;
   sweep_mode?: "grid" | "random";
@@ -58,6 +58,10 @@ export interface RunRequest {
   experiment?: Record<string, unknown>;
   /** Sequential batch: { batch_id?, max_runs?, items: Partial<RunRequest>[] } */
   batch_config?: Record<string, unknown>;
+  /** Wall-clock cap for engine run (seconds). Omit = server default. 0 = no limit (server must allow). */
+  run_timeout_sec?: number;
+  /** Max seconds without stream activity (stall detection). Omit = server default. 0 = disabled. */
+  stream_idle_timeout_sec?: number;
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -82,6 +86,8 @@ export interface DataInstrument {
   instrumentType?: InstrumentType;
   /** Futures broker params - used when present */
   brokerConfig?: BrokerConfig;
+  /** Strategy View: canonical NQ 2025 demo file — full series load + shuffle within file */
+  viewDemo?: boolean;
 }
 
 /** Single trade record */
@@ -120,6 +126,7 @@ export interface BacktestMetrics {
   finalEquity: number;
   maxEquity?: number;
   sharpeRatio: number;
+  /** Max drawdown as percentage (0–100). Prefer `maxDrawdownPct` when both are set. */
   maxDrawdown: number;
   maxDrawdownPct?: number;
   maxDrawdownUsd?: number;
@@ -130,7 +137,8 @@ export interface BacktestMetrics {
   winRate?: number;
   totalReturn?: number;
   totalReturnUsd?: number;
-  profitFactor?: number;
+  /** null when undefined (e.g. no losing trades); see profitFactorStatus */
+  profitFactor?: number | null;
   expectancyUsd?: number;
   expectancyR?: number;
   rMultiple?: number;
@@ -139,6 +147,29 @@ export interface BacktestMetrics {
   marRatio?: number;
   ulcerIndex?: number;
   cagr?: number;
+  /** Engine: defined | undefined_no_losing_trades | no_gross_activity */
+  profitFactorStatus?: string;
+  /** Backtrader SharpeRatio analyzer (legacy); headline sharpeRatio uses equity-based annualization */
+  sharpeRatioLegacyAnalyzer?: number;
+  grossProfitClosedTrades?: number;
+  grossLossAbsClosedTrades?: number;
+  riskAnnualizationPeriodsPerYear?: number;
+  /** Longest drawdown period in bars (peak-to-recovery or end of data) */
+  maxDrawdownDurationBars?: number;
+  /** Longest drawdown period in calendar days */
+  maxDrawdownDurationDays?: number | null;
+  /** Bars from deepest trough back to preceding peak; null if not recovered */
+  timeToRecoveryBars?: number | null;
+  /** Days from deepest trough back to preceding peak; null if not recovered */
+  timeToRecoveryDays?: number | null;
+  /** Current DD % at end of equity curve (0 = at or above peak) */
+  currentDrawdownPct?: number;
+  /** Payoff ratio (AvgWin / AvgLoss); null when no losses */
+  payoffRatio?: number | null;
+  /** Edge per trade = WR×AvgWin - LR×AvgLoss */
+  edgePerTrade?: number;
+  /** Kelly fraction under i.i.d. assumption; null when payoffRatio unavailable */
+  kellyFraction?: number | null;
 }
 
 /** OHLC bar for chart */
@@ -175,9 +206,17 @@ export interface ModuleZone {
   gap_value_high?: number;
 }
 
+/** Bod indikátorové čáry; volitelně trend state/score z Swing HL */
+export interface ModuleLinePoint {
+  date: string;
+  value: number;
+  state?: string;
+  score?: number;
+}
+
 /** Jedna řada z get_line — běžná čára nebo režimový histogram (View / run výstup) */
 export type ModuleLineOutput =
-  | { name: string; data: { date: string; value: number }[]; color?: string }
+  | { name: string; data: ModuleLinePoint[]; color?: string }
   | {
       name: string;
       regime_histogram: true;
@@ -213,6 +252,20 @@ export interface RunResponse {
   qualityGate?: Record<string, unknown>;
   experiment?: Record<string, unknown>;
   batchSummary?: Record<string, unknown>;
+  /** Extended drawdown analysis: duration, recovery, underwater integral */
+  drawdownAnalysis?: Record<string, unknown>;
+  /** Trade PnL distribution: histogram, percentiles, tail CVaR, concentration */
+  tradePnlDistribution?: Record<string, unknown>;
+  /** Bootstrap 95% CI for key metrics (trade-level resampling) */
+  bootstrapCI?: Record<string, unknown>;
+  /** Edge decomposition: win rate vs payoff ratio, Kelly fraction */
+  payoffDecomposition?: Record<string, unknown>;
+  /** Trial count and multiple testing awareness */
+  overfittingSignals?: Record<string, unknown>;
+  /** Prop-level red flags and trust assessment */
+  propRedFlags?: Record<string, unknown>;
+  /** Plné výsledky každého dílčího běhu dávky (jen pokud runů ≤ serverový limit, typicky 12) */
+  batchRuns?: RunResponse[];
 }
 
 /** Project structure for file tree */

@@ -1,5 +1,7 @@
 # Security Hardening Spec (Runner + Engine)
 
+> **2026 update:** The app no longer uses Docker by default. The engine runs as a **host subprocess** with the same privileges as the FastAPI process. Sections below about container flags are **historical** unless you reintroduce a container runtime.
+
 ## Scope
 
 Backend files:

@@ -43,7 +43,7 @@ class RunRequest(BaseModel):
     applied_modules: Optional[List[AppliedModule]] = None
     run_id: Optional[str] = None
     # Edge-finding / validation modes
-    validation_mode: Literal["single", "oos_split", "walk_forward"] = "single"
+    validation_mode: Literal["single", "oos_split", "walk_forward", "param_test"] = "single"
     validation_config: Optional[dict[str, Any]] = None
     quality_gates: Optional[dict[str, Any]] = None
     sweep_mode: Optional[Literal["grid", "random"]] = None
@@ -55,6 +55,10 @@ class RunRequest(BaseModel):
     experiment: Optional[dict[str, Any]] = None
     # Sequential matrix runs: { "batch_id"?: str, "max_runs"?: int (cap 48), "items": [ { partial RunRequest fields } ] }
     batch_config: Optional[dict[str, Any]] = None
+    # Server-side wall timeout for engine subprocess (seconds). None = use server default / RUN_TIMEOUT_SEC env. 0 = unlimited.
+    run_timeout_sec: Optional[int] = Field(default=None, ge=0, le=86400)
+    # Max seconds without SSE/stream activity before treating run as stalled. None = server default. 0 = disabled.
+    stream_idle_timeout_sec: Optional[int] = Field(default=None, ge=0, le=86400)
 
     @model_validator(mode="after")
     def validate_source(self):
@@ -152,6 +156,19 @@ class BacktestMetrics(BaseModel):
     marRatio: Optional[float] = None
     ulcerIndex: Optional[float] = None
     cagr: Optional[float] = None
+    profitFactorStatus: Optional[str] = None
+    sharpeRatioLegacyAnalyzer: Optional[float] = None
+    grossProfitClosedTrades: Optional[float] = None
+    grossLossAbsClosedTrades: Optional[float] = None
+    riskAnnualizationPeriodsPerYear: Optional[float] = None
+    maxDrawdownDurationBars: Optional[int] = None
+    maxDrawdownDurationDays: Optional[float] = None
+    timeToRecoveryBars: Optional[int] = None
+    timeToRecoveryDays: Optional[float] = None
+    currentDrawdownPct: Optional[float] = None
+    payoffRatio: Optional[float] = None
+    edgePerTrade: Optional[float] = None
+    kellyFraction: Optional[float] = None
 
 
 class ModuleOutput(BaseModel):
@@ -180,3 +197,11 @@ class RunResponse(BaseModel):
     qualityGate: Optional[dict[str, Any]] = None
     experiment: Optional[dict[str, Any]] = None
     batchSummary: Optional[dict[str, Any]] = None
+    drawdownAnalysis: Optional[dict[str, Any]] = None
+    tradePnlDistribution: Optional[dict[str, Any]] = None
+    bootstrapCI: Optional[dict[str, Any]] = None
+    payoffDecomposition: Optional[dict[str, Any]] = None
+    overfittingSignals: Optional[dict[str, Any]] = None
+    propRedFlags: Optional[dict[str, Any]] = None
+    # Full payload per sub-run when batch size ≤ cap (see run.py); each item same shape as a normal RunResponse dict
+    batchRuns: Optional[list[dict[str, Any]]] = None

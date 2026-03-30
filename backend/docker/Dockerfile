@@ -1,4 +1,5 @@
-# Backtest engine - runs strategies in isolated sandbox
+# Optional legacy image — NOT required for local runs (runner: host subprocess or in-process).
+# Engine scripts run on the host by default; see README in this folder.
 FROM python:3.11-slim
 
 WORKDIR /app

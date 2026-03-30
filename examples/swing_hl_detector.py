@@ -8,6 +8,9 @@ Pouziti v aplikaci:
 3. Uloz
 4. Ve View: vyber modul, ikona params - uprav parametry
 5. Ve strategii: from modules.Swing_HL import detect, get_swings, get_bos  (nazev podle jmena modulu v app)
+6. Pokud strategie tento modul nenaimportuje staticky (napr. dynamicke nacitani), pridej do strategie
+   PARAM_MODULE_CHAIN = "Swing HL" (presny nazev polozky v Moduly), aby se VIEW_PARAMS modulu objevily v zalozce Moduly
+   a main.py modulu se pribalil pri runu.
 
 Interface pro View:
   detect(ohlc, params=None) -> [{"date", "type": "high"|"low"|"major_high"|"major_low"|"internal_*", "value"}, ...]
@@ -74,13 +77,15 @@ VIEW_PARAMS = {
     # TF vstupních OHLC (např. 30m); ve View doplní instrument — pro resampling na `timeframe`
     "data_timeframe": "",
     "atr_period": 10,
-    "atr_multiplier": 1.6, #nechat!
-    "min_bars_between_swings": 3, #nechat!
+    "atr_multiplier": 1.6,
+    "min_bars_between_swings": 3,
     "max_bars": 180,
     "max_candidate_bars": 0,
     "allow_unconfirmed_last_swing": True,
     "min_pullback_atr_ratio": 0.4,
-    "sensitivity": 1.0, #nechat!
+    "sensitivity": 1.0,
+    # 1.0 = výchozí hustota pro daný TF (TF_CONFIG). >1 řidší swingy (např. 1.4), <1 hustší (např. 0.85).
+    "swing_sparsity": 1.0,
     "window_bars": 120,
     "include_internals": False,
     # BOS (Break of Structure) – close nad/pod posledním swing H/L, 1 bar acceptance
@@ -564,6 +569,8 @@ def get_swings(
     params["data_timeframe"]: TF vstupnich dat (odhadne se z dat, pokud chybi) – pro spravny resample (napr. View 30m + timeframe 1d).
     Swing H/L: min. 5m – pri jemnejsim TF nez 5m se data nejdriv resampluji na 5m.
     params["max_bars"]: max. baru v jednom okne (pro 1d doporuceno 180 = 6M).
+    params["swing_sparsity"]: 1.0 = preset pro dany TF; >1 ridsi swingy (nasobi min_bars mezi swingy),
+        mirne zvysi atr_multiplier. Rozsah cca 0.35–5.
     params["include_internals"]: True -> vrati {"swings": [...], "internals": [...]}.
     params["omit_swings_overlapping_major"]: default True – swing na stejném místě jako major se vyhodí (BOS/get_bos).
         Pro View markery nastav False (viz detect v Swing HL / S_D_Zones).
@@ -600,13 +607,39 @@ def get_swings(
         work_tf = MIN_TF_SWING if base_ohlc is not ohlc else tf
     base = TF_CONFIG.get(work_tf, TF_CONFIG["1d"])
     params = {**base, **params}
+    try:
+        swing_sparsity = float(params.pop("swing_sparsity", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        swing_sparsity = 1.0
+    swing_sparsity = max(0.35, min(float(swing_sparsity), 5.0))
+    swing_core_params = dict(params)
+    mb0 = max(int(swing_core_params.get("min_bars_between_swings", 4)), 2)
+    swing_core_params["min_bars_between_swings"] = max(2, int(round(mb0 * swing_sparsity)))
+    atr_m0 = float(swing_core_params.get("atr_multiplier", 1.6))
+    atr_bump = 1.0 + 0.12 * max(0.0, swing_sparsity - 1.0)
+    swing_core_params["atr_multiplier"] = min(3.5, atr_m0 * atr_bump)
 
     max_bars = int(params.get("max_bars", 0))
     atr_period = int(params.get("atr_period", 10))
-    min_bars = max(int(params.get("min_bars_between_swings", 4)), 2)
 
     if work_ohlc is None or len(work_ohlc) < atr_period + 2:
         return {"swings": [], "internals": [], "major_swings": []} if include_internals else []
+
+    # Rolling okna resetují stav; u pravého okraje často chybí bary pro ATR potvrzení → po sloučení
+    # zmizí struktura v části grafu (častý případ 1h: max_bars=360, délka > 360). Pro typické View
+    # použij jeden plný běh; rolling jen u velmi dlouhých řad.
+    wf_min = TF_FINE_TO_COARSE.get(work_tf, 1440)
+    if max_bars > 0 and wf_min >= 60:
+        _rolling_min_len = max(12000, int(max_bars * 30))
+    elif max_bars > 0:
+        _rolling_min_len = max(15000, int(max_bars * 2))
+    else:
+        _rolling_min_len = 0
+    use_rolling_windows = (
+        max_bars > 0
+        and len(work_ohlc) > max_bars
+        and len(work_ohlc) > _rolling_min_len
+    )
 
     def _map_swings_to_original(sws: list[dict]) -> list[dict]:
         if work_ohlc is original_ohlc:
@@ -622,8 +655,8 @@ def get_swings(
     maj_params = {"timeframe": tf, "data_timeframe": data_tf, **params}
     major_swings = get_major_swings(original_ohlc, maj_params)
 
-    if max_bars <= 0 or len(work_ohlc) <= max_bars:
-        swings, _ = _get_swings_core(work_ohlc, params)
+    if max_bars <= 0 or len(work_ohlc) <= max_bars or not use_rolling_windows:
+        swings, _ = _get_swings_core(work_ohlc, swing_core_params)
         swings = _map_swings_to_original(swings)
         atr_series = _compute_atr(work_ohlc, atr_period)
         swings = _deduplicate_swings(swings, original_ohlc, atr_series)
@@ -644,7 +677,7 @@ def get_swings(
         window = work_ohlc.iloc[i - max_bars : i]
         if len(window) < atr_period + 2:
             continue
-        swings, _ = _get_swings_core(window, params)
+        swings, _ = _get_swings_core(window, swing_core_params)
         offset = i - max_bars
         for s in swings:
             s = dict(s)
@@ -655,7 +688,7 @@ def get_swings(
     if len(work_ohlc) > max_bars and len(work_ohlc) not in seen_ends:
         window = work_ohlc.iloc[-max_bars:]
         if len(window) >= atr_period + 2:
-            swings, _ = _get_swings_core(window, params)
+            swings, _ = _get_swings_core(window, swing_core_params)
             offset = len(work_ohlc) - max_bars
             for s in swings:
                 s = dict(s)
@@ -1260,8 +1293,9 @@ def get_line(ohlc: pd.DataFrame, params: dict | None = None) -> dict | None:
     for i in range(len(ohlc)):
         value = float(trend_ema.iloc[i])
         date_str = _to_date_str(index[i])
+        score = float(trend_per_bar[i][1])
         state = trend_per_bar[i][2]
-        data.append({"date": date_str, "value": value, "state": state})
+        data.append({"date": date_str, "value": value, "state": state, "score": score})
 
     segments: list[dict] = []
     prev_end = -1

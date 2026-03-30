@@ -51,9 +51,12 @@ export function effectiveViewDataTimeframe(
 const TRADING_DAYS_PER_YEAR = 252;
 const MINUTES_PER_DAY = 1440;
 
+/** Max. podíl načtené řady jako šířka shuffle okna — zbytek je rezerva pro náhodný posun začátku. */
+const SHUFFLE_WINDOW_MAX_FRAC = 0.62;
+
 /**
  * Počet svíček pro Shuffle okno — odpovídá výběru „Období“ (years) a TF grafu.
- * Dřív: min(126, 20% řady) → u kratších serií ~20 barů (1–2 měsíce na 1D) a nesoulad s 6M.
+ * Okno se nikdy nevezme jako téměř celá řada (jinak maxStart ≈ 0 a shuffle skočí jen o pár barů).
  */
 export function shuffleWindowBarCount(
   fullLen: number,
@@ -62,9 +65,11 @@ export function shuffleWindowBarCount(
   nativeTf?: string | null
 ): number {
   if (fullLen < 2) return fullLen;
+  const capBySeries = Math.max(20, Math.floor(fullLen * SHUFFLE_WINDOW_MAX_FRAC));
+
   if (yearsSelected <= 0) {
     const quarter = Math.max(200, Math.floor(fullLen * 0.25));
-    return Math.min(fullLen, quarter);
+    return Math.min(fullLen, quarter, capBySeries);
   }
 
   let chartMinutes: number;
@@ -90,7 +95,8 @@ export function shuffleWindowBarCount(
   }
 
   const want = Math.ceil(yearsSelected * barsPerYear);
-  return Math.min(fullLen, Math.max(20, want));
+  const target = Math.max(20, want);
+  return Math.min(fullLen, target, capBySeries);
 }
 
 export function buildViewChartTimeframeOptions(nativeTf: string | undefined | null): { value: string; label: string }[] {

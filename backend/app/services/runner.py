@@ -1,5 +1,5 @@
 """
-Strategy Runner - orchestrates Docker container execution.
+Strategy Runner - orchestrates host subprocess execution of the backtest engine.
 Supports streaming stdout/stderr to client.
 Uses subprocess.Popen (not asyncio) - Python 3.14 on Windows has NotImplementedError in asyncio subprocess.
 """
@@ -12,6 +12,7 @@ import re
 import shutil
 import hashlib
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -19,13 +20,51 @@ from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Union
 
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
+from app.services.data_ohlc import (
+    fingerprint_dataset_file,
+    polars_scan_ohlc_schema,
+    resolve_safe_data_path,
+)
+from app.services.ohlc_timeframe import (
+    infer_data_timeframe,
+    iso_or_str,
+    normalize_tf,
+    resample_ohlcv,
+    should_resample,
+)
 
-RUN_TIMEOUT = 300  # seconds (override with RUN_TIMEOUT_SEC)
-# Importing pandas/backtrader in Docker can be silent on stdout for a long time; keep this generous.
-RUN_STREAM_IDLE_TIMEOUT = 300  # seconds (override with RUN_STREAM_IDLE_TIMEOUT_SEC)
-# Do not kill the container on client-disconnect right after start (avoids flaky SSE / strict-mode races).
+RUN_TIMEOUT = 3600  # seconds — wall-clock cap for engine subprocess (override RUN_TIMEOUT_SEC or request run_timeout_sec)
+# Importing pandas/backtrader in the engine child can be silent on stdout for a long time; keep this generous.
+RUN_STREAM_IDLE_TIMEOUT = 1800  # seconds — no SSE/log/progress events (override RUN_STREAM_IDLE_TIMEOUT_SEC)
+RUN_TIMEOUT_MAX_SEC = 86400  # hard cap when set from API request
+# Do not kill the subprocess on client-disconnect right after start (avoids flaky SSE / strict-mode races).
 RUN_DISCONNECT_GRACE_SEC = 20.0
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+# Per-process batch hint: how often the same on-disk dataset key repeats in batch runs.
+_BATCH_DATASET_HITS: dict[str, int] = {}
+
+
+def log_batch_dataset_reuse(
+    data_file: str,
+    instrument: str,
+    timeframe: str,
+    years: float,
+) -> None:
+    """Log fingerprint + hit count when batch items reuse the same resolved data file + slice key."""
+    backend_root = Path(__file__).resolve().parent.parent.parent
+    data_dir = backend_root.parent / "data"
+    p = resolve_safe_data_path(data_dir, data_file or "")
+    if not p:
+        return
+    fp = fingerprint_dataset_file(p)
+    key = f"{fp}\x1f{data_file}\x1f{instrument}\x1f{timeframe}\x1f{years}"
+    _BATCH_DATASET_HITS[key] = _BATCH_DATASET_HITS.get(key, 0) + 1
+    n = _BATCH_DATASET_HITS[key]
+    print(
+        f"[runner] batch_dataset_hit={n} fingerprint={fp} instrument={instrument} data_file={data_file}",
+        flush=True,
+    )
 
 
 def _resolve_disconnect_grace_seconds() -> float:
@@ -38,19 +77,45 @@ def _resolve_disconnect_grace_seconds() -> float:
         return RUN_DISCONNECT_GRACE_SEC
 
 
-def _format_docker_failure(stderr: str, returncode: int | None) -> str:
+def _backtest_engine_script() -> Path:
+    """engine.py shipped with repo (formerly run inside Docker)."""
+    return Path(__file__).resolve().parent.parent.parent / "docker" / "engine.py"
+
+
+def _format_engine_failure(stderr: str, returncode: int | None) -> str:
     err = (stderr or "").strip()
     if returncode == 130 or "KeyboardInterrupt" in err:
         return (
             "Běh engine byl přerušen (exit 130 / KeyboardInterrupt). "
             "To není typická chyba pandas — proces dostal signál „zastav“ (jako Ctrl+C). "
-            "Nejčastěji: tlačítko Zastavit v aplikaci, zavření záložky / přerušení požadavku, nebo ruční ukončení kontejneru v Dockeru. "
-            "Zkuste spustit znovu a nechte běh doběhnout; první start po zapnutí Dockeru může kvůli načtení knihoven chvíli trvat. "
+            "Nejčastěji: tlačítko Zastavit v aplikaci, zavření záložky / přerušení požadavku. "
+            "Zkuste spustit znovu a nechte běh doběhnout; první start může kvůli načtení knihoven chvíli trvat. "
             "(Technický výpis: "
             + (err[:600] + ("…" if len(err) > 600 else ""))
             + ")"
         )
-    return f"Docker failed (exit {returncode}): {err}"
+    if returncode == -1:
+        return f"Engine (in-process) failed: {err}"
+    return f"Engine subprocess failed (exit {returncode}): {err}"
+
+
+def _extract_params_dict_keys(content: str) -> set[str]:
+    """Top-level keys from PARAMS = { ... } (brace-balanced; typical flat strategy PARAMS)."""
+    m = re.search(r"\bPARAMS\s*=\s*\{", content)
+    if not m:
+        return set()
+    i = m.end() - 1
+    depth = 0
+    start = i
+    for j in range(i, len(content)):
+        if content[j] == "{":
+            depth += 1
+        elif content[j] == "}":
+            depth -= 1
+            if depth == 0:
+                block = content[start + 1 : j]
+                return set(re.findall(r'''["']([a-zA-Z_][a-zA-Z0-9_]*)["']\s*:''', block))
+    return set()
 
 
 def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[str]:
@@ -64,7 +129,26 @@ def _extract_strategy_param_names(files: dict | None, code: str | None) -> set[s
         return set()
     # Match ("param_name", or ('param_name', inside params = ( ... )
     matches = re.findall(r'\(\s*["\']([a-zA-Z_][a-zA-Z0-9_]*)["\']\s*[,\)]', content)
-    return set(matches)
+    return set(matches) | _extract_params_dict_keys(content)
+
+
+def _param_test_enabled_range_keys(validation_config: dict | None) -> set[str]:
+    """OAT sweep keys — must stay in STRATEGY_PARAMS after accepted-params filtering."""
+    if not validation_config or not isinstance(validation_config, dict):
+        return set()
+    pt = validation_config.get("param_test")
+    if not isinstance(pt, dict):
+        return set()
+    raw = pt.get("param_ranges")
+    if not isinstance(raw, dict):
+        return set()
+    out: set[str] = set()
+    for k, rcfg in raw.items():
+        if k == "module_params":
+            continue
+        if isinstance(rcfg, dict) and rcfg.get("enabled"):
+            out.add(str(k))
+    return out
 
 
 def _compute_code_digest(files: dict[str, str] | None, code: str | None) -> str:
@@ -176,12 +260,22 @@ def _merge_strategy_params(
     return merged
 
 
-def _resolve_run_timeout_seconds() -> int:
+def _resolve_run_timeout_seconds(request_override: int | None = None) -> int:
     """
-    Resolve run timeout from env.
-    - RUN_TIMEOUT_SEC <= 0: disabled
-    - invalid value: fallback to default RUN_TIMEOUT
+    Wall-clock timeout for the backtest engine subprocess.
+    - Request `run_timeout_sec` (if provided) wins over env/default.
+    - RUN_TIMEOUT_SEC env overrides default when request omits value.
+    - Value <= 0: disabled (no wall timeout).
     """
+    if request_override is not None:
+        try:
+            o = int(request_override)
+        except (TypeError, ValueError):
+            o = None
+        if o is not None:
+            if o <= 0:
+                return 0
+            return min(o, RUN_TIMEOUT_MAX_SEC)
     raw = os.environ.get("RUN_TIMEOUT_SEC")
     if raw is None or str(raw).strip() == "":
         return RUN_TIMEOUT
@@ -190,6 +284,66 @@ def _resolve_run_timeout_seconds() -> int:
     except ValueError:
         return RUN_TIMEOUT
     return parsed
+
+
+def _use_inprocess_engine() -> bool:
+    raw = os.environ.get("RUN_INPROCESS_ENGINE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _inprocess_engine_allowed_for_digest(code_digest: str) -> bool:
+    """If INPROCESS_ENGINE_DIGESTS is set, code_digest must be listed (hex, case-insensitive)."""
+    raw = os.environ.get("INPROCESS_ENGINE_DIGESTS", "").strip()
+    if not raw:
+        return True
+    allowed = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    return (code_digest or "").strip().lower() in allowed
+
+
+def _inprocess_during_stream_env() -> bool:
+    """In-process engine during SSE streaming (default ON for single-user). Set =0 to force subprocess."""
+    raw = os.environ.get("RUN_INPROCESS_DURING_STREAM", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def _may_use_inprocess_engine(
+    code_digest: str,
+    *,
+    disallow_inprocess_engine: bool,
+    sse_stream: bool,
+) -> bool:
+    if not _use_inprocess_engine() or not _inprocess_engine_allowed_for_digest(code_digest):
+        return False
+    if not disallow_inprocess_engine:
+        return True
+    if sse_stream and _inprocess_during_stream_env():
+        return True
+    return False
+
+
+def _resolve_stream_idle_timeout_seconds(request_override: int | None = None) -> int:
+    """Max seconds without any stream event while engine still running → treat as stall."""
+    if request_override is not None:
+        try:
+            o = int(request_override)
+        except (TypeError, ValueError):
+            o = None
+        if o is not None:
+            if o <= 0:
+                return 0
+            return min(o, RUN_TIMEOUT_MAX_SEC)
+    raw = os.environ.get("RUN_STREAM_IDLE_TIMEOUT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return RUN_STREAM_IDLE_TIMEOUT
+    try:
+        parsed = int(float(raw))
+    except ValueError:
+        return RUN_STREAM_IDLE_TIMEOUT
+    return max(0, parsed)
 
 
 def _resolve_safe_run_dir(run_root: Path, run_id: str | None) -> tuple[str, Path]:
@@ -202,17 +356,6 @@ def _resolve_safe_run_dir(run_root: Path, run_id: str | None) -> tuple[str, Path
     if run_root_resolved != run_dir and run_root_resolved not in run_dir.parents:
         raise ValueError("Unsafe run_id path.")
     return resolved_run_id, run_dir
-
-
-def _resolve_stream_idle_timeout_seconds() -> int:
-    raw = os.environ.get("RUN_STREAM_IDLE_TIMEOUT_SEC")
-    if raw is None or str(raw).strip() == "":
-        return RUN_STREAM_IDLE_TIMEOUT
-    try:
-        parsed = int(float(raw))
-    except ValueError:
-        return RUN_STREAM_IDLE_TIMEOUT
-    return max(0, parsed)
 
 
 def _normalize_result_payload(
@@ -232,6 +375,11 @@ def _normalize_result_payload(
     execution_model: dict | None,
     experiment: dict | None,
     runner_duration_ms: int,
+    runner_host_prepare_ms: int | None = None,
+    runner_engine_wall_ms: int | None = None,
+    host_dataset_fingerprint: str | None = None,
+    host_dataset_parquet_column_count: int | None = None,
+    runner_engine_notes: list[str] | None = None,
 ) -> dict:
     normalized = dict(result_data or {})
     normalized.setdefault("equity", [])
@@ -268,7 +416,40 @@ def _normalize_result_payload(
         "experiment": experiment or {},
         "generatedAt": dt.datetime.utcnow().isoformat() + "Z",
         "runnerDurationMs": runner_duration_ms,
+        "engine": "host-worker",
     })
+    if runner_host_prepare_ms is not None:
+        normalized["manifest"]["runnerHostPrepareMs"] = runner_host_prepare_ms
+    if runner_engine_wall_ms is not None:
+        normalized["manifest"]["runnerEngineWallMs"] = runner_engine_wall_ms
+    if host_dataset_fingerprint:
+        normalized["manifest"]["hostDatasetFingerprint"] = host_dataset_fingerprint
+    if host_dataset_parquet_column_count is not None:
+        normalized["manifest"]["hostDatasetParquetColumnCount"] = host_dataset_parquet_column_count
+    if runner_engine_notes:
+        normalized["manifest"]["runnerEngineNotes"] = list(runner_engine_notes)
+    normalized["manifest"].pop("imageDigest", None)
+    perf = normalized.get("perf")
+    if isinstance(perf, dict):
+        if runner_host_prepare_ms is not None:
+            perf["runnerHostPrepareMs"] = runner_host_prepare_ms
+        if runner_engine_wall_ms is not None:
+            perf["runnerEngineWallMs"] = runner_engine_wall_ms
+        if host_dataset_fingerprint:
+            perf["hostDatasetFingerprint"] = host_dataset_fingerprint
+        if host_dataset_parquet_column_count is not None:
+            perf["hostDatasetParquetColumnCount"] = host_dataset_parquet_column_count
+    elif runner_host_prepare_ms is not None or runner_engine_wall_ms is not None or host_dataset_fingerprint:
+        normalized["perf"] = {
+            k: v
+            for k, v in (
+                ("runnerHostPrepareMs", runner_host_prepare_ms),
+                ("runnerEngineWallMs", runner_engine_wall_ms),
+                ("hostDatasetFingerprint", host_dataset_fingerprint),
+                ("hostDatasetParquetColumnCount", host_dataset_parquet_column_count),
+            )
+            if v is not None
+        }
     return normalized
 
 
@@ -346,143 +527,167 @@ def _run_module_outputs(
     if not modules_dir.exists():
         return outputs
 
-    sys.path.insert(0, str(run_dir))
-
-    for mod in applied_modules:
-        name = mod.get("name") or ""
-        params = mod.get("params") or {}
-        mod_name = _to_module_name(name)
-        mod_path = modules_dir / f"{mod_name}.py"
-        if not mod_path.exists():
-            continue
-        try:
-            spec = importlib.util.spec_from_file_location(
-                f"mod_{mod_name}", mod_path
-            )
-            mod_obj = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = mod_obj
-            spec.loader.exec_module(mod_obj)
-
-            markers = []
-            lines = []
-            zones = []
-
-            if hasattr(mod_obj, "detect"):
-                try:
-                    sig = inspect.signature(mod_obj.detect)
-                    result = mod_obj.detect(df, params) if len(sig.parameters) >= 2 else mod_obj.detect(df)
-                except (ValueError, TypeError):
-                    result = mod_obj.detect(df)
-                if isinstance(result, list):
-                    for item in result:
-                        if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
-                            markers.append({
-                                "date": str(item["date"])[:10],
-                                "type": str(item["type"]).lower(),
-                                "value": float(item["value"]),
-                            })
-
-            if hasattr(mod_obj, "get_line"):
-                try:
-                    sig = inspect.signature(mod_obj.get_line)
-                    result = mod_obj.get_line(df, params) if len(sig.parameters) >= 2 else mod_obj.get_line(df)
-                except (ValueError, TypeError):
-                    result = mod_obj.get_line(df)
-                if isinstance(result, dict):
-                    for line_name, data in result.items():
-                        pts = []
-                        color = None
-                        segments = None
-                        if isinstance(data, list):
-                            pts = [
-                                {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
-                                for p in data if isinstance(p, dict)
-                            ]
-                        elif isinstance(data, dict) and "data" in data:
-                            pts = [
-                                {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
-                                for p in data["data"] if isinstance(p, dict)
-                            ]
-                            color = data.get("color")
-                            segments = data.get("segments")
-                        if pts:
-                            if segments:
-                                for seg in segments:
-                                    if isinstance(seg, dict) and "from" in seg and "to" in seg and "color" in seg:
-                                        i0, i1 = int(seg["from"]), int(seg["to"]) + 1
-                                        seg_pts = pts[i0:i1]
-                                        if seg_pts:
-                                            lines.append({"name": str(line_name), "data": seg_pts, "color": str(seg["color"])})
-                            else:
-                                line_obj = {"name": str(line_name), "data": pts}
-                                if color:
-                                    line_obj["color"] = str(color)
-                                lines.append(line_obj)
-                elif isinstance(result, list):
-                    pts = [
-                        {"date": str(p.get("date", ""))[:10], "value": float(p.get("value", 0))}
-                        for p in result if isinstance(p, dict)
-                    ]
-                    if pts:
-                        lines.append({"name": "line", "data": pts})
-
-            if hasattr(mod_obj, "get_zones"):
-                try:
-                    sig = inspect.signature(mod_obj.get_zones)
-                    result = mod_obj.get_zones(df, params) if len(sig.parameters) >= 2 else mod_obj.get_zones(df)
-                except (ValueError, TypeError):
-                    result = mod_obj.get_zones(df)
-                if isinstance(result, list):
-                    for item in result:
-                        if (
-                            isinstance(item, dict)
-                            and "date_start" in item
-                            and "date_end" in item
-                            and "value_low" in item
-                            and "value_high" in item
-                        ):
-                            zone = {
-                                "date_start": str(item["date_start"])[:10],
-                                "date_end": str(item["date_end"])[:10],
-                                "value_low": float(item["value_low"]),
-                                "value_high": float(item["value_high"]),
-                                "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
-                                "name": str(item["name"]) if item.get("name") else None,
-                            }
-                            if "base_length" in item:
-                                zone["base_length"] = int(item["base_length"])
-                            if "impulse_score" in item:
-                                zone["impulse_score"] = int(item["impulse_score"])
-                            if "has_gap" in item:
-                                zone["has_gap"] = bool(item["has_gap"])
-                            if "gap_type" in item:
-                                zone["gap_type"] = str(item["gap_type"])
-                            if "gap_date" in item:
-                                zone["gap_date"] = str(item["gap_date"])[:10]
-                            if "gap_value_low" in item:
-                                zone["gap_value_low"] = float(item["gap_value_low"])
-                            if "gap_value_high" in item:
-                                zone["gap_value_high"] = float(item["gap_value_high"])
-                            if "inducements" in item and isinstance(item["inducements"], list):
-                                zone["inducements"] = [
-                                    {"date": str(x.get("date", ""))[:10], "value": float(x.get("value", 0)), "type": str(x.get("type", ""))}
-                                    for x in item["inducements"] if isinstance(x, dict)
+    run_dir_s = str(run_dir)
+    path_inserted = False
+    try:
+        sys.path.insert(0, run_dir_s)
+        path_inserted = True
+        for mod in applied_modules:
+            name = mod.get("name") or ""
+            params = dict(mod.get("params") or {})
+            mod_name = _to_module_name(name)
+            mod_path = modules_dir / f"{mod_name}.py"
+            if not mod_path.exists():
+                continue
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    f"mod_{mod_name}", mod_path
+                )
+                mod_obj = importlib.util.module_from_spec(spec)
+                sys.modules[spec.name] = mod_obj
+                spec.loader.exec_module(mod_obj)
+    
+                inferred_source = infer_data_timeframe(df)
+                if inferred_source:
+                    params.setdefault("data_timeframe", inferred_source)
+                    params.setdefault("work_timeframe", inferred_source)
+                module_df = df
+                module_tf = normalize_tf(params.get("timeframe"))
+                if should_resample(inferred_source, module_tf):
+                    module_df = resample_ohlcv(df, module_tf)
+    
+                markers = []
+                lines = []
+                zones = []
+    
+                if hasattr(mod_obj, "detect"):
+                    try:
+                        sig = inspect.signature(mod_obj.detect)
+                        result = mod_obj.detect(module_df, params) if len(sig.parameters) >= 2 else mod_obj.detect(module_df)
+                    except (ValueError, TypeError):
+                        result = mod_obj.detect(module_df)
+                    if isinstance(result, list):
+                        for item in result:
+                            if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
+                                markers.append({
+                                    "date": iso_or_str(item["date"]),
+                                    "type": str(item["type"]).lower(),
+                                    "value": float(item["value"]),
+                                })
+    
+                if hasattr(mod_obj, "get_line"):
+                    try:
+                        sig = inspect.signature(mod_obj.get_line)
+                        result = mod_obj.get_line(module_df, params) if len(sig.parameters) >= 2 else mod_obj.get_line(module_df)
+                    except (ValueError, TypeError):
+                        result = mod_obj.get_line(module_df)
+                    if isinstance(result, dict):
+                        for line_name, data in result.items():
+                            pts = []
+                            color = None
+                            segments = None
+                            if isinstance(data, list):
+                                pts = [
+                                    {"date": iso_or_str(p.get("date", "")), "value": float(p.get("value", 0))}
+                                    for p in data if isinstance(p, dict)
                                 ]
-                            if "inducement_count" in item:
-                                zone["inducement_count"] = int(item["inducement_count"])
-                            if "inducement_points" in item:
-                                zone["inducement_points"] = int(item["inducement_points"])
-                            zones.append(zone)
-
-            outputs[name] = {"markers": markers, "lines": lines, "zones": zones}
-        except Exception as e:
-            print(f"[runner] Module {name} output error: {e}", flush=True)
-        finally:
-            if f"mod_{mod_name}" in sys.modules:
-                del sys.modules[f"mod_{mod_name}"]
-
-    if str(run_dir) in sys.path:
-        sys.path.remove(str(run_dir))
+                            elif isinstance(data, dict) and "data" in data:
+                                pts = [
+                                    {"date": iso_or_str(p.get("date", "")), "value": float(p.get("value", 0))}
+                                    for p in data["data"] if isinstance(p, dict)
+                                ]
+                                color = data.get("color")
+                                segments = data.get("segments")
+                            if pts:
+                                if segments:
+                                    for seg in segments:
+                                        if isinstance(seg, dict) and "from" in seg and "to" in seg and "color" in seg:
+                                            i0, i1 = int(seg["from"]), int(seg["to"]) + 1
+                                            seg_pts = pts[i0:i1]
+                                            if seg_pts:
+                                                lines.append({"name": str(line_name), "data": seg_pts, "color": str(seg["color"])})
+                                else:
+                                    line_obj = {"name": str(line_name), "data": pts}
+                                    if color:
+                                        line_obj["color"] = str(color)
+                                    lines.append(line_obj)
+                    elif isinstance(result, list):
+                        pts = [
+                            {"date": iso_or_str(p.get("date", "")), "value": float(p.get("value", 0))}
+                            for p in result if isinstance(p, dict)
+                        ]
+                        if pts:
+                            lines.append({"name": "line", "data": pts})
+    
+                if hasattr(mod_obj, "get_zones"):
+                    try:
+                        sig = inspect.signature(mod_obj.get_zones)
+                        result = mod_obj.get_zones(module_df, params) if len(sig.parameters) >= 2 else mod_obj.get_zones(module_df)
+                    except (ValueError, TypeError):
+                        result = mod_obj.get_zones(module_df)
+                    if isinstance(result, list):
+                        for item in result:
+                            if (
+                                isinstance(item, dict)
+                                and "date_start" in item
+                                and "date_end" in item
+                                and "value_low" in item
+                                and "value_high" in item
+                            ):
+                                zone = {
+                                    "date_start": iso_or_str(item["date_start"]),
+                                    "date_end": iso_or_str(item["date_end"]),
+                                    "value_low": float(item["value_low"]),
+                                    "value_high": float(item["value_high"]),
+                                    "fillcolor": str(item["fillcolor"]) if item.get("fillcolor") else None,
+                                    "name": str(item["name"]) if item.get("name") else None,
+                                }
+                                if "base_length" in item:
+                                    zone["base_length"] = int(item["base_length"])
+                                if "impulse_score" in item:
+                                    zone["impulse_score"] = int(item["impulse_score"])
+                                if "has_touch" in item:
+                                    zone["has_touch"] = bool(item["has_touch"])
+                                if "touch_bar_index" in item:
+                                    zone["touch_bar_index"] = int(item["touch_bar_index"])
+                                if "touch_marker_price" in item:
+                                    zone["touch_marker_price"] = float(item["touch_marker_price"])
+                                if "has_gap" in item:
+                                    zone["has_gap"] = bool(item["has_gap"])
+                                if "gap_type" in item:
+                                    zone["gap_type"] = str(item["gap_type"])
+                                if "gap_date" in item:
+                                    zone["gap_date"] = iso_or_str(item["gap_date"])
+                                if "gap_value_low" in item:
+                                    zone["gap_value_low"] = float(item["gap_value_low"])
+                                if "gap_value_high" in item:
+                                    zone["gap_value_high"] = float(item["gap_value_high"])
+                                if "inducements" in item and isinstance(item["inducements"], list):
+                                    zone["inducements"] = [
+                                        {
+                                            "date": iso_or_str(x.get("date", "")),
+                                            "value": float(x.get("value", 0)),
+                                            "type": str(x.get("type", "")),
+                                        }
+                                        for x in item["inducements"] if isinstance(x, dict)
+                                    ]
+                                if "inducement_count" in item:
+                                    zone["inducement_count"] = int(item["inducement_count"])
+                                if "inducement_points" in item:
+                                    zone["inducement_points"] = int(item["inducement_points"])
+                                if "active_demand_zones_below" in item:
+                                    zone["active_demand_zones_below"] = int(item["active_demand_zones_below"])
+                                zones.append(zone)
+    
+                outputs[name] = {"markers": markers, "lines": lines, "zones": zones}
+            except Exception as e:
+                print(f"[runner] Module {name} output error: {e}", flush=True)
+            finally:
+                if f"mod_{mod_name}" in sys.modules:
+                    del sys.modules[f"mod_{mod_name}"]
+    finally:
+        if path_inserted and run_dir_s in sys.path:
+            sys.path.remove(run_dir_s)
     return outputs
 
 
@@ -518,9 +723,13 @@ async def run_strategy_streaming(
     experiment: dict | None = None,
     actor_id: str = "unknown",
     is_client_connected: Callable[[], Union[bool, Awaitable[bool]]] = lambda: True,
+    run_timeout_sec: int | None = None,
+    stream_idle_timeout_sec: int | None = None,
+    disallow_inprocess_engine: bool = False,
+    sse_stream: bool = False,
 ) -> AsyncGenerator[dict, None]:
     """
-    Execute strategy in Docker sandbox, yield events for streaming.
+    Execute strategy in a host Python subprocess (backtest engine), yield events for streaming.
     Yields: {"type": "log", "line": "..."} | {"type": "progress", "value": 0-100} | {"type": "result", "data": {...}} | {"type": "error", "message": "..."}
     """
     backend_root = Path(__file__).resolve().parent.parent.parent
@@ -533,16 +742,30 @@ async def run_strategy_streaming(
     resolved_run_id, run_dir = _resolve_safe_run_dir(run_root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    prep_started = time.perf_counter()
     entry_file = _prepare_strategy_files(run_dir, code, files)
-    strategy_path = run_dir / entry_file
 
-    # Filter params to only those the strategy accepts (avoids "unexpected keyword argument")
+    # Filter params to only those the strategy accepts (avoids "unexpected keyword argument").
+    # Keep module_params and param_test sweep keys even if missing from params-tuple regex
+    # (PARAMS dict keys may not appear as ("name", default) in source).
     accepted_params = _extract_strategy_param_names(files, code)
-    filtered_params = strategy_params
-    if accepted_params:
-        filtered_params = {k: v for k, v in (strategy_params or {}).items() if k in accepted_params}
+    if accepted_params and strategy_params:
+        module_blob = strategy_params.get("module_params")
+        filtered_params = {k: v for k, v in strategy_params.items() if k in accepted_params}
+        if module_blob is not None:
+            filtered_params["module_params"] = module_blob
+    else:
+        filtered_params = dict(strategy_params) if strategy_params else None
 
-    run_started = time.perf_counter()
+    if validation_mode == "param_test" and strategy_params:
+        pt_keys = _param_test_enabled_range_keys(validation_config)
+        if pt_keys:
+            fp = dict(filtered_params or {})
+            for k in pt_keys:
+                if k in strategy_params:
+                    fp[k] = strategy_params[k]
+            filtered_params = fp
+
     try:
         if not data_dir.exists():
             data_dir.mkdir(parents=True, exist_ok=True)
@@ -580,53 +803,171 @@ async def run_strategy_streaming(
         if seed is None:
             seed = int(uuid.uuid4().int % 1_000_000_000)
         code_digest = _compute_code_digest(files, code)
-        cmd = [
-            "docker", "run",
-            "--rm",
-            "--memory=1g",
-            "--cpus=1",
-            "--pids-limit=256",
-            "--network", "none",
-            "--security-opt", "no-new-privileges:true",
-            "--cap-drop", "ALL",
-            "-v", f"{run_path}:/app/strategy:rw",
-            "-v", f"{data_path}:/app/data:ro",
-            "-v", f"{cache_path}:/app/cache:rw",
-            "-e", f"STRATEGY_PATH=/app/strategy/{entry_file}",
-            "-e", f"DATA_PATH=/app/data",
-            "-e", "DATA_CACHE_PATH=/app/cache",
-            "-e", f"INSTRUMENT={instrument}",
-            "-e", f"TIMEFRAME={timeframe}",
-            "-e", f"YEARS={years}",
-            "-e", f"DATA_FILE={data_file}",
-            "-e", f"INITIAL_CAPITAL={initial_capital}",
-            "-e", f"SLIPPAGE_PERC={slippage_perc}",
-            "-e", f"COMMISSION_PERC={commission_perc}",
-            "-e", f"INSTRUMENT_TYPE={instrument_type}",
-            "-e", f"TICK_SIZE={tick_size if tick_size is not None else ''}",
-            "-e", f"VALUE_PER_TICK={value_per_tick if value_per_tick is not None else ''}",
-            "-e", f"SHARE_SIZE={share_size if share_size is not None else ''}",
-            "-e", f"LOT_SIZE={lot_size if lot_size is not None else ''}",
-            "-e", f"PIP_SIZE={pip_size if pip_size is not None else ''}",
-            "-e", f"PIP_VALUE={pip_value if pip_value is not None else ''}",
-            "-e", "PYTHONDONTWRITEBYTECODE=1",
-            "-e", f"RUN_ID={resolved_run_id}",
-            "-e", f"STRATEGY_PARAMS={json.dumps(_merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value))}",
-            "-e", f"APPLIED_MODULES={json.dumps(applied_modules_payload)}",
-            "-e", f"ANALYSIS_CONFIG={json.dumps(analysis_payload)}",
-            "-e", f"EXECUTION_MODEL_JSON={json.dumps(execution_model or {})}",
-            "-e", f"ACTOR_ID={actor_id}",
-            "-e", f"RUN_SEED={seed}",
-            "-e", f"CODE_DIGEST={code_digest}",
-            "-e", f"ENGINE_IMAGE_DIGEST={os.environ.get('BACKTEST_ENGINE_IMAGE_DIGEST', '')}",
-            "backtest-engine",
-        ]
+        engine_script = _backtest_engine_script()
+        if not engine_script.is_file():
+            raise RuntimeError(f"Backtest engine not found: {engine_script}")
+
+        strategy_path_abs = str((Path(run_path) / entry_file).resolve())
+        env = os.environ.copy()
+        _backend_root = Path(__file__).resolve().parent.parent.parent
+        _project_root = str(_backend_root.parent.resolve())
+        _backend_root_s = str(_backend_root.resolve())
+        _existing_pp = env.get("PYTHONPATH", "").strip()
+        _roots = f"{_project_root}{os.pathsep}{_backend_root_s}"
+        env["PYTHONPATH"] = f"{_roots}{os.pathsep}{_existing_pp}" if _existing_pp else _roots
+        env["STRATEGY_PATH"] = strategy_path_abs
+        env["DATA_PATH"] = str(Path(data_path).resolve())
+        env["DATA_CACHE_PATH"] = str(Path(cache_path).resolve())
+        env["INSTRUMENT"] = str(instrument)
+        env["TIMEFRAME"] = str(timeframe)
+        env["YEARS"] = str(years)
+        env["DATA_FILE"] = str(data_file)
+        env["INITIAL_CAPITAL"] = str(initial_capital)
+        env["SLIPPAGE_PERC"] = str(slippage_perc)
+        env["COMMISSION_PERC"] = str(commission_perc)
+        env["INSTRUMENT_TYPE"] = str(instrument_type)
+        env["TICK_SIZE"] = str(tick_size if tick_size is not None else "")
+        env["VALUE_PER_TICK"] = str(value_per_tick if value_per_tick is not None else "")
+        env["SHARE_SIZE"] = str(share_size if share_size is not None else "")
+        env["LOT_SIZE"] = str(lot_size if lot_size is not None else "")
+        env["PIP_SIZE"] = str(pip_size if pip_size is not None else "")
+        env["PIP_VALUE"] = str(pip_value if pip_value is not None else "")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["RUN_ID"] = str(resolved_run_id)
+        env["STRATEGY_PARAMS"] = json.dumps(
+            _merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value)
+        )
+        env["APPLIED_MODULES"] = json.dumps(applied_modules_payload)
+        env["ANALYSIS_CONFIG"] = json.dumps(analysis_payload)
+        env["EXECUTION_MODEL_JSON"] = json.dumps(execution_model or {})
+        env["ACTOR_ID"] = str(actor_id)
+        env["RUN_SEED"] = str(seed)
+        env["CODE_DIGEST"] = str(code_digest)
+        env["ENGINE_IMAGE_DIGEST"] = ""
+
+        ds_path = resolve_safe_data_path(data_dir, data_file or "")
+        host_ds_fp = fingerprint_dataset_file(ds_path) if ds_path else None
+        pq_cols: int | None = None
+        if ds_path and ds_path.suffix.lower() in (".parquet", ".pq"):
+            sch = polars_scan_ohlc_schema(ds_path)
+            pq_cols = len(sch) if sch else None
+        if host_ds_fp:
+            print(f"[runner] host_dataset_fingerprint={host_ds_fp} data_file={data_file}", flush=True)
+        env["HOST_DATASET_FINGERPRINT"] = host_ds_fp or ""
+        t_before_popen = time.perf_counter()
+        runner_host_prepare_ms = int((t_before_popen - prep_started) * 1000)
+
+        env_str = {str(k): "" if v is None else str(v) for k, v in env.items()}
+
+        may_in = _may_use_inprocess_engine(
+            code_digest,
+            disallow_inprocess_engine=disallow_inprocess_engine,
+            sse_stream=sse_stream,
+        )
+        runner_engine_notes: list[str] = []
+        wants_in = _use_inprocess_engine() and _inprocess_engine_allowed_for_digest(code_digest)
+        if wants_in and not may_in:
+            if disallow_inprocess_engine and sse_stream and not _inprocess_during_stream_env():
+                runner_engine_notes.append("inProcessSkipped:sseDefault")
+            elif disallow_inprocess_engine and not sse_stream:
+                runner_engine_notes.append("inProcessSkipped:parallelBatch")
+
+        notes_for_normalize = runner_engine_notes if runner_engine_notes else None
+
+        if may_in:
+            from app.services.engine_inprocess import run_engine_in_process
+
+            print("[runner] in-process engine (RUN_INPROCESS_ENGINE=1)", flush=True)
+            proc_started = time.perf_counter()
+            loop = asyncio.get_running_loop()
+            progress_queue: asyncio.Queue = asyncio.Queue()
+
+            def _inprocess_progress_cb(pct: int) -> None:
+                try:
+                    loop.call_soon_threadsafe(progress_queue.put_nowait, int(pct))
+                except Exception:
+                    pass
+
+            engine_task = asyncio.create_task(
+                asyncio.to_thread(run_engine_in_process, env_str, _inprocess_progress_cb)
+            )
+            try:
+                while not engine_task.done():
+                    get_task = asyncio.create_task(progress_queue.get())
+                    done, _pending = await asyncio.wait(
+                        {engine_task, get_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if get_task in done:
+                        try:
+                            pct = get_task.result()
+                            yield {"type": "progress", "value": int(pct)}
+                        except Exception:
+                            pass
+                    else:
+                        get_task.cancel()
+                        try:
+                            await get_task
+                        except asyncio.CancelledError:
+                            pass
+                while True:
+                    try:
+                        pct = progress_queue.get_nowait()
+                        yield {"type": "progress", "value": int(pct)}
+                    except asyncio.QueueEmpty:
+                        break
+                raw_out = await engine_task
+            except Exception as e:
+                if not engine_task.done():
+                    engine_task.cancel()
+                    try:
+                        await engine_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                err = str(e) or type(e).__name__
+                yield {"type": "error", "message": _format_engine_failure(err, -1)}
+                return
+            captured_engine_wall_ms = int((time.perf_counter() - proc_started) * 1000)
+            if not isinstance(raw_out, dict):
+                yield {"type": "error", "message": "In-process engine returned invalid payload"}
+                return
+            result_data = _normalize_result_payload(
+                raw_out,
+                run_id=resolved_run_id,
+                instrument=instrument,
+                timeframe=timeframe,
+                years=years,
+                data_file=data_file,
+                instrument_type=instrument_type,
+                initial_capital=initial_capital,
+                slippage_perc=slippage_perc,
+                commission_perc=commission_perc,
+                validation_mode=validation_mode,
+                sweep_mode=sweep_mode,
+                execution_model=execution_model,
+                experiment=experiment,
+                runner_duration_ms=int((time.perf_counter() - prep_started) * 1000),
+                runner_host_prepare_ms=runner_host_prepare_ms,
+                runner_engine_wall_ms=captured_engine_wall_ms,
+                host_dataset_fingerprint=host_ds_fp,
+                host_dataset_parquet_column_count=pq_cols,
+                runner_engine_notes=notes_for_normalize,
+            )
+            if isinstance(result_data.get("manifest"), dict):
+                result_data["manifest"]["engineExecutionMode"] = "inprocess"
+            yield {"type": "result", "data": result_data}
+            print(f"[runner] engine_wall_ms={captured_engine_wall_ms}", flush=True)
+            return
+
+        cmd = [sys.executable, str(engine_script)]
+        print(f"[runner] host engine: {cmd[0]} {cmd[1]}", flush=True)
 
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,
+            env=env,
         )
         proc_started = time.perf_counter()
         disconnect_grace_sec = _resolve_disconnect_grace_seconds()
@@ -636,8 +977,8 @@ async def run_strategy_streaming(
         stderr_buffer: list[str] = []
         loop = asyncio.get_event_loop()
         _read_stream_sync(proc, queue, loop, stdout_buffer, stderr_buffer)
-        run_timeout_sec = _resolve_run_timeout_seconds()
-        stream_idle_timeout_sec = _resolve_stream_idle_timeout_seconds()
+        wall_timeout = _resolve_run_timeout_seconds(run_timeout_sec)
+        idle_timeout = _resolve_stream_idle_timeout_seconds(stream_idle_timeout_sec)
 
         timeout_triggered = False
         stream_stall_triggered = False
@@ -645,22 +986,19 @@ async def run_strategy_streaming(
 
         async def kill_after_timeout():
             nonlocal timeout_triggered
-            await asyncio.sleep(run_timeout_sec)
+            await asyncio.sleep(float(wall_timeout))
             if proc.poll() is None:
                 timeout_triggered = True
                 proc.kill()
 
-        timeout_task = (
-            asyncio.create_task(kill_after_timeout())
-            if run_timeout_sec > 0
-            else None
-        )
+        timeout_task = asyncio.create_task(kill_after_timeout()) if wall_timeout > 0 else None
 
         done_count = 0
         result_data = None
         error_msg = None
         last_queue_event_at = time.perf_counter()
         proc_exit_observed_at: float | None = None
+        captured_engine_wall_ms: int | None = None
 
         while done_count < 2:
             conn = is_client_connected()
@@ -683,14 +1021,14 @@ async def run_strategy_streaming(
                     elif now - proc_exit_observed_at >= 2.0:
                         break
                 if (
-                    stream_idle_timeout_sec > 0
+                    idle_timeout > 0
                     and proc.poll() is None
-                    and (now - last_queue_event_at) >= stream_idle_timeout_sec
+                    and (now - last_queue_event_at) >= idle_timeout
                     and not result_data
                     and not error_msg
                 ):
                     stream_stall_triggered = True
-                    stream_stall_message = f"Run stream stalled for {stream_idle_timeout_sec} seconds."
+                    stream_stall_message = f"Run stream stalled for {idle_timeout} seconds."
                     proc.kill()
                     break
                 continue
@@ -701,6 +1039,7 @@ async def run_strategy_streaming(
             if ev.get("type") == "result":
                 result_data = ev.get("data")
                 if result_data:
+                    captured_engine_wall_ms = int((time.perf_counter() - proc_started) * 1000)
                     result_data = _normalize_result_payload(
                         result_data,
                         run_id=resolved_run_id,
@@ -716,7 +1055,12 @@ async def run_strategy_streaming(
                         sweep_mode=sweep_mode,
                         execution_model=execution_model,
                         experiment=experiment,
-                        runner_duration_ms=int((time.perf_counter() - run_started) * 1000),
+                        runner_duration_ms=int((time.perf_counter() - prep_started) * 1000),
+                        runner_host_prepare_ms=runner_host_prepare_ms,
+                        runner_engine_wall_ms=captured_engine_wall_ms,
+                        host_dataset_fingerprint=host_ds_fp,
+                        host_dataset_parquet_column_count=pq_cols,
+                        runner_engine_notes=notes_for_normalize,
                     )
                     ev = {"type": "result", "data": result_data}
             if ev.get("type") == "error":
@@ -745,18 +1089,20 @@ async def run_strategy_streaming(
             proc.wait()
 
         if timeout_triggered and not result_data:
-            timeout_msg = f"Run timed out after {run_timeout_sec} seconds."
+            timeout_msg = f"Run timed out after {wall_timeout} seconds."
             yield {"type": "error", "message": timeout_msg}
         elif stream_stall_triggered and not result_data and not error_msg:
             yield {"type": "error", "message": stream_stall_message}
         elif not result_data and not error_msg and proc.returncode != 0:
             err = "\n".join(stderr_buffer) or "Unknown error"
-            msg = _format_docker_failure(err, proc.returncode)
-            print(f"[runner] DOCKER FAILED:\n{msg[:1500]}", flush=True)
+            msg = _format_engine_failure(err, proc.returncode)
+            print(f"[runner] ENGINE FAILED:\n{msg[:1500]}", flush=True)
             (run_dir / "last_error_strategy.py").write_text(
                 (code or "")[:5000] if code else str(files or {})[:5000], encoding="utf-8"
             )
             yield {"type": "error", "message": msg}
+        elif result_data and captured_engine_wall_ms is not None:
+            print(f"[runner] engine_wall_ms={captured_engine_wall_ms}", flush=True)
     finally:
         try:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -795,6 +1141,10 @@ async def run_strategy(
     execution_model: dict | None = None,
     experiment: dict | None = None,
     actor_id: str = "unknown",
+    run_timeout_sec: int | None = None,
+    stream_idle_timeout_sec: int | None = None,
+    disallow_inprocess_engine: bool = False,
+    sse_stream: bool = False,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -829,6 +1179,10 @@ async def run_strategy(
         execution_model=execution_model,
         experiment=experiment,
         actor_id=actor_id,
+        run_timeout_sec=run_timeout_sec,
+        stream_idle_timeout_sec=stream_idle_timeout_sec,
+        disallow_inprocess_engine=disallow_inprocess_engine,
+        sse_stream=sse_stream,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")

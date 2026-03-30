@@ -4,11 +4,14 @@ import { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import {
   getViewData,
   isViewRegimeHistogramLine,
+  type ViewInducement,
   type ViewLine,
   type ViewLineSeries,
+  type ViewZone,
 } from "@/lib/api";
 import { getFileContent } from "@/lib/firestore";
 import {
+  coarsestZoneTfFromStrategyCode,
   parseViewParams,
   parseViewParamMeta,
   type StrategyParams,
@@ -22,6 +25,11 @@ import {
   effectiveViewDataTimeframe,
   shuffleWindowBarCount,
 } from "@/lib/viewChartTimeframe";
+import {
+  HL_TREND_STATE_COLORS,
+  lineDataHasTrendState,
+  groupIndexedTrendSegments,
+} from "@/lib/viewChartLines";
 
 function toModuleName(name: string): string {
   return (name || "module").replace(/\s+/g, "_").replace(/-/g, "_").replace(/\./g, "_") || "module";
@@ -31,6 +39,34 @@ function parseViewDependencies(code: string): string[] {
   const m = code.match(/#\s*VIEW_DEPENDENCIES:\s*(.+)/);
   if (!m) return [];
   return m[1].split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** Po slice(startIdx) drží bar indexy relativní k oknu (0…len−1). */
+function remapViewZonesToWindow(zones: ViewZone[], startIdx: number, windowLen: number): ViewZone[] {
+  if (startIdx === 0 || windowLen < 1) return zones;
+  return zones.map((z) => {
+    const copy: ViewZone = { ...z };
+    if (typeof z.touch_bar_index === "number" && Number.isFinite(z.touch_bar_index)) {
+      const ri = Math.round(z.touch_bar_index - startIdx);
+      if (ri < 0 || ri >= windowLen) {
+        copy.has_touch = false;
+        delete copy.touch_bar_index;
+      } else {
+        copy.touch_bar_index = ri;
+      }
+    }
+    if (z.inducements?.length) {
+      copy.inducements = z.inducements
+        .map((ind) => {
+          if (typeof ind.index !== "number" || Number.isNaN(ind.index)) return ind;
+          const ni = ind.index - startIdx;
+          if (ni < 0 || ni >= windowLen) return null;
+          return { ...ind, index: ni } as ViewInducement;
+        })
+        .filter((x): x is ViewInducement => x != null);
+    }
+    return copy;
+  });
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -187,6 +223,14 @@ const TIMEFRAMES = [
   { label: "Max", years: 0 },
 ] as const;
 
+/** Kanonický View demo dataset — jediný zdroj dat v této záložce. */
+const VIEW_DEMO_FILE_FALLBACK = "futures_30m/nq_view_demo_2025.parquet";
+
+function isViewDemoDataFile(file: string): boolean {
+  const f = (file || "").toLowerCase().replace(/\\/g, "/");
+  return f.includes("nq_view_demo") || f.includes("view_demo");
+}
+
 type ViewItemType = "module" | "indicator" | "strategy";
 
 interface StrategyViewChartProps {
@@ -194,10 +238,13 @@ interface StrategyViewChartProps {
   modules: FirestoreItem[];
   indicators: FirestoreItem[];
   strategies: FirestoreItem[];
+  /** Ignorováno — View používá výhradně demo parquet (viz VIEW_DEMO_FILE_FALLBACK). */
   defaultDataFile?: string;
   initialItemId?: string;
   initialItemType?: ViewItemType;
   height?: number;
+  /** When the editor has a strategy file open, pass its source to seed S/D `timeframe` from PARAMS.zone_timeframes. */
+  strategyZoneSyncCode?: string | null;
 }
 
 type ViewMarker = { date: string; type: string; value: number };
@@ -207,23 +254,31 @@ export function StrategyViewChart({
   modules,
   indicators,
   strategies,
-  defaultDataFile = "mock/NQ_5Y.csv",
+  defaultDataFile: _defaultDataFileIgnored,
   initialItemId,
   initialItemType,
   height = 960,
+  strategyZoneSyncCode = null,
 }: StrategyViewChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [ohlc, setOhlc] = useState<OhlcBar[]>([]);
   const [markers, setMarkers] = useState<ViewMarker[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [dataFile, setDataFile] = useState(defaultDataFile);
+  const [dataFile, setDataFile] = useState(VIEW_DEMO_FILE_FALLBACK);
+
+  const demoInstruments = useMemo(
+    () =>
+      instruments.filter((i) => i.viewDemo === true || isViewDemoDataFile(i.file)),
+    [instruments]
+  );
 
   useEffect(() => {
-    if (instruments.length > 0 && !instruments.some((i) => i.file === dataFile)) {
-      setDataFile(instruments[0].file);
-    }
-  }, [instruments, dataFile]);
+    if (demoInstruments.length === 0) return;
+    setDataFile((prev) =>
+      demoInstruments.some((i) => i.file === prev) ? prev : demoInstruments[0].file
+    );
+  }, [demoInstruments]);
   const [years, setYears] = useState(0.5);
   /** Candle bar size for chart + module OHLC: native = instrument resolution; else server-side resample */
   const [chartTimeframe, setChartTimeframe] = useState<string>("native");
@@ -275,10 +330,24 @@ export function StrategyViewChart({
     viewParamsRef.current = viewParamsValues;
   }, [viewParamsValues]);
 
-  const selectedInstrument = useMemo(
-    () => instruments.find((i) => i.file === dataFile),
-    [instruments, dataFile]
-  );
+  const selectedInstrument = useMemo((): DataInstrument | undefined => {
+    const found = demoInstruments.find((i) => i.file === dataFile);
+    if (found) return found;
+    if (isViewDemoDataFile(dataFile)) {
+      return {
+        instrument: "NQ",
+        displayName: "Nasdaq-100 E-mini — View demo (2025)",
+        timeframe: "30m",
+        file: dataFile,
+        minDate: "2025-01-01",
+        maxDate: "2025-12-31",
+        yearsAvailable: 1,
+        instrumentType: "futures",
+        viewDemo: true,
+      };
+    }
+    return undefined;
+  }, [demoInstruments, dataFile]);
   const chartTfOptions = useMemo(
     () => buildViewChartTimeframeOptions(selectedInstrument?.timeframe),
     [selectedInstrument?.timeframe]
@@ -317,15 +386,22 @@ export function StrategyViewChart({
           setViewParamsSchema(schema);
           setViewParamsMeta(parseViewParamMeta(code));
           const merged: StrategyParams = { ...schema };
-          if (instruments.length > 0) {
-            const inv = instruments.find((i) => i.file === dataFile);
-            if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
-              merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
-            }
+          const inv = selectedInstrument;
+          if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
+            merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          const seedTf = strategyZoneSyncCode ? coarsestZoneTfFromStrategyCode(strategyZoneSyncCode) : null;
+          if (seedTf && "timeframe" in merged) {
+            merged["timeframe"] = seedTf;
           }
           const current = viewParamsRef.current;
           for (const k of Object.keys(current)) {
             if (k in schema) merged[k] = current[k];
+          }
+          // Po merge UI hodnot musí znovu vyhrát rozlišení svíček grafu — jinak zůstane např. 4h v refi
+          // při native 30m a Swing HL vrátí prázdné swingy / zóny.
+          if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
+            merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
           }
           setViewParamsValues(merged);
           paramsToSend = Object.keys(merged).length > 0 ? merged : null;
@@ -337,7 +413,16 @@ export function StrategyViewChart({
       const depNames = code ? parseViewDependencies(code) : [];
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
-      const res = await getViewData(dataFile, years, code, paramsToSend, moduleDeps, chartTimeframe);
+      const viewDemo = selectedInstrument?.viewDemo === true;
+      const effectiveYears = viewDemo ? 0 : years;
+      const res = await getViewData(
+        dataFile,
+        effectiveYears,
+        code,
+        paramsToSend,
+        moduleDeps,
+        chartTimeframe
+      );
       if (gen !== viewRequestGenRef.current) return;
       setOhlc(res.ohlc);
       setMarkers(res.markers);
@@ -356,7 +441,16 @@ export function StrategyViewChart({
         setLoading(false);
       }
     }
-  }, [dataFile, years, chartTimeframe, selectedItemId, selectedItemType, instruments, modules]);
+  }, [
+    dataFile,
+    years,
+    chartTimeframe,
+    selectedItemId,
+    selectedItemType,
+    selectedInstrument,
+    modules,
+    strategyZoneSyncCode,
+  ]);
 
   const handleShuffle = useCallback(async () => {
     const gen = ++viewRequestGenRef.current;
@@ -376,15 +470,22 @@ export function StrategyViewChart({
         if (code) {
           const schema = parseViewParams(code);
           const merged: StrategyParams = { ...schema };
-          if (instruments.length > 0) {
-            const inv = instruments.find((i) => i.file === dataFile);
-            if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
-              merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
-            }
+          const inv = selectedInstrument;
+          if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
+            merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          const seedTfShuffle = strategyZoneSyncCode
+            ? coarsestZoneTfFromStrategyCode(strategyZoneSyncCode)
+            : null;
+          if (seedTfShuffle && "timeframe" in merged) {
+            merged["timeframe"] = seedTfShuffle;
           }
           const current = viewParamsRef.current;
           for (const k of Object.keys(current)) {
             if (k in schema) merged[k] = current[k];
+          }
+          if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
+            merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
           }
           paramsToSend = Object.keys(merged).length > 0 ? merged : null;
         }
@@ -392,7 +493,14 @@ export function StrategyViewChart({
       const depNames = code ? parseViewDependencies(code) : [];
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
-      const res = await getViewData(dataFile, 0, code, paramsToSend, moduleDeps, chartTimeframe);
+      // Na shuffle načti širší řez než jen „Období“ — jinak je fullLen ≈ šířka okna a posun je ~0–1 bar.
+      // U 6M view načteme např. ~2× období (strop yearsAvailable / 12 let), pak náhodně vybereme okno šířky 6M.
+      const capAvail = selectedInstrument?.yearsAvailable ?? 12;
+      const shuffleLoadYears =
+        years > 0
+          ? Math.min(capAvail, 12, Math.max(years * 2.5, years + 0.75))
+          : Math.min(capAvail, 10);
+      const res = await getViewData(dataFile, shuffleLoadYears, code, paramsToSend, moduleDeps, chartTimeframe);
       if (gen !== viewRequestGenRef.current) return;
       const fullOhlc = res.ohlc;
       const fullMarkers = res.markers ?? [];
@@ -415,9 +523,60 @@ export function StrategyViewChart({
         selectedInstrument?.timeframe
       );
       const maxStart = Math.max(0, fullOhlc.length - windowBars);
-      const startIdx = Math.floor(Math.random() * (maxStart + 1));
-      const endIdx = Math.min(startIdx + windowBars, fullOhlc.length);
-      const windowOhlc = fullOhlc.slice(startIdx, endIdx);
+      const SMART_SHUFFLE_ATTEMPTS = 15;
+      let startIdx = 0;
+      let windowOhlc = fullOhlc;
+
+      for (let attempt = 0; attempt < SMART_SHUFFLE_ATTEMPTS; attempt++) {
+        startIdx = maxStart === 0 ? 0 : Math.floor(Math.random() * (maxStart + 1));
+        const endIdx = Math.min(startIdx + windowBars, fullOhlc.length);
+        windowOhlc = fullOhlc.slice(startIdx, endIdx);
+        const startTime = Date.parse(windowOhlc[0]?.date ?? "");
+        const endTime = Date.parse(windowOhlc[windowOhlc.length - 1]?.date ?? "");
+
+        const inRangeProbe = (d: string) => {
+          const ts = Date.parse(d);
+          if (Number.isFinite(ts) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+            return ts >= startTime && ts <= endTime;
+          }
+          const ds = d.slice(0, 10);
+          const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+          const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+          return ds >= startDate && ds <= endDate;
+        };
+
+        const mCount = fullMarkers.filter((m) => inRangeProbe(m.date)).length;
+        const zCount = fullZones.filter((z) => {
+          const zStart = Date.parse(z.date_start);
+          const zEnd = Date.parse(z.date_end);
+          if (
+            Number.isFinite(zStart) &&
+            Number.isFinite(zEnd) &&
+            Number.isFinite(startTime) &&
+            Number.isFinite(endTime)
+          ) {
+            return (
+              (zStart >= startTime && zStart <= endTime) ||
+              (zEnd >= startTime && zEnd <= endTime) ||
+              (zStart <= startTime && zEnd >= endTime)
+            );
+          }
+          const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+          const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+          return (
+            (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
+            (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
+            (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+          );
+        }).length;
+
+        const hasContent = mCount > 0 || zCount > 0;
+        const lastAttempt = attempt === SMART_SHUFFLE_ATTEMPTS - 1;
+        if (hasContent || maxStart === 0 || lastAttempt) {
+          break;
+        }
+      }
+
       const startTime = Date.parse(windowOhlc[0]?.date ?? "");
       const endTime = Date.parse(windowOhlc[windowOhlc.length - 1]?.date ?? "");
 
@@ -446,24 +605,25 @@ export function StrategyViewChart({
           })
           .filter((line): line is ViewLine => line != null)
       );
-      setZones(
-        fullZones.filter(
-          (z) => {
-            const zStart = Date.parse(z.date_start);
-            const zEnd = Date.parse(z.date_end);
-            if (Number.isFinite(zStart) && Number.isFinite(zEnd) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
-              return (zStart >= startTime && zStart <= endTime) || (zEnd >= startTime && zEnd <= endTime) || (zStart <= startTime && zEnd >= endTime);
-            }
-            const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
-            const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
-            return (
-              (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
-              (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
-              (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
-            );
-          }
-        )
-      );
+      const zonesInWindow = fullZones.filter((z) => {
+        const zStart = Date.parse(z.date_start);
+        const zEnd = Date.parse(z.date_end);
+        if (Number.isFinite(zStart) && Number.isFinite(zEnd) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+          return (
+            (zStart >= startTime && zStart <= endTime) ||
+            (zEnd >= startTime && zEnd <= endTime) ||
+            (zStart <= startTime && zEnd >= endTime)
+          );
+        }
+        const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+        const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+        return (
+          (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
+          (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
+          (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+        );
+      });
+      setZones(remapViewZonesToWindow(zonesInWindow, startIdx, windowOhlc.length));
       setPlotRevision((r) => r + 1);
     } catch (e) {
       if (gen !== viewRequestGenRef.current) return;
@@ -483,9 +643,9 @@ export function StrategyViewChart({
     chartTimeframe,
     selectedItemId,
     selectedItemType,
-    selectedInstrument?.timeframe,
-    instruments,
+    selectedInstrument,
     modules,
+    strategyZoneSyncCode,
   ]);
 
   useEffect(() => {
@@ -790,28 +950,89 @@ export function StrategyViewChart({
   const standardLines = lines.filter((line): line is ViewLineSeries => !isViewRegimeHistogramLine(line));
   const regimeHistogramLine = lines.find(isViewRegimeHistogramLine);
 
-  const lineTraces = standardLines
-    .map((line, i) => {
-      const pts = line.data
-        .map((p) => ({ idx: dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1, val: p.value }))
+  const lineTraces = standardLines.flatMap((line, i) => {
+    const fallbackColor = line.color ?? lineColors[i % lineColors.length];
+    const data = line.data ?? [];
+    // Backend může poslat více řad se stejným jménem (segmenty trendu) — každá má vlastní barvu z Pythonu
+    if (line.color) {
+      const pts = data
+        .map((p) => {
+          const idx = dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1;
+          let ht = "%{y:.4f}<extra></extra>";
+          if (p.state != null && String(p.state).length > 0) {
+            ht =
+              p.score != null && Number.isFinite(Number(p.score))
+                ? `${p.state} · ${Number(p.score).toFixed(0)}<extra></extra>`
+                : `${p.state}<extra></extra>`;
+          }
+          return { idx, val: p.value, ht };
+        })
         .filter((p) => p.idx >= 0)
         .sort((a, b) => a.idx - b.idx);
-      const color = line.color ?? lineColors[i % lineColors.length];
-      const count = (trendNameCount.get(line.name) ?? 0) + 1;
-      trendNameCount.set(line.name, count);
-      return {
+      if (pts.length === 0) return [];
+      const prev = trendNameCount.get(line.name) ?? 0;
+      trendNameCount.set(line.name, prev + 1);
+      return [
+        {
+          type: "scatter" as const,
+          x: pts.map((p) => p.idx),
+          y: pts.map((p) => p.val),
+          mode: "lines" as const,
+          line: { color: line.color, width: 2, shape: "linear" as const },
+          connectgaps: true,
+          name: line.name,
+          legendgroup: line.name,
+          showlegend: prev === 0,
+          hovertemplate: "%{text}",
+          text: pts.map((p) => p.ht),
+        },
+      ];
+    }
+    if (lineDataHasTrendState(data)) {
+      const segs = groupIndexedTrendSegments(data, dateToIndex, dayToIndex);
+      if (segs.length === 0) return [];
+      const prev = trendNameCount.get(line.name) ?? 0;
+      trendNameCount.set(line.name, prev + 1);
+      const showLegendForLine = prev === 0;
+      return segs.map((seg, si) => ({
+        type: "scatter" as const,
+        x: seg.x,
+        y: seg.y,
+        mode: "lines" as const,
+        line: {
+          color: HL_TREND_STATE_COLORS[seg.state] ?? fallbackColor,
+          width: 2,
+          shape: "linear" as const,
+        },
+        connectgaps: true,
+        name: line.name,
+        legendgroup: line.name,
+        showlegend: showLegendForLine && si === 0,
+        hovertemplate: "%{text}",
+        text: seg.text,
+      }));
+    }
+    const pts = data
+      .map((p) => ({ idx: dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1, val: p.value }))
+      .filter((p) => p.idx >= 0)
+      .sort((a, b) => a.idx - b.idx);
+    if (pts.length === 0) return [];
+    const count = (trendNameCount.get(line.name) ?? 0) + 1;
+    trendNameCount.set(line.name, count);
+    return [
+      {
         type: "scatter" as const,
         x: pts.map((p) => p.idx),
         y: pts.map((p) => p.val),
         mode: "lines" as const,
-        line: { color, width: 2, shape: "linear" },
+        line: { color: fallbackColor, width: 2, shape: "linear" },
         connectgaps: true,
         name: line.name,
         legendgroup: line.name,
         showlegend: count === 1,
-      };
-    })
-    .filter((t) => t.x.length > 0);
+      },
+    ];
+  });
 
   type RegimeKey = keyof typeof REGIME_HISTOGRAM_COLORS;
   const dominantRegime = (t: number, c: number, h: number): RegimeKey => {
@@ -873,8 +1094,11 @@ export function StrategyViewChart({
     if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
     if ((z.name === "Discount" || z.name === "Mid" || z.name === "Premium") && !visibility.premium_discount_zones) continue;
 
-    const idxStart = dateToIndex.get(z.date_start) ?? dayToIndex.get(z.date_start.slice(0, 10)) ?? 0;
-    const idxEnd = dateToIndex.get(z.date_end) ?? dayToIndex.get(z.date_end.slice(0, 10)) ?? n - 1;
+    const i0 = mapMarkerToIndex({ date: z.date_start, type: "high", value: z.value_high });
+    const i1 = mapMarkerToIndex({ date: z.date_end, type: "high", value: z.value_high });
+    if (i0 < 0 || i1 < 0) continue;
+    const idxStart = Math.min(i0, i1);
+    const idxEnd = Math.max(i0, i1);
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
     const isLine = z.value_low === z.value_high;
     const lineColor =
@@ -1063,21 +1287,21 @@ export function StrategyViewChart({
     <div className="flex flex-col h-full min-h-0">
       <div className="flex flex-wrap gap-3 pb-3 shrink-0">
         <div>
-          <label className="text-xs text-zinc-500 block mb-1">Instrument</label>
-          <select
-            value={dataFile}
-            onChange={(e) => setDataFile(e.target.value)}
-            className={inputClass}
+          <label className="text-xs text-zinc-500 block mb-1">Data (View demo)</label>
+          <div
+            className={`${inputClass} cursor-default bg-zinc-800/90 text-zinc-300`}
+            title="Záložka View používá výhradně kanonický demo soubor NQ 2025 (30m). Výběr instrumentu není k dispozici."
           >
-            {instruments.length === 0 && (
-              <option value={defaultDataFile}>{defaultDataFile}</option>
-            )}
-            {instruments.map((inv) => (
-              <option key={inv.file} value={inv.file}>
-                {inv.displayName ? `${inv.instrument} - ${inv.displayName}` : inv.instrument} ({inv.timeframe}, {inv.yearsAvailable}y)
-              </option>
-            ))}
-          </select>
+            {selectedInstrument
+              ? `${selectedInstrument.instrument} — ${selectedInstrument.displayName ?? "View demo (2025)"} (${selectedInstrument.timeframe})`
+              : "NQ — View demo (2025) (30m)"}
+          </div>
+          {instruments.length > 0 && demoInstruments.length === 0 && (
+            <p className="text-xs text-amber-400/90 mt-1 max-w-md">
+              Backend nevrátil záznam pro demo parquet — zkontrolujte soubor{" "}
+              <code className="text-zinc-400">{VIEW_DEMO_FILE_FALLBACK}</code> a skript build_nq_view_demo_2025.
+            </p>
+          )}
         </div>
         <div>
           <label
@@ -1157,7 +1381,11 @@ export function StrategyViewChart({
           <button
             onClick={handleShuffle}
             disabled={loading}
-            title="Načte celou historii (years=0), pak náhodný úsek o šířce podle Období a TF grafu (např. 6M + 1D ≈ 126 svíček)"
+            title={
+              selectedInstrument?.viewDemo
+                ? "Náhodný výřez uvnitř celé demo řady 2025. Modul běží vždy na celém demo souboru."
+                : "Modul se počítá na delší historii než „Období“, výstup se ořeže do náhodného okna — prázdné okno (bez markerů/zón v řezu) je běžné. Aplikace opakuje náhodný posun až ~15×, dokud v okně něco je, nebo použije poslední pokus."
+            }
             className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
           >
             Shuffle

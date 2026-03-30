@@ -1,6 +1,6 @@
 # Backtesting Platform – Kompletní dokumentace
 
-Webová aplikace pro testování obchodních strategií na historických datech. Uživatel píše strategie v Pythonu (Backtrader), spouští backtest v izolovaném Docker kontejneru a vidí výsledky – grafy, statistiky, obchody a historii runů.
+Webová aplikace pro testování obchodních strategií na historických datech. Uživatel píše strategie v Pythonu (Backtrader), spouští backtest přes **hostovský Python subprocess** (stejný engine jako dříve v Dockeru) a vidí výsledky – grafy, statistiky, obchody a historii runů.
 
 **Mapa dokumentace (vše v kořeni repozitáře):**
 
@@ -9,19 +9,33 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 | **READMEADAM.md** | Osobní přehled UI, všech funkcí a workflow (pro každodenní používání). |
 | **README.md** (tento) | Kompletní technická dokumentace platformy, API, struktura projektu, limity. |
 | **READMEAI.md** | Reference pro AI / vývojáře: kontrakty, data flow, kde měnit kód. |
-| **SCRIPTS.md** | Příkazy: Docker, backend, frontend, troubleshooting při spuštění. |
+| **SCRIPTS.md** | Příkazy: backend, frontend, troubleshooting při spuštění. |
+| **audit/** | Uložené audity (risk, quant, UX, výkon, …) — **index:** **audit/README.md**. |
+| **docs/QUANT_AUDIT.md** | Hlubší technický audit dat, exekuce a engine (doplňuje README). |
 
 **Účel tohoto souboru:** technická dokumentace pro hodnocení workflow, deployment a code review. Popisy polí v UI drží **`frontend/components/backtestFieldMeta.ts`** a průvodce **`frontend/data/guideContent.ts`** + **`/guide`** — při změně funkcí je aktualizuj společně s **READMEADAM.md**.
 
+### Pravidlo: složka `audit/` (AI a code review)
+
+Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné soubory (reporty, poznámky, checklisty) do **`audit/`** v kořeni repozitáře. Nepoužívej tuto složku pro runtime logy — ty patří jinam; **`.audit/`** je vyhrazeno pro append-only strojové události (`events.jsonl`). Detailní popis a konvence pojmenování: **`audit/README.md`**.
+
 > **Důležité (2026-03):** Institution-grade hardening + rozšířený research stack:
-> - API auth + rate limiting; `/api/view` v Docker sandboxu; append-only audit (`.audit/events.jsonl`).
-> - Manifest fingerprinting (`runSeed`, `datasetFingerprint`, `codeDigest`, `imageDigest`, `actorId`).
+> - API auth + rate limiting; `/api/view` v host subprocessu; append-only audit (`.audit/events.jsonl`).
+> - Manifest fingerprinting (`runSeed`, `datasetFingerprint`, `codeDigest`, `actorId`).
 > - Firestore owner/role + soft-delete; compare workspace + lifecycle v Run history.
-> - Edge finding: OOS/WF, quality gates, sweep, Monte Carlo (**iid_trade** / **block_bootstrap**), regime, portfolio, execution model, forward bridge, **batch_config** (matrix runy).
+> - Edge finding: OOS/WF, **param_test** (citlivost numerických PARAMS na stejných datech), quality gates, sweep, Monte Carlo (**iid_trade** / **block_bootstrap**), regime, portfolio, execution model, forward bridge, **batch_config** (matrix runy).
 > - Volitelný **fixní seed** (`experiment.seed` → `RUN_SEED` v engine).
 > - **Cost attribution** v execution summary; **Analytics** s heuristikami readiness/overfitting (`overfittingSignals.ts`).
+> - **Bootstrap CI** (95% intervaly pro mean PnL, total return, trade Sharpe; Bonferroni α korekce); **Payoff decomposition** (edge rovnice, Kelly frakce); **Multiple testing awareness** (trial count K, Bonferroni strip).
+> - **Param test train-only** režim: OAT sweep na trénovací části, holdout evaluace nejlepšího parametru.
 > - **Repro bundle (ZIP)** z výsledků (manifest + summary + snapshot `main.py`).
 > - Nápověda u polí: **FieldHelpPopover** + `backtestFieldMeta.ts`; **Guided mode** a **/guide** z `guideContent.ts`.
+> - **Prop-level red flags** (`_compute_prop_red_flags`): automatická kontrola výsledků na podezřelé vzory (vysoký Sharpe s málo obchody, nulové ztráty, příliš hladká equity, koncentrace PnL, …); výstup `propRedFlags` v `RunResponse` s `trustLevel` (not_trustworthy / low_trust / cautious / acceptable) + trust banner v ResultsView a barevná sekce v Analytics.
+> - **Prop conservative** preset v Edge finding (WF 5 folds, min 50 obchodů, MC 1000 block_bootstrap, execution se stress multiplierem 1.5×).
+> - **„Not a broker" disclaimer** v execution summary sekci Analytics.
+> - **Performance optimalizace:** In-process engine jako výchozí (eliminace subprocess overhead), lightweight mode pro sub-runy (přeskočení bootstrap CI / drawdown / OHLC), in-memory result cache (256 slotů), fast data fingerprint (mtime+size místo SHA-256), vectorized OHLC/equity export, server-side OHLC cap (8000 barů).
+> - **Trader audit (2026-03):** "Reality check" varování v ResultsView (málo obchodů, execution off, single run, PnL koncentrace); **Underwater equity chart** (drawdown % timeline + "pod vodou" statistika); **Pessimist preset** (agresivní execution: spread 2 bps, slip 3×vol, latence 2 bary, stress 2×); **Run journal note** (poznámka k runu, export do repro bundle); color-coded StatBlocks (DD duration, recovery, PnL koncentrace, trade count — vizuální alarm při nebezpečných hodnotách).
+> - **UX audit (2026-03):** **Verdict row** nad StatBlocks (readiness label + severity + top 3 warnings + run kontext inline — validace/MC/exec/instrument); **klávesové zkratky** 1–5 pro záložky výsledků; **StatBlocks seskupeny** do 3 kategorií (PnL / Risk / Activity) s responsive gridem `auto-fill minmax(7rem,1fr)`; **ⓘ metodika toggle** (defaultně skryté, odkrytí přes "Metodika" tlačítko); **param test** zbalen do `<details>` když je přítomen; **zone slovník na klik** místo hover; **odstraněny duplicitní stat cards** z Analytics details (ponecháno jen Avg Win/Loss, Best/Worst, MFE/MAE); zkrácený manifest strip text.
 
 ---
 
@@ -33,13 +47,13 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 2. **Indikátory a moduly** – `bt.Indicator` vs utility moduly (`detect` / `get_line` / `get_zones`).
 3. **Parameter Panel** – `PARAMS` strategie a `VIEW_PARAMS` modulů; záložky Strategie | Modul1 | …
 4. **Auto-detekce importů** – předvýběr indikátorů/modulů podle `from indicators.X` / `from modules.Y`.
-5. **Backtest** – Docker engine, SSE logy a progress.
+5. **Backtest** – host engine subprocess, SSE logy a progress.
 6. **Výsledky (ResultsView)** – záložky **Equity** | **Highlight** | **Detailed** | **Analytics** | **Run history**; **StatBlocks** s metodickými ⓘ; **Export JSON** a **Repro bundle (ZIP)**.
 7. **Detailed** – svíčky + sloučené výstupy modulů (`ModuleOutputChart`) a obchody; není samostatná záložka „Moduly“.
 8. **Trade Highlight** – jeden obchod, okno entry–exit + kontext.
-9. **Analytics** – validace, foldy, guardrails, robustnost/sweep heatmapa, Monte Carlo, regime, portfolio, execution + **cost attribution**, forward bridge, batch summary, quality gate, experiment diff; **readiness / overfitting** (heuristiky).
+9. **Analytics** – strip **konfigurace běhu** z `manifest.analysis`; záložka **S/D zóny** (`SdZoneAnalytics`, `zoneMeta`); při `param_test` grafy **`ParamTestAnalytics`**; validace, foldy, guardrails, robustnost/sweep heatmapa, Monte Carlo, regime, portfolio, execution + **cost attribution**, forward bridge, batch summary, quality gate, experiment diff; **readiness / overfitting** (heuristiky; část bloků je v rozbalené „Obecná analytika“).
 10. **Run history** – Firestore, tabulka, grafy metrik, **N-way compare**, lifecycle/governance, sloupec readiness (stejná logika jako Analytics).
-11. **Edge finding** (pravý panel) – validace (single/OOS/WF), gates, sweep, MC režimy, seed, regime, portfolio, batch, execution, forward bridge, experiment (hypotéza, tagy, branch, promote on pass).
+11. **Edge finding** (pravý panel) – validace (`single` / `oos_split` / `walk_forward` / **`param_test`**), gates, sweep, MC režimy, seed, regime, portfolio, batch, execution, forward bridge, experiment (hypotéza, tagy, branch, promote on pass). Presety: **Pessimist** (agresivní execution: spread 2 bps, slip 3×vol, latence 2 bary, stress 2× — nemění validaci) / Safe / Balanced / Explore / **Prop conservative** (WF 5 folds, min 50 obchodů, max DD 15 %, PF ≥ 1.5, MC 1000 block_bootstrap, execution se stress 1.5×, param test train-only).
 12. **Guided mode** – checklist + varování před riskantními kombinacemi (např. sweep bez OOS).
 13. **View mode** – graf bez backtestu; View params drawer pro `VIEW_PARAMS`.
 14. **Uložit / Uloženo** – stav tlačítka podle změn v editoru.
@@ -67,27 +81,42 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 │  - POST /api/run?stream=1: spuštění backtestu (SSE: log, progress, result)    │
 │  - POST /api/view: OHLC + markery/čáry z modulu, View params                  │
 │  - POST /api/chart: generace PNG grafu (mplfinance)                          │
-│  - services/runner.py: orchestrace Dockeru, streamování výstupu              │
+│  - services/runner.py: subprocess nebo volitelně in-process engine, stream výstupu │
 └─────────────────────────────────────────────────────────────────────────────┘
                                         │
-                                        │ docker run
+                                        │ subprocess (stejný Python / venv)
                                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  DOCKER KONTEJNER (backtest-engine)                                          │
-│  - engine.py: načte strategii, data, spustí Backtrader                      │
-│  - Mount: /app/strategy (strategie), /app/data (OHLCV CSV/parquet)            │
-│  - Env: STRATEGY_PATH, DATA_FILE, STRATEGY_PARAMS (JSON), …                  │
+│  BACKTEST ENGINE (backend/docker/engine.py na hostu)                         │
+│  - načte strategii, data, spustí Backtrader                                  │
+│  - Cesty: STRATEGY_PATH, DATA_PATH, DATA_CACHE_PATH (absolutní na disku)      │
 │  - Výstup: JSON na stdout, PROGRESS:X na stderr                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.3 Proč Docker
+### 1.3 Provoz na hostu (single-user)
 
-Strategie je cizí Python kód. Spouští se v izolovaném kontejneru:
-- Bez síťového přístupu (`--network none`)
-- Omezená paměť (1 GB), CPU (1 core)
-- Timeout default 5 minut (`RUN_TIMEOUT_SEC=300`, lze přepsat env)
-- Nemůže poškodit hostitelský systém
+Engine běží jako **dětský proces** stejného Pythonu jako backend. Pro vlastní / důvěřovaný kód je to nejjednodušší; pro veřejný multi-tenant hosting by bylo potřeba znovu zavést silnější izolaci.
+
+- Timeout default 1 hodina (`RUN_TIMEOUT_SEC` / UI **Max. doba běhu** / `run_timeout_sec` v requestu)
+- Dávkové běhy: volitelná paralelizace `BATCH_PARALLEL_WORKERS` (1–8)
+- **In-process engine** je nyní **výchozí** (bez druhého interpreteru; eliminuje cold-start overhead). Subprocess se použije jen při explicitním `RUN_INPROCESS_ENGINE=0`. Globální lock zajišťuje konzistenci stavu.
+- **Single-user:** strategie běží jako tvůj uživatel na hostu; pro veřejný multi-tenant by bylo potřeba znovu zavést silnější izolaci než čistý subprocess.
+
+### 1.4 Výkonnostní optimalizace (2026-03)
+
+Systém obsahuje několik vrstev optimalizace pro minimalizaci doby backtestů:
+
+| Optimalizace | Popis | Dopad |
+|---|---|---|
+| **In-process engine (default)** | Eliminuje subprocess fork + Python import overhead na každý run. | ~2–5s úspora na run (kritické pro param test / sweep s desítkami sub-runů). |
+| **Lightweight mode** | Param test, sweep, WF fold a portfolio sub-runy přeskočí těžké analytiky (bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition, OHLC export). | ~30–60 % úspora CPU na sub-run; dramaticky menší JSON payload. |
+| **Result cache** | In-memory LRU (256 slotů) klíčovaný (code_digest, params, data_fingerprint, bars, lightweight). Cache hit = nulový CPU. | Okamžitý návrat pro opakované param test / sweep body. |
+| **Fast data fingerprint** | Rutinní `datasetFingerprint` používá `mtime_ns + size` hash místo plného SHA-256 celého souboru. | Eliminuje druhé plné čtení disku na GB CSV souborech. |
+| **Vectorized OHLC export** | Pandas vectorizace místo row-by-row `iloc` smyčky + server-side cap (default 8000 barů, `MAX_OHLC_EXPORT_BARS`). | ~10× rychlejší export + menší JSON pro frontend. |
+| **Vectorized equity curve** | Exportní smyčka equity s daty nahrazena bulk `strftime` + list comprehension. | ~5× rychlejší serializace u velkých datasetů. |
+
+**Architektonické limity (Backtrader):** Hlavní bottleneck zůstává Backtrader `next()` smyčka — per-bar dispatch v CPythonu. Pro SD zone strategii existuje základ v `sd_numba_exec.py` (Numba-akcelerovaný demand limit kernel). **Roadmap:** plná vektorizace SD zone execution do Numba/NumPy (potenciální 10–50× zrychlení oproti Backtrader).
 
 ---
 
@@ -115,14 +144,17 @@ Backtesting_app/
 │   │   ├── results/
 │   │   │   ├── ResultsView.tsx  # Kontejner výsledků – záložky Equity, Highlight, Detailed, Analytics, Run history
 │   │   │   ├── StatBlocks.tsx   # Metriky (equity, Sharpe, drawdown, win rate, …)
-│   │   │   ├── AnalyticsView.tsx # Validace, MC, robustnost, náklady, readiness
+│   │   │   ├── AnalyticsView.tsx # Manifest strip, S/D + param test, validace, MC, readiness
+│   │   │   ├── SdZoneAnalytics.tsx
+│   │   │   ├── ParamTestAnalytics.tsx
 │   │   │   ├── TradeHighlight.tsx # Graf jednoho obchodu + seznam obchodů (klik pro detail)
 │   │   │   └── RunHistory.tsx   # Historie runů – tabulka + grafy metrik
 │   │   ├── charts/
-│   │   │   ├── DetailedChart.tsx # Candlestick + trades (TradingView Lightweight Charts)
-│   │   │   ├── EquityChart.tsx
+│   │   │   ├── ModuleOutputChart.tsx # Detailed + výsledky: OHLC Plotly + zóny/čáry + obchody
+│   │   │   ├── DetailedChart.tsx   # (další candlestick / legacy cesty)
+│   │   │   ├── EquityChart.tsx     # Lightweight Charts, downsample equity
 │   │   │   ├── TradesChart.tsx
-│   │   │   └── TradeHighlightChart.tsx # Candlestick okno entry–exit pro jeden obchod
+│   │   │   └── TradeHighlightChart.tsx # Okno entry–exit pro jeden obchod
 │   │   ├── StrategyViewChart.tsx # View mode – Plotly candlestick + H/L markery, View params drawer (ikona vedle Obnovit)
 │   │   ├── LogPanel.tsx         # Spodní panel – logy z backendu
 │   │   ├── LoadingOverlay.tsx   # Progress bar + Zastavit
@@ -134,6 +166,7 @@ Backtesting_app/
 │   │   └── guideContent.ts      # Strukturovaný obsah A-Z guide stránky
 │   └── lib/
 │       ├── api.ts               # runBacktestStreaming, getAvailableData, getChartImage
+│       ├── chartOhlcResample.ts # Agregace TF pro Detailed graf
 │       ├── overfittingSignals.ts # Heuristiky readiness (Analytics + Run history)
 │       ├── firestore.ts         # CRUD + owner metadata, soft-delete run history, governance update
 │       ├── firebase.ts          # Firebase konfigurace
@@ -149,14 +182,14 @@ Backtesting_app/
 │   │   │   ├── view.py          # POST /api/view (OHLC + markery/čáry z modulu, View params)
 │   │   │   └── chart.py         # POST /api/chart (PNG)
 │   │   ├── services/
-│   │   │   ├── runner.py        # Docker orchestrace, streamování + manifest metadata
+│   │   │   ├── runner.py        # Subprocess engine, streamování + manifest metadata
 │   │   │   ├── audit.py         # Append-only audit logger
 │   │   │   └── chart.py         # mplfinance generace grafu
 │   │   └── models/
 │   │       └── run.py           # RunRequest, RunResponse, Trade, BacktestMetrics
 │   └── docker/
 │       ├── Dockerfile           # python:3.11-slim + backtrader
-│       ├── engine.py            # Skript běžící UVNITŘ kontejneru
+│       ├── engine.py            # Backtest engine (spouští se na hostu jako subprocess)
 │       ├── view_engine.py       # Sandbox engine pro /api/view
 │       └── requirements.txt
 │
@@ -176,9 +209,11 @@ Backtesting_app/
 ├── firestore.rules              # Firestore security rules
 ├── firebase.json                # Konfigurace pro firebase deploy
 ├── strategies/                  # Lokální příklady (ne v produkci)
-├── SCRIPTS.md                   # Příkazy, skripty, troubleshooting
-├── README.md                    # Dokumentace pro vývojáře
-└── READMEAI.md                  # Referenční dokument pro AI/boty – architektura, data flow, workflow
+├── examples/                    # Příklady modulů/indikátorů ke kopírování
+├── audit/                       # Auditní reporty (lidské) — seznam v audit/README.md
+├── docs/
+│   └── QUANT_AUDIT.md           # Technický quant audit (data, exekuce, metriky)
+└── SCRIPTS.md                   # Příkazy, skripty, troubleshooting
 ```
 
 ---
@@ -189,7 +224,7 @@ Backtesting_app/
 
 1. **Backend:** `cd backend && uvicorn app.main:app --reload` → http://localhost:8000
 2. **Frontend:** `cd frontend && npm run dev` → http://localhost:3000
-3. **Docker:** Image `backtest-engine` musí být sestaven: `docker build -t backtest-engine backend/docker`
+3. **Závislosti:** `pip install -r backend/requirements.txt` (Backtrader, pyarrow, …).
 
 ### 3.2 Uživatelský flow
 
@@ -257,12 +292,14 @@ Backtesting_app/
   "sweep_config": { "max_samples": 24 },
   "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50 },
   "regime_config": { "enabled": true },
-  "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0 },
+  "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0, "stress_multiplier": 1.0 },
   "experiment": { "hypothesis": "sd-trend-breakout", "tags": ["manual-run"], "seed": 42 }
 }
 ```
 
-*Poznámka:* `experiment.seed` je volitelné; v UI lze zapnout fixní seed → hodnota se předá do Docker env `RUN_SEED` (reprodukovatelnost MC / sweep / bootstrap). Když seed v requestu chybí, backend doplní náhodný.
+*Poznámka:* `experiment.seed` je volitelné; v UI lze zapnout fixní seed → hodnota se předá do env `RUN_SEED` subprocessu (reprodukovatelnost MC / sweep / bootstrap). Když seed v requestu chybí, backend doplní náhodný.
+
+*`validation_mode`:* kromě příkladu výše je podporováno `single`, `walk_forward` a **`param_test`** (OAT citlivost vybraných číselných `PARAMS` na stejných datech; konfigurace v `validation_config.param_test`, engine vrací `validation.paramTest` a UI `ParamTestAnalytics`). Param test podporuje **train-only režim** (`train_only: true`): OAT sweep probíhá jen na trénovací části dat a nejlepší nalezený parametr se automaticky vyhodnotí na hold-out (out-of-sample) části — výsledek holdout evaluace je v `validation.paramTest.holdout`.
 
 **Backend (`api/run.py`):**
 
@@ -274,37 +311,19 @@ Backtesting_app/
 
 1. Vytvoří `.backtest_run/` v project root
 2. `_prepare_strategy_files()`: zapíše soubory do `.backtest_run/`, vytvoří `indicators/__init__.py`, `modules/__init__.py` pokud potřeba
-3. Spustí Docker:
-   ```
-   docker run --rm --memory=1g --cpus=1 --network none
-     -v .backtest_run:/app/strategy:rw
-     -v data:/app/data:ro
-     -e STRATEGY_PATH=/app/strategy/main.py
-     -e INSTRUMENT=NQ
-     -e TIMEFRAME=1d
-     -e YEARS=1
-     -e DATA_FILE=mock/NQ_5Y.csv
-     -e INITIAL_CAPITAL=100000
-     -e SLIPPAGE_PERC=0.001
-     -e INSTRUMENT_TYPE=futures
-     -e TICK_SIZE=0.25
-     -e VALUE_PER_TICK=5
-     -e STRATEGY_PARAMS={"sma_fast":20,"sma_slow":50,...}
-     ...
-     backtest-engine
-   ```
+3. Spustí **subprocess** `python backend/docker/engine.py` *nebo* při `RUN_INPROCESS_ENGINE=1` zavolá `execute_backtest_from_environ()` v tom samém procesu (`engine_inprocess.py`). Env obsahuje mimo jiné `STRATEGY_PATH`, `DATA_PATH`, `DATA_CACHE_PATH`, `HOST_DATASET_FINGERPRINT`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `INITIAL_CAPITAL`, `STRATEGY_PARAMS`, `RUN_SEED`, `CODE_DIGEST`, `ACTOR_ID`, `PYTHONPATH` = kořen repa **+** `backend` (import `app.services.*`, `examples.*`, …).
 4. Čte stdout/stderr v odděleném vlákně
 5. Parsuje JSON z stdout → `{"equity": [...], "metrics": {...}, "trades": [...], "ohlc": [...]}` → event `result`
-6. Pokud `applied_modules` v requestu: `engine.py` dopočítá `moduleOutputs` uvnitř kontejneru (detect/get_line/get_zones) a vrátí je v JSON výsledku
+6. Pokud `applied_modules` v requestu: `engine.py` dopočítá `moduleOutputs` (detect/get_line/get_zones) a vrátí je v JSON výsledku
 7. Parsuje `PROGRESS:10` z stderr → event `progress`
 8. Při chybě: JSON `{"error": "..."}` → event `error`
 9. Streamuje události klientovi přes SSE
-10. Po dokončení smaže `.backtest_run/*.py`
-11. Do engine env posílá governance metadata: `RUN_SEED`, `CODE_DIGEST`, `ENGINE_IMAGE_DIGEST`, `ACTOR_ID`
+10. Po dokončení smaže `.backtest_run/{run_id}/`
+11. Do engine env posílá governance metadata: `RUN_SEED`, `CODE_DIGEST`, `ACTOR_ID`
 
-**Engine (`docker/engine.py` – uvnitř kontejneru):**
+**Engine (`docker/engine.py` — subprocess nebo in-process na hostu):**
 
-1. Načte env: `STRATEGY_PATH`, `DATA_PATH`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `STRATEGY_PARAMS` (JSON), `RUN_SEED`, `CODE_DIGEST`, `ENGINE_IMAGE_DIGEST`, `ACTOR_ID`
+1. Načte env: `STRATEGY_PATH`, `DATA_PATH`, `DATA_CACHE_PATH`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `STRATEGY_PARAMS` (JSON), `RUN_SEED`, `CODE_DIGEST`, `ACTOR_ID`
 2. `load_strategy(path)`: dynamický import, najde první třídu dědící z `bt.Strategy`
 3. `strategy_params = json.loads(STRATEGY_PARAMS)` → předá do `cerebro.addstrategy(TradeRecordingStrategy, **params)`
 4. `load_data(data_path, instrument, timeframe, years, data_file)`:
@@ -318,6 +337,12 @@ Backtesting_app/
    - Spustí `cerebro.run()`
    - Zaznamenává equity na každý bar, obchody přes `notify_trade`/`notify_order`
    - Vypočítá metriky (Sharpe, max drawdown, win rate, profit factor, expectancy, …)
+   - `_compute_drawdown_analysis()`: detailní analýza drawdownu — max/avg trvání (bary + dny), recovery, underwater %, počet period
+   - `_compute_trade_pnl_distribution()`: histogram PnL, percentily, skewness, kurtosis, tail risk (CVaR), koncentrace (top 5 %)
+   - `_compute_bootstrap_ci(trades)`: bootstrap 95% CI pro mean PnL, total return a trade-level Sharpe (1 000 resamplingů uzavřených obchodů); vrací `bootstrapCI` s `lo`/`hi`/`alpha`/`adjustedAlpha`/`trialCount`
+   - `_compute_payoff_decomposition(trades, metrics)`: rozklad edge — win rate, loss rate, avg win, avg loss, payoff ratio (avg win / avg loss), edge per trade (WR×AvgWin − LR×AvgLoss), Kelly fraction; vrací `payoffDecomposition`
+   - `_compute_prop_red_flags(metrics, trades, equity, manifest, bootstrapCI, tradePnlDistribution)`: automatická kontrola výsledků z pohledu prop-firm reviewer — vrací `propRedFlags` s `trustLevel` a seznamem `flags`. Kontrolované vzory: extrémně vysoký Sharpe s málo obchody, příliš málo obchodů (< 10 critical, < 30 warning), nulové ztráty / win rate > 95 %, nedefinovaný PF (sentinel), single run bez validace, vypnutý execution model, kombinace single + no execution = minimální věrohodnost, podezřele nízký DD, příliš hladká equity (> 92 % barů rostoucích), bootstrap CI protínající nulu, koncentrace PnL (top 5 > 80 %)
+   - `trialCount` v manifestu: počet nezávislých pokusů (sweep × batch × folds); `overfittingSignals.bonferroniAlpha` = 0.05 / K
 8. Vypíše JSON na stdout, `PROGRESS:100` na stderr
 
 **Response (`RunResponse`):**
@@ -341,9 +366,22 @@ Backtesting_app/
     "totalReturn": 5.0,
     "totalReturnUsd": 5000,
     "profitFactor": 1.8,
+    "profitFactorStatus": "defined",
+    "sharpeRatioLegacyAnalyzer": 0.95,
+    "grossProfitClosedTrades": 12000,
+    "grossLossAbsClosedTrades": 6666,
+    "riskAnnualizationPeriodsPerYear": 252,
     "expectancyUsd": 119,
     "expectancyR": 0.5,
-    "rMultiple": 0.5
+    "rMultiple": 0.5,
+    "maxDrawdownDurationBars": 47,
+    "maxDrawdownDurationDays": 65,
+    "timeToRecoveryBars": 32,
+    "timeToRecoveryDays": 44,
+    "currentDrawdownPct": 1.8,
+    "payoffRatio": 1.85,
+    "edgePerTrade": 28.5,
+    "kellyFraction": 0.18
   },
   "trades": [
     {"date": "...", "entryDate": "...", "exitDate": "...", "type": "buy", "size": 1, "pnl": 150, "entryPrice": 20000, "exitPrice": 20150, "mfe": 220, "mae": 80, "mfePct": 1.1, "maePct": 0.4}
@@ -354,22 +392,95 @@ Backtesting_app/
       "markers": [{"date": "2024-03-12", "type": "high", "value": 20100}, {"date": "2024-03-15", "type": "low", "value": 19950}],
       "lines": []
     }
+  },
+  "drawdownAnalysis": {
+    "maxDurationBars": 47,
+    "maxDurationDays": 65,
+    "timeToRecoveryBars": 32,
+    "timeToRecoveryDays": 44,
+    "currentDrawdownPct": 1.8,
+    "underwaterPct": 38.2,
+    "avgDurationBars": 12,
+    "periodsCount": 8
+  },
+  "tradePnlDistribution": {
+    "histogram": [{"binEdge": -500, "count": 3}, {"binEdge": 0, "count": 12}, {"binEdge": 500, "count": 18}],
+    "percentiles": {"p5": -420, "p25": -80, "p50": 60, "p75": 310, "p95": 820},
+    "skewness": 0.42,
+    "kurtosis": 3.1,
+    "tailRiskCVaR": -380,
+    "concentration": {"top5PnlPct": 42.5}
+  },
+  "bootstrapCI": {
+    "meanPnl": {"lo": 45.2, "hi": 210.8, "alpha": 0.05},
+    "totalReturn": {"lo": 3.1, "hi": 7.8, "alpha": 0.05},
+    "tradeSharpe": {"lo": 0.08, "hi": 0.42, "alpha": 0.05},
+    "nBootstrap": 1000,
+    "adjustedAlpha": 0.025,
+    "trialCount": 2,
+    "note": "Trade-level resampling; adjustedAlpha = 0.05 / trialCount (Bonferroni)"
+  },
+  "payoffDecomposition": {
+    "winRate": 0.60,
+    "lossRate": 0.40,
+    "avgWin": 310.5,
+    "avgLoss": 180.2,
+    "payoffRatio": 1.72,
+    "edgePerTrade": 114.2,
+    "kellyFraction": 0.18,
+    "edgeEquation": "WR×AvgWin − LR×AvgLoss"
+  },
+  "overfittingSignals": {
+    "trialCount": 2,
+    "bonferroniAlpha": 0.025,
+    "multipleTestingNote": "K=2 trials detected; naive Bonferroni α = 0.05/2 = 0.025"
+  },
+  "propRedFlags": {
+    "trustLevel": "cautious",
+    "flags": [
+      { "key": "too_few_trades", "severity": "warning", "label": "Low trade count", "detail": "30 trades — below 30 is a warning for prop evaluation" },
+      { "key": "no_execution_model", "severity": "warning", "label": "Execution model disabled", "detail": "Results do not account for spread, slippage or latency" }
+    ],
+    "criticalCount": 0,
+    "warningCount": 2,
+    "tip": "Enable walk-forward or OOS validation to increase credibility"
   }
 }
 ```
 
 ### 3.4 Zobrazení výsledků (ResultsView)
 
-**Záložky:**
+**Záložky** (klávesové zkratky `1`–`5`):
 
-| Záložka | Obsah |
-|---------|-------|
-| **Equity** | `EquityChart` – křivka equity v čase |
-| **Highlight** | `TradeHighlight` – jeden obchod (entry–exit) + seznam obchodů |
-| **Detailed** | `ModuleOutputChart`: OHLC + **sloučené** markery/čáry/zóny ze všech `moduleOutputs` + obchody (výřez času, RRR volitelně) |
-| **Run view** | `RunModuleViewChart`: stejné `moduleOutputs` z runu + všechny obchody na plném OHLC (bez živého `/api/view`) |
-| **Analytics** | Validace (foldy, summary, guardrails), robustnost/sweep heatmapa, Monte Carlo (`method`/`mode`/`note`), regime, portfolio, execution + **costAttribution**, forward bridge, batchSummary, qualityGate, experiment (runDiff, promoteEvidence); **readiness + overfitting** (heuristiky) |
-| **Run history** | `RunHistory` – uložené runy, compare, lifecycle, grafy metrik, sloupec readiness |
+| Záložka | Klávesa | Obsah |
+|---------|---------|-------|
+| **Equity** | `1` | `EquityChart` – křivka equity v čase + underwater chart |
+| **Highlight** | `2` | `TradeHighlight` – jeden obchod (entry–exit) + seznam obchodů |
+| **Detailed** | `3` | OHLC + markery/zóny + obchody (výřez času, agregace TF, RRR styl) |
+| **Analytics** | `4` | Manifest strip (zkrácený); S/D analytika; param test v `<details>`; validace, MC, DD, PnL dist, Bootstrap CI, Edge decomposition, Prop red flags, readiness/overfitting v „Obecná analytika" |
+| **Run history** | `5` | `RunHistory` – uložené runy, compare, lifecycle, grafy metrik, sloupec readiness |
+
+**Trust banner (pod export tlačítky v ResultsView):**
+
+- Barevný pruh z `propRedFlags.trustLevel`: zelený = `acceptable`, žlutý = `cautious`, oranžový = `low_trust`, červený = `not_trustworthy`
+- Zobrazuje počet critical a warning flagů + validační tip (např. „Enable walk-forward or OOS validation to increase credibility")
+- Přítomen pouze pokud `propRedFlags` existuje v `RunResponse`
+
+**"Reality check" banner (trader audit):**
+
+- Automaticky se zobrazí při nebezpečné kombinaci: málo obchodů (<30), vypnutý execution model, single run bez validace, nebo PnL koncentrace >60% v top 5 obchodech
+- Žlutý varovný banner s konkrétními zprávami (nezávislý na prop red flags — doplňují se)
+
+**Underwater chart (záložka Equity):**
+
+- SVG drawdown % timeline pod hlavní equity křivkou
+- Zobrazuje: max DD %, % barů strávených „pod vodou" (equity pod předchozím peakem)
+- Vizualizuje jak hluboké, tak jak dlouhé jsou drawdowny — „jak dlouho jsi v pekle"
+
+**Run journal note:**
+
+- Tlačítko „Poznámka" vedle export tlačítek otevírá textarea pro volný text k runu
+- Poznámka se exportuje do repro bundle (soubor `run_note.txt` + pole `runNote` v `results_summary.json`)
 
 **Trade Highlight (detail):**
 
@@ -385,7 +496,11 @@ Backtesting_app/
 - Osa X: čísla runů (1, 2, 3…), osa Y: hodnoty
 - Layout: 2 grafy na řádek (`grid-cols-2`)
 
-**StatBlocks:** metriky aktuálního runu + ⓘ tooltips (metodické limity) + řádek Monte Carlo (risk of ruin, mode), pokud MC běžel.
+**Verdict row (UX audit):** Kompaktní řádek nad StatBlocks zobrazující readiness label (ready / caution / not_ready), severity score, top 3 overfitting warnings, validační mode, MC status, execution status, instrument a datový soubor. Zdroj dat: `assessOverfitting()` z `overfittingSignals.ts`. Přechod od „klikej na Analytics → rozklikni details" k „okamžitá odpověď na jednom místě".
+
+**StatBlocks:** Metriky seskupeny do tří kategorií: **PnL** (return, equity, PF, expectancy, payoff, Kelly), **Risk** (Sharpe, Sortino, DD, recovery, koncentrace) a **Activity** (trades, L/S, win rate). Grid: `auto-fill minmax(7rem,1fr)` — responzivní bez fixní šířky. **ⓘ metodika** schovaná za toggle "Metodika ⓘ" (defaultně off). Color-coded alerts: DD duration, recovery, PnL koncentrace a trade count s barevným rámcem (amber/rose) při nebezpečných hodnotách. Monte Carlo řádek zobrazuje risk of ruin + mode/method.
+
+**Klávesové zkratky:** `1`–`5` přepínají záložky Equity / Highlight / Detailed / Analytics / Run history. Nefungují v inputech/textareách.
 
 **Export JSON:** celý RunResponse ke stažení.
 
@@ -664,9 +779,9 @@ Spustí backtest.
 
 **Query:** `?stream=1` – SSE stream (log, progress, result)
 
-**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `commission_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů), `run_id`, `validation_mode`, `validation_config`, `quality_gates`, `sweep_mode`, `sweep_config`, `monte_carlo`, `regime_config`, `portfolio_config`, `execution_model`, `experiment`
+**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `commission_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů), `run_id`, `validation_mode` (`single` \| `oos_split` \| `walk_forward` \| `param_test`), `validation_config`, `quality_gates`, `sweep_mode`, `sweep_config`, `monte_carlo`, `regime_config`, `portfolio_config`, `execution_model`, `experiment`, volitelně `batch_config`
 
-**Response (non-stream):** RunResponse (equity, equityCurve, metrics incl. `maxEquity`/`maxDrawdownPct`/`maxDrawdownUsd` + `sortinoRatio`/`calmarRatio`/`marRatio`/`ulcerIndex`/`cagr`, trades incl. `mfe`/`mae`/`fees`/`slippageCost`, ohlc, moduleOutputs, `validation`, `robustness`, `monteCarlo` (včetně `method`/`mode`/`note` u Monte Carla), `regimeAnalysis`, `portfolio`, `executionSummary` incl. `costAttribution`/`totalFees`/`totalSlippageCost`/`forwardBridge`, `qualityGate`, `experiment` incl. `runDiff`/`promoteEvidence`/`promoteDecision`=`review_candidate`|`hold`, volitelně `batchSummary`)
+**Response (non-stream):** RunResponse (equity, equityCurve, metrics incl. `maxEquity`/`maxDrawdownPct`/`maxDrawdownUsd` + `sortinoRatio`/`calmarRatio`/`marRatio`/`ulcerIndex`/`cagr` + `maxDrawdownDurationBars`/`maxDrawdownDurationDays`/`timeToRecoveryBars`/`timeToRecoveryDays`/`currentDrawdownPct` + `payoffRatio`/`edgePerTrade`/`kellyFraction`, trades incl. `mfe`/`mae`/`fees`/`slippageCost`, ohlc, moduleOutputs, `drawdownAnalysis` (full DD analysis: `underwaterPct`, `avgDurationBars`, `periodsCount`), `tradePnlDistribution` (histogram, percentiles, skewness, kurtosis, `tailRiskCVaR`, concentration), **`bootstrapCI`** (95% CI pro mean PnL, total return, trade Sharpe; trade-level resampling, 1000 bootstraps; `adjustedAlpha` = 0.05/trialCount Bonferroni), **`payoffDecomposition`** (win/loss rate, avg win/loss, payoff ratio, edge per trade, Kelly fraction), **`overfittingSignals`** (`trialCount`, `bonferroniAlpha`, `multipleTestingNote`), **`propRedFlags`** (`trustLevel`, `flags[]` s `key`/`severity`/`label`/`detail`, `criticalCount`, `warningCount`, `tip`), `validation`, `robustness`, `monteCarlo` (včetně `method`/`mode`/`note` u Monte Carla), `regimeAnalysis`, `portfolio`, `executionSummary` incl. `costAttribution`/`totalFees`/`totalSlippageCost`/`forwardBridge`, `qualityGate`, `experiment` incl. `runDiff`/`promoteEvidence`/`promoteDecision`=`review_candidate`|`hold`, volitelně `batchSummary`)
 
 **SSE events (stream=1):**
 - `{"type": "log", "line": "..."}`
@@ -686,7 +801,7 @@ OHLC data + volitelné markery a čáry z modulu/indikátoru/strategie pro View 
 - `detect(ohlc, params=None)` → markery: `[{"date", "type": "high"|"low"|"signal", "value"}, ...]`
 - `get_line(ohlc, params=None)` → čáry: `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}`
 
-**View sandbox execution:** Pokud je v requestu `module_code`, backend spouští `view_engine.py` uvnitř Docker sandboxu.
+**View execution:** Pokud je v requestu `module_code`, backend spouští `view_engine.py` jako host subprocess (stejný Python jako backend).
 
 **View params:** Pokud modul definuje `VIEW_PARAMS = {...}`, frontend posílá `params` v requestu; backend předává `params` do `detect`/`get_line` (pokud funkce druhý argument přijímá).
 
@@ -746,11 +861,11 @@ Modul **Swing HL** (`examples/swing_hl_detector.py`) vrací:
 
 | Vrstva | Technologie |
 |--------|-------------|
-| Frontend | Next.js 14, React, TailwindCSS, Monaco Editor, TradingView Lightweight Charts |
+| Frontend | Next.js 14, React, TailwindCSS, Monaco Editor, Plotly (react-plotly.js), TradingView Lightweight Charts |
 | Backend | Python 3.11+, FastAPI, uvicorn |
-| Backtest | Backtrader (v Dockeru) |
+| Backtest | Backtrader (`docker/engine.py` — subprocess nebo volitelně in-process) |
 | Data | Firebase Firestore (strategie, indikátory, moduly, results), CSV (OHLCV) |
-| Docker | python:3.11-slim, backtrader, pandas |
+| Engine deps | backtrader, pandas, pyarrow (viz `backend/requirements.txt`) |
 | Graf (PNG) | mplfinance |
 
 ---
@@ -763,15 +878,16 @@ Modul **Swing HL** (`examples/swing_hl_detector.py`) vrací:
 - **Frontend (auth):** `NEXT_PUBLIC_API_AUTH_KEY` – API key posílaný na backend
 - **Backend (security):** `API_AUTH_REQUIRED`, `API_AUTH_KEY`, `API_ALLOW_DEV_BYPASS`, `API_RATE_LIMIT_MAX_REQUESTS`, `API_RATE_LIMIT_WINDOW_SEC`
 - **Backend (optional governance hardening):** `API_STRICT_GOVERNANCE=true` zamítne u klientů bez API klíče eskalaci v `experiment`: `lifecycleStatus` ∈ {approved, promoted}, `reviewerApproved=true`, nebo nastavené `promotedAt`
-- **Backend (timeouts):** `RUN_TIMEOUT_SEC`, `RUN_STREAM_IDLE_TIMEOUT_SEC`, `RUN_DISCONNECT_GRACE_SEC` (prodleva před zabitím kontejneru při odpojení klienta během studeného startu), `VIEW_WORKER_TIMEOUT_SEC`
-- **Backend (manifest):** `BACKTEST_ENGINE_IMAGE_DIGEST` (volitelné, pro audit fingerprint)
+- **Backend (timeouts):** `RUN_TIMEOUT_SEC`, `RUN_STREAM_IDLE_TIMEOUT_SEC`, `RUN_DISCONNECT_GRACE_SEC` (prodleva před ukončením **engine subprocessu** při odpojení klienta během studeného startu), `VIEW_WORKER_TIMEOUT_SEC`
+- **Backend (manifest):** `codeDigest`, `engine` = `host-worker`, volitelně `engineExecutionMode` = `inprocess`; legacy `imageDigest` se z manifestu odstraňuje po normalizaci
 - **Firebase:** konfigurace v `frontend/lib/firebase.ts`
 
 ### Runner
 
-- Timeout: default **300s** (`RUN_TIMEOUT_SEC=300`), optional env override
-- Stream idle: default **300s** (`RUN_STREAM_IDLE_TIMEOUT_SEC`) — import pandas/backtrader v kontejneru může dlouho nic nepsat na stdout
-- Docker: `--memory=2g`, `--cpus=1`, `--network none`
+- Timeout: default **3600s** wall-clock (env `RUN_TIMEOUT_SEC` nebo request `run_timeout_sec`; `0` = bez limitu)
+- Stream idle: default **1800s** (`RUN_STREAM_IDLE_TIMEOUT_SEC`) — žádný log/progress z engine po tuto dobu = považovat za zásek
+- **In-process engine** je nyní výchozí (eliminuje subprocess overhead). Pro subprocess: `RUN_INPROCESS_ENGINE=0`.
+- `MAX_OHLC_EXPORT_BARS` — server-side OHLC bar cap (default 8000). Delší série se uniform-downsampleují.
 
 ---
 
@@ -793,9 +909,22 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 ### 8.1 Metodické limity (shrnutí)
 
 - **Monte Carlo:** `riskOfRuin` je **odhad z bootstrapu** (náhodné přeuspořádání PnL), ne pravděpodobnost z reálné distribuce trhu. Pole `method`/`mode`/`note` ve výsledku popisují použitý postup.
-- **Profit factor:** při nule ztrátových obchodů může engine vrátit sentinel (např. `null` nebo velké číslo) – UI zobrazuje „∞ / N/A“. Při sweep scoringu se PF capuje, aby sentinel nezkresloval ranking.
+- **Profit factor:** poměr hrubého zisku a hrubé ztráty z uzavřených obchodů. **Bez ztrátových obchodů** je poměr matematicky nedefinovaný: `metrics.profitFactor` je **`null`**, `metrics.profitFactorStatus` je např. `undefined_no_losing_trades` (ne číselný sentinel 999). Pro **řazení ve sweepu** engine používá interní konečné `forScoring`, ne JSON null. Starší uložené runy mohou mít ještě vysoký číselný sentinel — UI ho bere jako legacy.
+- **Sharpe:** hlavní `sharpeRatio` je annualizovaný z equity křivky (stejná logika jako Sortino); `sharpeRatioLegacyAnalyzer` je hodnota z Backtrader `SharpeRatio` analyzéru pro srovnání.
+- **Portfolio:** `portfolio.model` = `independent_isolated_capital_per_instrument` — každý instrument má izolovaný kapitál; `weightedIndependentReturnUsd` / `weightedIndependentMaxDrawdownPct` jsou vážené průměry metrik, ne jedna multi-asset equity cesta (viz `disclaimer` v JSON).
+- **Execution latency:** `slippage_latency_proxy_bars` (alias `latency_bars`) zvyšuje efektivní slippage %, **neodkládá** objednávky v čase.
+- **CSV bez volume:** při chybějícím sloupci engine/view doplní **syntetické volume=1000** a zaloguje varování — strategie závislé na reálném objemu nejsou validní.
 - **Walk-forward / OOS:** fold-level metriky a `guardrails` jsou **heuristiky** (varování před možným leakage nebo slabým foldem), ne důkaz absence leakage.
 - **Overfitting / readiness (UI):** záložka Analytics a sloupec v Run history používají sdílenou **heuristickou** sadu pravidel (single run, počet obchodů, MC risk of ruin, quality gate, sweep na single, degradace train→test, selhání fold gates, guardrails, stabilita sweepu, velikost batch dávky, extrémní PF). Jde o orientační signál, ne statistický test.
+- **Drawdown duration (`drawdownAnalysis`):** `maxDrawdownDurationBars` / `Days` měří nejdelší nepřerušený pokles od vrcholu k dnu; `timeToRecoveryBars` / `Days` = bary/dny od dna zpět na nový vrchol equity (nebo null pokud nedošlo k recovery). `underwaterPct` = procento barů pod předchozím maximem; `periodsCount` = celkový počet drawdown epizod.
+- **Trade PnL distribution (`tradePnlDistribution`):** histogram uzavřených PnL, percentily (p5–p95), skewness, kurtosis, `tailRiskCVaR` (podmíněná hodnota v riziku na 5. percentilu), `concentration.top5PnlPct` = podíl celkového zisku z top 5 obchodů (vysoká koncentrace = závislost na málo obchodech).
+- **Stress multiplier (`execution_model.stress_multiplier`):** násobí slippage/spread penaltu v execution modelu; výchozí 1.0 (žádný stress), hodnota > 1 simuluje horší podmínky plnění (např. 1.5 = 50 % přirážka na tření). V UI jako vstupní pole **Stress multiplier** v sekci Execution Model (Edge finding).
+- **Portfolio model:** `portfolio.model` v odpovědi — např. `independent_isolated_capital_per_instrument`; UI zobrazuje banner s popisem modelu a disclaimerem (portfoliové metriky jsou vážené průměry, ne multi-asset equity).
+- **Bootstrap CI (`bootstrapCI`):** 95% intervaly spolehlivosti (mean PnL, total return, trade-level Sharpe) pomocí **trade-level resamplingU** (1 000 bootstrapů). `adjustedAlpha` = 0.05 / `trialCount` (naivní Bonferroni korekce na počet nezávislých pokusů K z manifestu). Předpokládá nezávislost obchodů (IID); při silné sériové korelaci PnL interpretuj opatrně.
+- **Payoff decomposition (`payoffDecomposition`):** rozklad edge na win rate × avg win − loss rate × avg loss; `payoffRatio` = avg win / avg loss; `kellyFraction` = Kelly kritérium pro position sizing. Kelly předpokládá přesné pravděpodobnosti a nezávislé sázky — v praxi se obvykle bere **half-Kelly nebo méně**.
+- **Multiple testing / trial count (`overfittingSignals`):** `trialCount` K = sweep samples × batch runs × folds; naivní **Bonferroni α = 0.05 / K**. Je to konzervativní horní odhad — při korelovaných pokusech (podobné parametry) je skutečná korekce slabší. UI zobrazuje strip s K a upravenou α.
+- **Prop red flags (`propRedFlags`):** engine funkce `_compute_prop_red_flags()` automaticky skenuje výsledky z pohledu prop-firm reviewer. Vrací `trustLevel` (not_trustworthy / low_trust / cautious / acceptable) a seznam `flags` s `severity` (critical / warning). Kontrolované vzory: extrémně vysoký Sharpe s málo obchody, méně než 10 obchodů (critical) / méně než 30 (warning), nulové ztráty / win rate > 95 %, nedefinovaný PF (sentinel), single run bez validace, vypnutý execution model, kombinace single + no execution (minimální věrohodnost), podezřele nízký DD, příliš hladká equity (> 92 % barů rostoucích), bootstrap CI protínající nulu, koncentrace PnL (top 5 > 80 %). UI zobrazuje trust banner pod exportem a detailní sekci v Analytics.
+- **„Not a broker" disclaimer (`executionSummary`):** v Analytics u execution summary se zobrazuje upozornění, že execution model je **zjednodušená aproximace** (lineární slippage, bez market impact, bez modelování kapacity a book depth). Není to broker-level simulace a výsledky nelze přímo srovnávat s reálným plněním.
 - **Governance:** schvalování z UI zapisuje metadata do Firestore; **server-only** enforcement (Phase 6b) vyžaduje backend proxy nebo Cloud Functions – viz READMEAI.
 
 ---
@@ -816,8 +945,8 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 | 429 Rate limit | Příliš mnoho requestů ve window | Uprav `API_RATE_LIMIT_MAX_REQUESTS` / `API_RATE_LIMIT_WINDOW_SEC` |
 | Instrument se nenačítá | Instrument Type ≠ typ dat | Zkontroluj, že máš vybraný správný Instrument Type (Futures pro NQ) |
 | Žádné instrumenty | Data složka prázdná nebo špatná cesta | Zkontroluj `GET /api/data/debug`, strukturu `data/mock/` |
-| Backtest selže | Docker neběží, chyba ve strategii | Zkontroluj `docker ps`, logy v LogPanelu, `.backtest_run/last_error_strategy.py` |
-| **exit 130 / KeyboardInterrupt** v logu engine | Přerušení procesu (SIGINT), ne chyba pandas | Nejčastěji Zastavit v UI, zavření záložky, nebo ruční stop kontejneru. Zkus znovu; po změně `engine.py` znovu `docker build -t backtest-engine backend/docker` |
+| Backtest selže | Chybějící závislosti (Backtrader, pyarrow), chyba ve strategii | `pip install -r backend/requirements.txt`, logy v LogPanelu, `.backtest_run/last_error_strategy.py` |
+| **exit 130 / KeyboardInterrupt** v logu engine | Přerušení procesu (SIGINT), ne chyba pandas | Nejčastěji Zastavit v UI nebo zavření záložky. Zkus znovu. |
 | CORS chyba | Backend jiný port/origin | Nastav `allow_origins` v main.py nebo `NEXT_PUBLIC_API_URL` |
 | Firebase chyba | Chybějící konfigurace | Zkontroluj `firebase.ts`, service account / API key |
 | **FirebaseError: Missing or insufficient permissions** | Firestore pravidla blokují zápis | Nasazení pravidel: `firebase deploy --only firestore:rules` (v root projektu) |
@@ -830,7 +959,9 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 
 - **READMEADAM.md** – uživatelská mapa celé aplikace (UI, Edge finding, výsledky, kde je nápověda)
 - **READMEAI.md** – reference pro AI/boty: architektura, data flow, API kontrakty, kde měnit kód
-- **SCRIPTS.md** – příkazy pro spuštění (Docker, backend, frontend), troubleshooting
+- **audit/README.md** – index uložených auditů (risk, DS, prop, trader, výkon, UX)
+- **docs/QUANT_AUDIT.md** – technický quant audit (data pipeline, exekuce, metriky engine)
+- **SCRIPTS.md** – příkazy pro spuštění (backend, frontend), troubleshooting
 - **strategies/test/readme.py** – tutoriál psaní strategií (Backtrader API, životní cyklus, příklady)
 - **examples/view_interface.md** – rozhraní pro View (detect, get_line, VIEW_PARAMS)
 - **examples/ema_indicator_mock.py** – příklad indikátoru s VIEW_PARAMS (period, color)

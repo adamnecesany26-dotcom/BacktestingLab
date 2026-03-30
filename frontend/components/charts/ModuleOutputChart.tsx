@@ -2,7 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { isViewRegimeHistogramLine } from "@/lib/api";
+import {
+  HL_TREND_STATE_COLORS,
+  lineDataHasTrendState,
+  groupDateTrendSegments,
+} from "@/lib/viewChartLines";
 import type { OhlcBar, ModuleOutput, ModuleZone, Trade } from "@shared/types";
+import { zoneTimeBoundsForOhlc } from "@/lib/zoneChartAlign";
 
 type VisibilityKey =
   | "entry_markers"
@@ -165,6 +171,20 @@ function buildZoneTouchMarkerTraceDateAxis(ohlc: OhlcBar[], zones: ModuleZone[] 
   };
 }
 
+function zoneMetaPrice(zm: unknown, keys: string[]): number | null {
+  if (!zm || typeof zm !== "object") return null;
+  const o = zm as Record<string, unknown>;
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string") {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return null;
+}
+
 interface ModuleOutputChartProps {
   ohlc: OhlcBar[];
   moduleName: string;
@@ -173,6 +193,15 @@ interface ModuleOutputChartProps {
   height?: number;
   /** RRR styl: kruhy entry/exit, tělo obchodu + MFE (modře) + MAE (fialově) z polí trade.mfe / trade.mae */
   rrrTradeStyle?: boolean;
+  /**
+   * Detailed view: bez MFE/MAE; entry/exit + stop / take profit z zoneMeta (stopPrice, targetPrice, …).
+   * Čáry / zóny z moduleOutputs zůstávají (RSI, S/D, …).
+   */
+  orderLevelsMode?: boolean;
+  /**
+   * Touch markery z touch_bar_index jsou indexy do aktuálního OHLC pole — po agregaci TF jsou nesmyslné.
+   */
+  showZoneTouchByIndex?: boolean;
 }
 
 const MARKER_COLORS: Record<string, string> = {
@@ -218,6 +247,8 @@ export function ModuleOutputChart({
   trades = [],
   height = 480,
   rrrTradeStyle = false,
+  orderLevelsMode = false,
+  showZoneTouchByIndex = true,
 }: ModuleOutputChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [visibilityPanelOpen, setVisibilityPanelOpen] = useState(false);
@@ -226,6 +257,15 @@ export function ModuleOutputChart({
   useEffect(() => {
     import("react-plotly.js").then((mod) => setPlot(() => mod.default));
   }, []);
+
+  useEffect(() => {
+    if (!orderLevelsMode) return;
+    setVisibility((prev) => ({
+      ...prev,
+      trade_mfe: false,
+      trade_mae: false,
+    }));
+  }, [orderLevelsMode]);
 
   if (!Plot || ohlc.length === 0) {
     return (
@@ -267,8 +307,8 @@ export function ModuleOutputChart({
   const tradeShapes: any[] = [];
   const EPS = 1e-9;
 
-  const resolveBar = (iso: string) =>
-    rrrTradeStyle ? findNearestBarDate(ohlc, iso) : findBarDate(ohlc, iso);
+  const useNearestBar = rrrTradeStyle || orderLevelsMode;
+  const resolveBar = (iso: string) => (useNearestBar ? findNearestBarDate(ohlc, iso) : findBarDate(ohlc, iso));
 
   for (const t of trades) {
     const entryDate = t.entryDate ?? t.date ?? "";
@@ -302,7 +342,7 @@ export function ModuleOutputChart({
     const x0 = entryTs <= exitTs ? entryBarDate : exitBarDate;
     const x1 = entryTs <= exitTs ? exitBarDate : entryBarDate;
 
-    if (rrrTradeStyle) {
+    if (rrrTradeStyle && !orderLevelsMode) {
       const isLong = t.type === "buy";
       const mfe = typeof t.mfe === "number" && Number.isFinite(t.mfe) ? t.mfe : 0;
       const mae = typeof t.mae === "number" && Number.isFinite(t.mae) ? t.mae : 0;
@@ -396,6 +436,33 @@ export function ModuleOutputChart({
         layer: "below",
       });
     }
+
+    if (orderLevelsMode) {
+      const sl = zoneMetaPrice(t.zoneMeta, ["stopPrice", "stop_loss", "sl", "stop"]);
+      const tp = zoneMetaPrice(t.zoneMeta, ["targetPrice", "takeProfit", "tp", "target"]);
+      if (sl != null) {
+        tradeShapes.push({
+          type: "line",
+          x0,
+          x1,
+          y0: sl,
+          y1: sl,
+          line: { color: "rgba(248, 113, 113, 0.95)", width: 2, dash: "6px,4px" },
+          layer: "below",
+        });
+      }
+      if (tp != null) {
+        tradeShapes.push({
+          type: "line",
+          x0,
+          x1,
+          y0: tp,
+          y1: tp,
+          line: { color: "rgba(74, 222, 128, 0.95)", width: 2, dash: "6px,4px" },
+          layer: "below",
+        });
+      }
+    }
   }
 
   if (visibility.entry_markers && entryX.length > 0) {
@@ -403,17 +470,17 @@ export function ModuleOutputChart({
       type: "scatter",
       x: entryX,
       y: entryY,
-      mode: rrrTradeStyle ? "markers+text" : "markers",
+      mode: rrrTradeStyle || orderLevelsMode ? "markers+text" : "markers",
       marker: {
-        size: rrrTradeStyle ? 11 : 10,
+        size: rrrTradeStyle || orderLevelsMode ? 11 : 10,
         color: rrrTradeStyle ? entryMarkerColors : "#3b82f6",
-        symbol: rrrTradeStyle ? "circle" : "triangle-up",
+        symbol: rrrTradeStyle || orderLevelsMode ? "circle" : "triangle-up",
         line: { color: "#fff", width: 1 },
       },
       name: "Entry",
       showlegend: true,
     };
-    if (rrrTradeStyle) {
+    if (rrrTradeStyle || orderLevelsMode) {
       entryTrace.text = entryX.map(() => "entry");
       entryTrace.textposition = "top center";
       entryTrace.textfont = { size: 9, color: "#d4d4d8", family: "system-ui, sans-serif" };
@@ -425,17 +492,17 @@ export function ModuleOutputChart({
       type: "scatter",
       x: exitX,
       y: exitY,
-      mode: rrrTradeStyle ? "markers+text" : "markers",
+      mode: rrrTradeStyle || orderLevelsMode ? "markers+text" : "markers",
       marker: {
-        size: rrrTradeStyle ? 11 : 10,
+        size: rrrTradeStyle || orderLevelsMode ? 11 : 10,
         color: rrrTradeStyle ? exitMarkerColors : "#f97316",
-        symbol: rrrTradeStyle ? "circle" : "triangle-down",
+        symbol: rrrTradeStyle || orderLevelsMode ? "circle" : "triangle-down",
         line: { color: "#fff", width: 1 },
       },
       name: "Exit",
       showlegend: true,
     };
-    if (rrrTradeStyle) {
+    if (rrrTradeStyle || orderLevelsMode) {
       exitTrace.text = exitX.map(() => "exit");
       exitTrace.textposition = "bottom center";
       exitTrace.textfont = { size: 9, color: "#d4d4d8", family: "system-ui, sans-serif" };
@@ -554,7 +621,7 @@ export function ModuleOutputChart({
     const tO = buildInducementMarkerTraceDateAxis(ohlc, inducementOther, "#64748b", "Inducement");
     if (tO) traces.push(tO);
   }
-  if (visibility.demand_supply_zones) {
+  if (visibility.demand_supply_zones && showZoneTouchByIndex) {
     const tt = buildZoneTouchMarkerTraceDateAxis(ohlc, zones);
     if (tt) traces.push(tt);
   }
@@ -565,18 +632,61 @@ export function ModuleOutputChart({
     lines.forEach((line, i) => {
       if (isViewRegimeHistogramLine(line)) return;
       const pts = line.data ?? [];
-      if (pts.length > 0) {
+      if (pts.length === 0) return;
+      const fallback = line.color ?? lineColors[i % lineColors.length];
+      if (line.color) {
+        const text = pts.map((p) => {
+          const st = (p as { state?: string; score?: number }).state;
+          const sc = (p as { state?: string; score?: number }).score;
+          if (st != null && String(st).length > 0) {
+            return sc != null && Number.isFinite(Number(sc))
+              ? `${st} · ${Number(sc).toFixed(0)}<extra></extra>`
+              : `${st}<extra></extra>`;
+          }
+          return "%{y:.4f}<extra></extra>";
+        });
         traces.push({
           type: "scatter",
           x: pts.map((p: { date: string }) => p.date),
           y: pts.map((p: { value: number }) => p.value),
           mode: "lines",
-          line: { color: line.color ?? lineColors[i % lineColors.length], width: 2 },
+          line: { color: line.color, width: 2 },
           name: line.name ?? "line",
           legendgroup: line.name ?? "line",
           showlegend: true,
+          hovertemplate: "%{text}",
+          text,
         });
+        return;
       }
+      if (lineDataHasTrendState(pts)) {
+        const segs = groupDateTrendSegments(pts);
+        segs.forEach((seg, si) => {
+          traces.push({
+            type: "scatter",
+            x: seg.x,
+            y: seg.y,
+            mode: "lines",
+            line: { color: HL_TREND_STATE_COLORS[seg.state] ?? fallback, width: 2 },
+            name: line.name ?? "line",
+            legendgroup: line.name ?? "line",
+            showlegend: si === 0,
+            hovertemplate: "%{text}",
+            text: seg.text,
+          });
+        });
+        return;
+      }
+      traces.push({
+        type: "scatter",
+        x: pts.map((p: { date: string }) => p.date),
+        y: pts.map((p: { value: number }) => p.value),
+        mode: "lines",
+        line: { color: fallback, width: 2 },
+        name: line.name ?? "line",
+        legendgroup: line.name ?? "line",
+        showlegend: true,
+      });
     });
   }
 
@@ -594,6 +704,7 @@ export function ModuleOutputChart({
     if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
     if (isPremiumDiscountZone(z.name) && !visibility.premium_discount_zones) continue;
 
+    const { x0, x1 } = zoneTimeBoundsForOhlc(z, ohlc);
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
     const isLine = z.value_low === z.value_high;
     const lineColor = getZoneLineColor(z.name);
@@ -601,8 +712,8 @@ export function ModuleOutputChart({
     if (isLine) {
       zoneShapes.push({
         type: "line",
-        x0: z.date_start,
-        x1: z.date_end,
+        x0,
+        x1,
         y0: z.value_low,
         y1: z.value_high,
         line: { width: 2, color: lineColor, dash: "solid" },
@@ -611,8 +722,8 @@ export function ModuleOutputChart({
     } else {
       zoneShapes.push({
         type: "rect",
-        x0: z.date_start,
-        x1: z.date_end,
+        x0,
+        x1,
         y0: z.value_low,
         y1: z.value_high,
         fillcolor: fill,
@@ -641,9 +752,12 @@ export function ModuleOutputChart({
       if (im !== null && (z.name === "Demand" || z.name === "Supply")) label += ` IM:${im}`;
       if (hasIp) label += ` IP:${ipCount},${ipPoints}`;
       if (z.name === "Demand" && adBelow > 0) label += ` ↓${adBelow}`;
-      const t1 = new Date(z.date_start).getTime();
-      const t2 = new Date(z.date_end).getTime();
-      const midDate = new Date((t1 + t2) / 2).toISOString();
+      const t1 = new Date(x0).getTime();
+      const t2 = new Date(x1).getTime();
+      const midDate =
+        Number.isFinite(t1) && Number.isFinite(t2)
+          ? new Date((t1 + t2) / 2).toISOString()
+          : x0;
       const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
       zoneAnnotations.push({
         x: midDate,
@@ -657,13 +771,14 @@ export function ModuleOutputChart({
     }
   }
 
-  const rrrVisibilityOptions: { key: VisibilityKey; label: string; hasData: boolean }[] = rrrTradeStyle
-    ? [
-        { key: "trade_rrr_body", label: "RRR: realizace (zelená / červená)", hasData: trades.length > 0 },
-        { key: "trade_mfe", label: "RRR: MFE jen mimo tělo (modře)", hasData: trades.length > 0 },
-        { key: "trade_mae", label: "RRR: MAE jen mimo tělo (fialově)", hasData: trades.length > 0 },
-      ]
-    : [];
+  const rrrVisibilityOptions: { key: VisibilityKey; label: string; hasData: boolean }[] =
+    rrrTradeStyle && !orderLevelsMode
+      ? [
+          { key: "trade_rrr_body", label: "RRR: realizace (zelená / červená)", hasData: trades.length > 0 },
+          { key: "trade_mfe", label: "RRR: MFE jen mimo tělo (modře)", hasData: trades.length > 0 },
+          { key: "trade_mae", label: "RRR: MAE jen mimo tělo (fialově)", hasData: trades.length > 0 },
+        ]
+      : [];
 
   const visibilityOptions: { key: VisibilityKey; label: string; hasData: boolean }[] = [
     { key: "entry_markers", label: "Entry (vstupy)", hasData: entryX.length > 0 },
@@ -692,7 +807,7 @@ export function ModuleOutputChart({
       gridcolor: "#27272a",
       rangeslider: { visible: true, thickness: 0.05, bgcolor: "#27272a" },
       fixedrange: false,
-      ...(rrrTradeStyle
+      ...((rrrTradeStyle || orderLevelsMode)
         ? {
             rangebreaks: [{ bounds: ["sat", "mon"] }],
           }
@@ -700,7 +815,7 @@ export function ModuleOutputChart({
     },
     yaxis: {
       gridcolor: "#27272a",
-      tickformat: rrrTradeStyle ? `.${inferPriceDecimalPlaces(ohlc)}f` : ".2f",
+      tickformat: rrrTradeStyle || orderLevelsMode ? `.${inferPriceDecimalPlaces(ohlc)}f` : ".2f",
       fixedrange: false,
     },
     dragmode: "zoom",

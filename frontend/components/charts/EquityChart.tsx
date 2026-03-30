@@ -1,61 +1,70 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import type { ComponentType } from "react";
 
-const DEFAULT_MAX_POINTS = 6000;
+/**
+ * Osa Y bez nuly: vizuálně „zoom“ kolem dat.
+ * Spodní mez = nejbližší hrubší dělení pod minimum (krok ≈ ¼ řádu hodnoty, typ. u ~100k USD je krok 25k),
+ * takže např. min equity 90–93k → spodní okraj osy často 75k, 80k… (ne od 0).
+ * Horní mez = nad maximum + malý odstup, zaokrouhleno nahoru ke stejnému kroku.
+ */
+function computeEquityYRange(values: number[]): [number, number] {
+  const finite = values.filter((v) => Number.isFinite(v));
+  if (finite.length === 0) return [0, 1];
 
-function parseToUnixSeconds(value: string | undefined, fallbackIndex: number): number {
-  if (value == null || value === "") {
-    return Math.floor(Date.UTC(1970, 0, 1) / 1000) + fallbackIndex;
+  const lo = Math.min(...finite);
+  const hi = Math.max(...finite);
+  if (lo === hi) {
+    const pad = Math.max(Math.abs(lo) * 0.02, 1);
+    return [lo - pad, hi + pad];
   }
-  const parsed = Date.parse(value);
-  if (Number.isFinite(parsed)) {
-    return Math.floor(parsed / 1000);
-  }
-  const asNum = Number(value);
-  if (Number.isFinite(asNum)) {
-    return Math.floor(Date.UTC(1970, 0, 1) / 1000) + asNum;
-  }
-  return Math.floor(Date.UTC(2020, 0, 1) / 1000) + fallbackIndex;
+
+  const span = hi - lo;
+  const k = Math.floor(Math.log10(Math.max(lo, 1e-9)));
+  // 2,5 × 10^(k−1): u účtů řádu 10^5 dá krok 25 000; u menších částek menší krok
+  const step = Math.pow(10, Math.max(0, k - 1)) * 2.5;
+
+  const cushionBelow = Math.max(span * 0.1, step * 0.15);
+  const cushionAbove = Math.max(span * 0.06, step * 0.15);
+
+  let yMin = Math.floor((lo - cushionBelow) / step) * step;
+  if (yMin >= lo - span * 0.005) yMin -= step;
+
+  let yMax = Math.ceil((hi + cushionAbove) / step) * step;
+  if (yMax <= hi + span * 0.005) yMax += step;
+
+  return [yMin, yMax];
 }
 
-function enforceStrictlyIncreasingTime(points: { time: number; value: number }[]): { time: number; value: number }[] {
-  if (points.length === 0) return [];
-  const out: { time: number; value: number }[] = [];
-  let prev = -Infinity;
-  for (const p of points) {
-    let t = p.time;
-    if (t <= prev) t = prev + 1;
-    out.push({ time: t, value: p.value });
-    prev = t;
-  }
-  return out;
-}
-
-function downsampleEquity(
-  points: { time: number; value: number }[],
+function downsamplePairs(
+  dates: string[],
+  values: number[],
   maxPoints: number
-): { time: number; value: number }[] {
-  if (points.length <= maxPoints) return points;
-  const out: { time: number; value: number }[] = [];
-  out.push(points[0]);
+): { dates: string[]; values: number[] } {
+  const n = dates.length;
+  if (n <= maxPoints) return { dates, values };
+  const outD: string[] = [dates[0]];
+  const outV: number[] = [values[0]];
   const inner = maxPoints - 2;
-  const n = points.length;
   for (let i = 0; i < inner; i++) {
     const idx = 1 + Math.floor(((i + 0.5) * (n - 2)) / inner);
-    out.push(points[Math.min(idx, n - 2)]);
+    const j = Math.min(idx, n - 2);
+    outD.push(dates[j]);
+    outV.push(values[j]);
   }
-  out.push(points[n - 1]);
-  return out;
+  outD.push(dates[n - 1]);
+  outV.push(values[n - 1]);
+  return { dates: outD, values: outV };
 }
 
-/** TradingView Lightweight Charts – equity; tlačítko „fit“ přes fitTick (ref se plní async). */
+/** Equity: Plotly, osa X = datum, osa Y = hodnota účtu. */
 export function EquityChart({
   equity,
-  height = 200,
+  height = 340,
   dates,
   equityCurve,
-  maxPoints = DEFAULT_MAX_POINTS,
+  maxPoints,
 }: {
   equity?: number[];
   height?: number;
@@ -63,151 +72,104 @@ export function EquityChart({
   equityCurve?: { date: string; value: number }[];
   maxPoints?: number;
 }) {
-  const chartRef = useRef<HTMLDivElement>(null);
-  const chartInstanceRef = useRef<ReturnType<typeof import("lightweight-charts").createChart> | null>(null);
-  const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const [fitTick, setFitTick] = useState(0);
+  const pointCap = maxPoints ?? Number.POSITIVE_INFINITY;
+  const [Plot, setPlot] = useState<ComponentType<any> | null>(null);
 
-  const rawSeries = useMemo(() => {
-    const fromCurve =
-      equityCurve?.map((p, i) => ({
-        time: parseToUnixSeconds(p.date, i),
-        value: p.value,
-      })) ??
-      (equity ?? []).map((v, i) => ({
-        time: parseToUnixSeconds(dates?.[i], i),
-        value: v,
-      }));
-    return fromCurve;
-  }, [equityCurve, equity, dates]);
-
-  const chartData = useMemo(() => {
-    const inc = enforceStrictlyIncreasingTime(rawSeries);
-    return downsampleEquity(inc, maxPoints);
-  }, [rawSeries, maxPoints]);
-
-  const downsampleNote = useMemo(() => {
-    if (rawSeries.length > maxPoints) {
-      return `Zobrazeno ${chartData.length} bodů z ${rawSeries.length} (celý rozsah období).`;
-    }
-    return null;
-  }, [rawSeries.length, chartData.length, maxPoints]);
-
-  const fitAll = useCallback(() => {
-    setFitTick((x) => x + 1);
+  useEffect(() => {
+    import("react-plotly.js").then((mod) => setPlot(() => mod.default));
   }, []);
 
-  useEffect(() => {
-    if (!chartRef.current || chartData.length === 0) return;
-
-    let mounted = true;
-    resizeObserverRef.current?.disconnect();
-    resizeObserverRef.current = null;
-
-    void import("lightweight-charts").then(({ createChart }) => {
-      if (!mounted || !chartRef.current) return;
-      chartInstanceRef.current?.remove();
-      chartInstanceRef.current = null;
-
-      const el = chartRef.current!;
-      const w = Math.max(el.clientWidth || el.getBoundingClientRect().width || 300, 200);
-
-      const chart = createChart(el, {
-        width: w,
-        height,
-        layout: {
-          background: { color: "#18181b" },
-          textColor: "#a1a1aa",
-        },
-        grid: {
-          vertLines: { color: "#27272a" },
-          horzLines: { color: "#27272a" },
-        },
-        timeScale: {
-          borderColor: "#3f3f46",
-          rightOffset: 4,
-          fixLeftEdge: false,
-          fixRightEdge: false,
-        },
-        rightPriceScale: {
-          borderColor: "#3f3f46",
-        },
-      });
-      chartInstanceRef.current = chart;
-
-      const series = chart.addAreaSeries({
-        lineColor: "#10b981",
-        topColor: "rgba(16, 185, 129, 0.4)",
-        bottomColor: "rgba(16, 185, 129, 0)",
-      });
-
-      series.setData(
-        chartData.map((d) => ({
-          time: d.time as import("lightweight-charts").UTCTimestamp,
-          value: d.value,
-        }))
-      );
-
-      const doFit = () => {
-        try {
-          chart.timeScale().fitContent();
-        } catch {
-          /* ignore */
-        }
-      };
-      doFit();
-      requestAnimationFrame(() => {
-        doFit();
-        requestAnimationFrame(doFit);
-      });
-
-      const ro = new ResizeObserver(() => {
-        if (!chartRef.current || !chartInstanceRef.current) return;
-        const nw = Math.max(chartRef.current.clientWidth, 200);
-        chartInstanceRef.current.applyOptions({ width: nw });
-        chartInstanceRef.current.timeScale().fitContent();
-      });
-      ro.observe(el);
-      resizeObserverRef.current = ro;
-    });
-
-    return () => {
-      mounted = false;
-      resizeObserverRef.current?.disconnect();
-      resizeObserverRef.current = null;
-      chartInstanceRef.current?.remove();
-      chartInstanceRef.current = null;
+  const { xDates, yEquity, rawCount } = useMemo(() => {
+    if (equityCurve?.length) {
+      const d = equityCurve.map((p) => p.date);
+      const v = equityCurve.map((p) => p.value);
+      return { xDates: d, yEquity: v, rawCount: d.length };
+    }
+    const v = equity ?? [];
+    const d = dates ?? v.map((_, i) => String(i));
+    const n = Math.min(d.length, v.length);
+    return {
+      xDates: d.slice(0, n),
+      yEquity: v.slice(0, n),
+      rawCount: n,
     };
-  }, [chartData, height]);
+  }, [equityCurve, equity, dates]);
 
-  /** Tlačítko „Celé období“ – ref se nastaví až po async importu, proto samostatný efekt. */
-  useEffect(() => {
-    if (fitTick === 0) return;
-    const run = () => {
-      const chart = chartInstanceRef.current;
-      if (!chart) return;
-      try {
-        chart.timeScale().fitContent();
-      } catch {
-        /* ignore */
-      }
-    };
-    run();
-    let raf1 = 0;
-    let raf2 = 0;
-    raf1 = requestAnimationFrame(() => {
-      run();
-      raf2 = requestAnimationFrame(run);
-    });
-    const t1 = window.setTimeout(run, 80);
-    return () => {
-      cancelAnimationFrame(raf1);
-      cancelAnimationFrame(raf2);
-      clearTimeout(t1);
-    };
-  }, [fitTick]);
+  const { plotX, plotY } = useMemo(() => {
+    if (!Number.isFinite(pointCap) || rawCount <= pointCap) {
+      return { plotX: xDates, plotY: yEquity };
+    }
+    const { dates: d, values: vals } = downsamplePairs(xDates, yEquity, Math.floor(pointCap));
+    return { plotX: d, plotY: vals };
+  }, [xDates, yEquity, rawCount, pointCap]);
 
-  if (rawSeries.length === 0) {
+  const downsampleNote = useMemo(() => {
+    if (Number.isFinite(pointCap) && rawCount > pointCap) {
+      return `Zobrazeno ${plotX.length} bodů z ${rawCount} (kvůli výkonu).`;
+    }
+    return null;
+  }, [pointCap, rawCount, plotX.length]);
+
+  /** Rozsah Y z celé série (ne z downsample), ať osa odpovídá skutečnému min/max. */
+  const yRange = useMemo(() => computeEquityYRange(yEquity), [yEquity]);
+
+  const trace = useMemo(
+    () => ({
+      type: "scatter" as const,
+      mode: "lines" as const,
+      x: plotX,
+      y: plotY,
+      fill: "tozeroy",
+      fillcolor: "rgba(16, 185, 129, 0.35)",
+      line: { color: "#10b981", width: 2 },
+      hovertemplate: "%{x}<br>Equity: %{y:,.2f}<extra></extra>",
+    }),
+    [plotX, plotY]
+  );
+
+  const layout = useMemo(
+    () => ({
+      height,
+      margin: { t: 24, r: 16, b: 48, l: 56 },
+      paper_bgcolor: "#18181b",
+      plot_bgcolor: "#18181b",
+      font: { color: "#a1a1aa", size: 11 },
+      xaxis: {
+        title: { text: "Čas", font: { size: 11, color: "#71717a" } },
+        type: "date" as const,
+        gridcolor: "#27272a",
+        rangeslider: { visible: false },
+        fixedrange: false,
+        automargin: true,
+      },
+      yaxis: {
+        title: { text: "Equity", font: { size: 11, color: "#71717a" } },
+        gridcolor: "#27272a",
+        tickformat: ",.2f",
+        fixedrange: false,
+        automargin: true,
+        range: yRange,
+        autorange: false,
+        rangemode: "normal" as const,
+      },
+      showlegend: false,
+      dragmode: "zoom" as const,
+    }),
+    [height, yRange]
+  );
+
+  const config = useMemo(
+    () => ({
+      responsive: true,
+      displayModeBar: true,
+      displaylogo: false,
+      scrollZoom: true,
+      modeBarButtonsToRemove: ["lasso2d", "select2d"],
+    }),
+    []
+  );
+
+  if (rawCount === 0) {
     return (
       <div className="h-[200px] rounded-lg bg-zinc-900 flex items-center justify-center text-zinc-500 text-sm">
         No equity data
@@ -215,23 +177,39 @@ export function EquityChart({
     );
   }
 
+  if (!Plot) {
+    return (
+      <div
+        className="flex items-center justify-center text-zinc-500 text-sm rounded-lg bg-zinc-900"
+        style={{ height }}
+      >
+        Načítání grafu…
+      </div>
+    );
+  }
+
   return (
     <div className="w-full h-full flex flex-col min-h-0 gap-2">
-      <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+      <div className="shrink-0">
         {downsampleNote ? (
           <p className="text-xs text-zinc-500">{downsampleNote}</p>
         ) : (
-          <p className="text-xs text-zinc-500">Celé období backtestu (osa X = čas podle dat engine).</p>
+          <p className="text-xs text-zinc-500">
+            Zobrazeno všech {rawCount} bodů. Osa Y je zúžena kolem min/max equity, ne od nuly.
+          </p>
         )}
-        <button
-          type="button"
-          onClick={fitAll}
-          className="text-xs px-2 py-1 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border border-zinc-600"
-        >
-          Celé období (fit)
-        </button>
       </div>
-      <div ref={chartRef} className="w-full flex-1 min-h-[280px] rounded-lg overflow-hidden" />
+      <div className="w-full flex-1 min-h-[280px] rounded-lg overflow-hidden">
+        <Plot
+          data={[trace]}
+          layout={layout}
+          config={config}
+          style={{ width: "100%", minHeight: height }}
+          useResizeHandler
+        />
+      </div>
     </div>
   );
 }
+
+export default EquityChart;

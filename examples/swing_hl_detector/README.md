@@ -312,7 +312,7 @@ def next(self):
 
 ## Platforma Backtesting App
 
-Modul se používá v projektu **Backtesting_app** (Next.js + FastAPI + Docker). Přehled UI a funkcí: **[READMEADAM.md](../../READMEADAM.md)** v kořeni repa; technická dokumentace a API: **[README.md](../../README.md)**; příkazy pro spuštění: **[SCRIPTS.md](../../SCRIPTS.md)**; reference pro vývoj: **[READMEAI.md](../../READMEAI.md)**.
+Modul se používá v projektu **Backtesting_app** (Next.js + FastAPI + host engine subprocess). Přehled UI a funkcí: **[READMEADAM.md](../../READMEADAM.md)** v kořeni repa; technická dokumentace a API: **[README.md](../../README.md)**; příkazy pro spuštění: **[SCRIPTS.md](../../SCRIPTS.md)**; reference pro vývoj: **[READMEAI.md](../../READMEAI.md)**.
 
 - **View:** `detect` / `get_line` / `get_zones`, `VIEW_PARAMS` — viz hlavní README §5 a `examples/view_interface.md`.
 - **Backtest:** v UI přidej modul **Swing HL**, klikni **Potvrdit**, nastav instrument a spusť Run.

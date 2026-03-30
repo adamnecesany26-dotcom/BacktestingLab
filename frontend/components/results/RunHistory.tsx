@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import type { SavedBacktestRun } from "@/lib/firestore";
 import { assessOverfitting, readinessFromSeverity } from "@/lib/overfittingSignals";
+import { formatProfitFactorFromRow } from "@/lib/formatProfitFactor";
 
 interface RunHistoryProps {
   runs: SavedBacktestRun[];
@@ -26,12 +27,6 @@ function formatDate(savedAt: { seconds: number; nanoseconds?: number } | null): 
 
 function formatNum(n: number | undefined): string {
   if (n == null || Number.isNaN(n)) return "—";
-  return n.toFixed(2);
-}
-
-function formatProfitFactor(n: number | undefined): string {
-  if (n == null || Number.isNaN(n)) return "—";
-  if (n >= 999) return "∞ / no losses";
   return n.toFixed(2);
 }
 
@@ -99,7 +94,16 @@ function getReadiness(run: SavedBacktestRun): "ready" | "caution" | "not_ready" 
   const robustness = run.robustness && typeof run.robustness === "object" ? (run.robustness as Record<string, unknown>) : null;
   const batchSummary =
     run.batchSummary && typeof run.batchSummary === "object" ? (run.batchSummary as Record<string, unknown>) : null;
-  const pf = Number(run.metrics?.profitFactor ?? NaN);
+  const mrec = run.metrics as Record<string, unknown> | undefined;
+  const pfraw = mrec?.profitFactor;
+  const pf =
+    pfraw === null || pfraw === undefined
+      ? NaN
+      : typeof pfraw === "string" && pfraw.trim() === ""
+        ? NaN
+        : Number(pfraw);
+  const pfStatus = typeof mrec?.profitFactorStatus === "string" ? mrec.profitFactorStatus : null;
+  const paramTestRuns = Math.max(0, Math.floor(Number(summary?.paramTestTotalRuns ?? 0)));
   const { severityScore } = assessOverfitting({
     validationMode,
     tradeCount,
@@ -111,7 +115,9 @@ function getReadiness(run: SavedBacktestRun): "ready" | "caution" | "not_ready" 
     sweepTested: Number(robustness?.tested ?? 0),
     stabilityScore: Number(robustness?.stabilityScore ?? NaN),
     batchRunCount: Number(batchSummary?.runCount ?? 0),
-    profitFactor: pf,
+    paramTestRuns,
+    profitFactor: Number.isFinite(pf) ? pf : null,
+    profitFactorStatus: pfStatus,
   });
   return readinessFromSeverity(severityScore);
 }
@@ -486,17 +492,36 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll, onUpdateLifecycle }
                   <tr key={m.key as string} className="border-b border-zinc-800/50">
                     <td className="py-2 text-zinc-300">{m.label}</td>
                     {compareRuns.map((r) => {
-                      const value = Number(r.metrics?.[m.key] ?? NaN);
-                      const baseline = Number(baselineRun?.metrics?.[m.key] ?? NaN);
+                      const metrics = r.metrics as Record<string, unknown>;
+                      if (m.key === "profitFactor") {
+                        const cell = formatProfitFactorFromRow(metrics);
+                        const bv = baselineRun?.metrics?.profitFactor;
+                        const va = metrics.profitFactor;
+                        const nb = bv === null || bv === undefined ? NaN : Number(bv);
+                        const na = va === null || va === undefined ? NaN : Number(va);
+                        const delta =
+                          Number.isFinite(nb) && Number.isFinite(na) ? na - nb : NaN;
+                        return (
+                          <td key={`${r.id}_${String(m.key)}`} className="py-2 text-right text-zinc-300 font-mono">
+                            {cell}
+                            {Number.isFinite(delta) && baselineRun && baselineRun.id !== r.id ? (
+                              <span className={`ml-2 ${delta >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                                {delta >= 0 ? "+" : ""}
+                                {delta.toFixed(2)}
+                              </span>
+                            ) : null}
+                          </td>
+                        );
+                      }
+                      const value = Number(metrics[m.key] ?? NaN);
+                      const baseline = Number(
+                        (baselineRun?.metrics as Record<string, unknown> | undefined)?.[m.key] ?? NaN,
+                      );
                       const delta =
                         Number.isFinite(value) && Number.isFinite(baseline) ? value - baseline : NaN;
                       return (
                         <td key={`${r.id}_${String(m.key)}`} className="py-2 text-right text-zinc-300 font-mono">
-                          {Number.isFinite(value)
-                            ? m.key === "profitFactor" && value >= 999
-                              ? "∞ / no losses"
-                              : value.toFixed(2)
-                            : "—"}
+                          {Number.isFinite(value) ? value.toFixed(2) : "—"}
                           {Number.isFinite(delta) && baselineRun && baselineRun.id !== r.id ? (
                             <span className={`ml-2 ${delta >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
                               {delta >= 0 ? "+" : ""}
@@ -514,7 +539,8 @@ export function RunHistory({ runs, onDeleteRun, onDeleteAll, onUpdateLifecycle }
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-6">
+      <div className="flex flex-col gap-4">
+        <h4 className="text-xs uppercase tracking-wider text-zinc-500">Metriky v čase (filtr větve)</h4>
         {CHART_METRICS.map(({ key, label }) => (
           <RunHistoryChart
             key={key}
@@ -565,8 +591,19 @@ function RunHistoryChart({
 }) {
   const chronological = [...runs].reverse();
   const values = chronological.map((r) => {
-    const v = (r.metrics as Record<string, unknown>)?.[metricKey];
-    return typeof v === "number" || typeof v === "string" ? Number(v) : null;
+    const raw = (r.metrics as Record<string, unknown>)?.[metricKey];
+    if (raw === null || raw === undefined) return null;
+    if (typeof raw === "number") {
+      if (metricKey === "profitFactor" && raw >= 999) return null;
+      return raw;
+    }
+    if (typeof raw === "string") {
+      const n = Number(raw);
+      if (Number.isNaN(n)) return null;
+      if (metricKey === "profitFactor" && n >= 999) return null;
+      return n;
+    }
+    return null;
   });
   const validValues = values.filter((v): v is number => v != null && !Number.isNaN(v));
   const maxVal = validValues.length ? Math.max(...validValues) : 0;
@@ -577,23 +614,28 @@ function RunHistoryChart({
   const chartMax = maxVal + padding;
   const chartRange = chartMax - chartMin || 1;
 
-  const padLeft = 56;
-  const padRight = 20;
-  const padTop = 20;
-  const padBottom = 36;
-  const chartW = 360;
-  const chartH = 180;
+  const padLeft = 58;
+  const padRight = 28;
+  const padTop = 22;
+  const padBottom = 40;
+  const chartW = 720;
+  const chartH = 200;
   const plotW = chartW - padLeft - padRight;
   const plotH = chartH - padTop - padBottom;
 
-  const points: string[] = [];
+  const pointPairs: { x: number; y: number; v: number }[] = [];
   values.forEach((v, i) => {
     if (v != null && !Number.isNaN(v)) {
-      const x = padLeft + (values.length <= 1 ? 0 : (i / (values.length - 1)) * plotW);
+      const x = padLeft + (values.length <= 1 ? plotW / 2 : (i / (values.length - 1)) * plotW);
       const y = padTop + plotH - ((v - chartMin) / chartRange) * plotH;
-      points.push(`${x},${y}`);
+      pointPairs.push({ x, y, v });
     }
   });
+  const linePoints = pointPairs.map((p) => `${p.x},${p.y}`).join(" ");
+  const areaPath =
+    pointPairs.length >= 2
+      ? `M ${pointPairs[0]!.x},${padTop + plotH} L ${pointPairs.map((p) => `${p.x},${p.y}`).join(" ")} L ${pointPairs[pointPairs.length - 1]!.x},${padTop + plotH} Z`
+      : "";
 
   const yTicks = 5;
   const yTickValues: number[] = [];
@@ -608,10 +650,16 @@ function RunHistoryChart({
   };
 
   return (
-    <div className="bg-zinc-800/50 rounded-lg p-4 border border-zinc-700 min-w-0">
-      <h4 className="text-sm font-medium text-zinc-400 mb-3">{label}</h4>
-      <div className="h-44 w-full min-w-0">
+    <div className="rounded-xl border border-zinc-700/50 bg-gradient-to-br from-zinc-900/55 via-zinc-950/35 to-zinc-950/50 p-4 min-w-0 shadow-lg shadow-black/20">
+      <h4 className="text-sm font-semibold text-zinc-200 mb-3">{label}</h4>
+      <div className="h-52 w-full min-w-0">
         <svg viewBox={`0 0 ${chartW} ${chartH}`} className="w-full h-full min-w-0" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <linearGradient id={`rhGrad_${metricKey.replace(/[^a-zA-Z0-9_-]/g, "_")}`} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#10b981" stopOpacity="0.35" />
+              <stop offset="100%" stopColor="#10b981" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
           {/* Y-axis labels */}
           {yTickValues.map((val, i) => {
             const y = padTop + plotH - ((val - chartMin) / chartRange) * plotH;
@@ -622,17 +670,18 @@ function RunHistoryChart({
                   y1={y}
                   x2={padLeft + plotW}
                   y2={y}
-                  stroke="#27272a"
-                  strokeWidth="0.5"
-                  strokeDasharray="2,2"
+                  stroke="#3f3f46"
+                  strokeWidth="0.75"
+                  strokeDasharray="3,4"
+                  opacity="0.85"
                 />
                 <text
-                  x={padLeft - 8}
-                  y={y + 5}
+                  x={padLeft - 10}
+                  y={y + 4}
                   textAnchor="end"
                   fill="#a1a1aa"
-                  fontSize="12"
-                  fontFamily="monospace"
+                  fontSize="11"
+                  fontFamily="ui-monospace, monospace"
                 >
                   {formatTick(val)}
                 </text>
@@ -640,13 +689,17 @@ function RunHistoryChart({
             );
           })}
 
-          {/* Line + points */}
-          {points.length >= 2 && (
+          {areaPath ? (
+            <path d={areaPath} fill={`url(#rhGrad_${metricKey.replace(/[^a-zA-Z0-9_-]/g, "_")})`} stroke="none" />
+          ) : null}
+          {pointPairs.length >= 2 && (
             <polyline
               fill="none"
-              stroke="#10b981"
-              strokeWidth="2"
-              points={points.join(" ")}
+              stroke="#34d399"
+              strokeWidth="2.25"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              points={linePoints}
             />
           )}
           {values.map((v, i) => {
@@ -656,33 +709,25 @@ function RunHistoryChart({
             const isPos = v >= 0;
             return (
               <g key={i}>
-                <title>Run {i + 1}: {v.toFixed(2)}</title>
+                <title>
+                  Run {i + 1}: {v.toFixed(2)}
+                </title>
                 <circle
                   cx={x}
                   cy={y}
-                  r="4"
-                  fill={isPos ? "#10b981" : "#ef4444"}
-                  stroke="#18181b"
-                  strokeWidth="1"
+                  r="5"
+                  fill={isPos ? "#6ee7b7" : "#f87171"}
+                  stroke="#09090b"
+                  strokeWidth="1.5"
                 />
                 <text
                   x={x}
-                  y={chartH - 8}
+                  y={chartH - 6}
                   textAnchor="middle"
                   fill="#71717a"
-                  fontSize="12"
+                  fontSize="11"
                 >
                   {i + 1}
-                </text>
-                <text
-                  x={x}
-                  y={y - 12}
-                  textAnchor="middle"
-                  fill="#a1a1aa"
-                  fontSize="11"
-                  fontFamily="monospace"
-                >
-                  {formatTick(v)}
                 </text>
               </g>
             );

@@ -14,7 +14,14 @@ export interface OverfittingSignalContext {
   sweepTested?: number;
   stabilityScore?: number;
   batchRunCount?: number;
-  profitFactor?: number;
+  /** Dodatečné OAT běhy z validation.param_test (bez baseline). */
+  paramTestRuns?: number;
+  profitFactor?: number | null;
+  profitFactorStatus?: string | null;
+  /** Total configurations tested (main + sweep + param test) */
+  trialCount?: number;
+  /** Naive Bonferroni adjusted alpha (0.05 / trialCount) */
+  naiveAdjustedAlpha?: number | null;
 }
 
 export interface OverfittingAssessment {
@@ -99,6 +106,17 @@ export function assessOverfitting(ctx: OverfittingSignalContext): OverfittingAss
     severity += 1;
   }
 
+  const ptr = Math.max(0, Math.floor(Number(ctx.paramTestRuns ?? 0)));
+  if (ptr > 0) {
+    warnings.push(
+      `Param test: ${ptr} dodatečných běhů (OAT po parametrech) — vícenásobné porovnání; špičky metrik ber jen jako exploraci.`,
+    );
+    severity += 1;
+    if (ptr >= 24) {
+      severity += 1;
+    }
+  }
+
   const brc = Math.max(0, Math.floor(Number(ctx.batchRunCount ?? 0)));
   if (brc >= 8) {
     warnings.push(
@@ -110,12 +128,36 @@ export function assessOverfitting(ctx: OverfittingSignalContext): OverfittingAss
     severity += 1;
   }
 
-  const pf = Number(ctx.profitFactor ?? NaN);
+  const pfs = String(ctx.profitFactorStatus ?? "");
+  if (pfs === "undefined_no_losing_trades") {
+    warnings.push(
+      "Profit factor není definován (žádné ztrátové obchody) — není to důkaz „nekonečného“ edge, jen degenerace poměru.",
+    );
+    severity += 1;
+  }
+  if (pfs === "no_gross_activity" && tc === 0) {
+    warnings.push("Žádná uzavřená P&L aktivita — metriky jako PF nemají smysl.");
+    severity += 1;
+  }
+
+  const pfRaw = ctx.profitFactor;
+  const pf = pfRaw == null ? NaN : Number(pfRaw);
   if (Number.isFinite(pf) && pf >= 3 && tc < 50 && tc >= 10) {
     warnings.push(
       "Velmi vysoký profit factor při omezeném počtu obchodů — zkontroluj výjimky a sample bias.",
     );
     severity += 1;
+  }
+
+  const trials = Math.max(1, Math.floor(Number(ctx.trialCount ?? 1)));
+  if (trials > 1) {
+    const adjAlpha = ctx.naiveAdjustedAlpha ?? (0.05 / trials);
+    warnings.push(
+      `Celkem ${trials} konfigurací testováno — naive Bonferroni práh: ${adjAlpha.toFixed(4)} (0.05/${trials}). ` +
+      "Vítězné metriky mohou odrážet šťastnou náhodu při mnohonásobném porovnání.",
+    );
+    if (trials >= 20) severity += 2;
+    else if (trials >= 5) severity += 1;
   }
 
   let readinessLabel: string;

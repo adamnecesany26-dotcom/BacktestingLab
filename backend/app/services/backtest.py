@@ -1,8 +1,5 @@
 """
-Backtest service - controls backtest logic.
-Used by engine.py inside Docker; this module documents the interface.
-"""
+Backtest service — documents the strategy interface for engine.py.
 
-# This module is primarily used inside the Docker container (engine.py).
-# The runner service invokes Docker, which runs engine.py.
-# Backtest logic lives in backend/docker/engine.py
+Runner uses a host subprocess or optional in-process call into docker/engine.py.
+"""

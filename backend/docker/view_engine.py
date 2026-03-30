@@ -1,5 +1,5 @@
 """
-View engine - executes module/indicator visualization code inside Docker sandbox.
+View engine — host subprocess for /api/view (module/indicator chart helpers).
 """
 
 from __future__ import annotations
@@ -7,7 +7,9 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import json
+import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,23 @@ def _to_iso(value) -> str:
         return pd.Timestamp(value).isoformat()
     except Exception:
         return str(value)
+
+
+def _view_line_point(p: Any) -> dict | None:
+    """Bod čáry pro View: date, value; volitelně state, score (trend z Swing HL)."""
+    if not isinstance(p, dict) or "date" not in p:
+        return None
+    pt: dict[str, Any] = {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+    st = p.get("state")
+    if st is not None:
+        pt["state"] = str(st)
+    sc = p.get("score")
+    if sc is not None:
+        try:
+            pt["score"] = float(sc)
+        except (TypeError, ValueError):
+            pass
+    return pt
 
 
 def _is_regime_histogram_row(p: Any) -> bool:
@@ -171,7 +190,28 @@ def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -
     return _resample_ohlc_dataframe(df, rule)
 
 
-def _load_ohlc(data_root: Path, data_file: str, years: float) -> pd.DataFrame:
+_VIEW_OHLC_CACHE_MAX = max(1, int(float(os.environ.get("VIEW_OHLC_CACHE_MAX", "32") or 32)))
+_VIEW_OHLC_CACHE: "OrderedDict[tuple[str, int, float, str, str], pd.DataFrame]" = OrderedDict()
+
+
+def _slice_ohlc_by_iso(df: pd.DataFrame, start_iso: str | None, end_iso: str | None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df
+    if start_iso and str(start_iso).strip():
+        out = out[out.index >= pd.Timestamp(str(start_iso).strip())]
+    if end_iso and str(end_iso).strip():
+        out = out[out.index <= pd.Timestamp(str(end_iso).strip())]
+    return out
+
+
+def _load_ohlc_uncached(
+    data_root: Path,
+    data_file: str,
+    years: float,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> pd.DataFrame:
     safe_file = (data_file or "").replace("\\", "/").lstrip("/")
     if not safe_file or safe_file.startswith("../") or "/../" in safe_file:
         raise ValueError("Unsafe data_file path")
@@ -216,13 +256,65 @@ def _load_ohlc(data_root: Path, data_file: str, years: float) -> pd.DataFrame:
                 break
         if "volume" not in df.columns:
             df["volume"] = 1000
+            try:
+                df.attrs["volumeIsSyntheticPlaceholder"] = True
+            except Exception:
+                pass
+            print(
+                "[view_engine] CSV has no volume — synthetic volume=1000; chart/module volume logic is not realistic.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            try:
+                df.attrs["volumeIsSyntheticPlaceholder"] = False
+            except Exception:
+                pass
     else:
         df = pd.read_parquet(p)
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "datetime" in df.columns:
+                df = df.set_index(pd.to_datetime(df["datetime"], errors="coerce")).sort_index()
+                df = df[~df.index.isna()]
+            else:
+                raise ValueError(f"Parquet must have DatetimeIndex or 'datetime' column: {p.name}")
 
     if years > 0 and len(df) > 0:
         cutoff = df.index.max() - pd.Timedelta(days=years * 365.25)
         df = df[df.index >= cutoff]
+    df = _slice_ohlc_by_iso(df, start_iso, end_iso)
     return df
+
+
+def _load_ohlc(
+    data_root: Path,
+    data_file: str,
+    years: float,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
+) -> pd.DataFrame:
+    safe_file = (data_file or "").replace("\\", "/").lstrip("/")
+    if not safe_file or safe_file.startswith("../") or "/../" in safe_file:
+        raise ValueError("Unsafe data_file path")
+    p = (data_root / safe_file).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Data file not found: {data_file}")
+    try:
+        st = p.stat()
+        mtime_ns = int(st.st_mtime_ns)
+    except OSError:
+        mtime_ns = 0
+    cache_key = (str(p), mtime_ns, float(years), start_iso or "", end_iso or "")
+    hit = _VIEW_OHLC_CACHE.get(cache_key)
+    if hit is not None:
+        _VIEW_OHLC_CACHE.move_to_end(cache_key)
+        return hit.copy()
+    df = _load_ohlc_uncached(data_root, data_file, years, start_iso, end_iso)
+    _VIEW_OHLC_CACHE[cache_key] = df
+    _VIEW_OHLC_CACHE.move_to_end(cache_key)
+    while len(_VIEW_OHLC_CACHE) > _VIEW_OHLC_CACHE_MAX:
+        _VIEW_OHLC_CACHE.popitem(last=False)
+    return df.copy()
 
 
 def _call_with_params(fn, df: pd.DataFrame, params: dict):
@@ -262,10 +354,11 @@ def _run_view_code(main_path: Path, module_key: str, df: pd.DataFrame, params: d
         result = _call_with_params(mod.get_line, df, params)
         if isinstance(result, dict):
             for name, data in result.items():
-                pts = []
+                pts: list[dict] = []
                 color = None
+                segments = None
                 if isinstance(data, list):
-                    pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in data if isinstance(p, dict)]
+                    pts = [lp for p in data if isinstance(p, dict) and (lp := _view_line_point(p)) is not None]
                 elif isinstance(data, dict) and "data" in data:
                     raw_data = data["data"]
                     forced = data.get("kind") == "regime_histogram"
@@ -279,19 +372,36 @@ def _run_view_code(main_path: Path, module_key: str, df: pd.DataFrame, params: d
                             continue
                         if forced:
                             continue
-                    pts = [
-                        {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
-                        for p in raw_data
-                        if isinstance(p, dict)
-                    ]
+                    pts = [lp for p in raw_data if isinstance(p, dict) and (lp := _view_line_point(p)) is not None]
                     color = data.get("color")
+                    segments = data.get("segments")
                 if pts:
-                    line_obj = {"name": str(name), "data": pts}
-                    if color:
-                        line_obj["color"] = str(color)
-                    lines.append(line_obj)
+                    if isinstance(segments, list) and len(segments) > 0:
+                        for seg in segments:
+                            if not isinstance(seg, dict):
+                                continue
+                            if "from" not in seg or "to" not in seg or "color" not in seg:
+                                continue
+                            try:
+                                i0, i1 = int(seg["from"]), int(seg["to"]) + 1
+                            except (TypeError, ValueError):
+                                continue
+                            if i0 < 0 or i1 > len(pts) or i0 >= i1:
+                                continue
+                            seg_pts = pts[i0:i1]
+                            if seg_pts:
+                                lines.append({
+                                    "name": str(name),
+                                    "data": seg_pts,
+                                    "color": str(seg["color"]),
+                                })
+                    else:
+                        line_obj = {"name": str(name), "data": pts}
+                        if color:
+                            line_obj["color"] = str(color)
+                        lines.append(line_obj)
         elif isinstance(result, list):
-            pts = [{"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))} for p in result if isinstance(p, dict)]
+            pts = [lp for p in result if isinstance(p, dict) and (lp := _view_line_point(p)) is not None]
             if pts:
                 lines.append({"name": "line", "data": pts})
 
@@ -384,8 +494,18 @@ def main() -> None:
     _yr = req.get("years", None)
     years = float(0.25 if _yr is None else _yr)
     params = req.get("params") if isinstance(req.get("params"), dict) else {}
+    start_iso = req.get("start_iso")
+    end_iso = req.get("end_iso")
+    if isinstance(start_iso, str):
+        start_iso = start_iso.strip() or None
+    else:
+        start_iso = None
+    if isinstance(end_iso, str):
+        end_iso = end_iso.strip() or None
+    else:
+        end_iso = None
 
-    df = _load_ohlc(data_path, data_file, years)
+    df = _load_ohlc(data_path, data_file, years, start_iso, end_iso)
     chart_tf = req.get("chart_timeframe")
     try:
         df = _apply_view_chart_timeframe(df, chart_tf if isinstance(chart_tf, str) else None)

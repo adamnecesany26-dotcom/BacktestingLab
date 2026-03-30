@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { Trade } from "@shared/types";
 import type { OhlcBar } from "@shared/types";
+import { formatChartAxisUtcLabel, prepareOhlcUtcSecondsSeries } from "@/lib/chartOhlcResample";
 
 interface TradeHighlightChartProps {
   ohlc: OhlcBar[];
@@ -66,17 +67,6 @@ function findNearestBarIndex(ohlc: OhlcBar[], isoWhen: string): number {
   return best;
 }
 
-function toUtcSeconds(value: string, fallbackIndex: number): number {
-  const parsed = Date.parse(value);
-  if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-  return Math.floor(Date.UTC(2020, 0, 1 + fallbackIndex) / 1000);
-}
-
-/** LW Charts: čas musí striktně růst (duplicitní sekundy slučují body). */
-function bumpTimeIfNeeded(time: number, prev: number): number {
-  return time <= prev ? prev + 1 : time;
-}
-
 function getOhlcWindowAndLocalIndices(
   ohlc: OhlcBar[],
   trade: Trade
@@ -130,12 +120,22 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
           background: { color: "#18181b" },
           textColor: "#a1a1aa",
         },
+        localization: {
+          locale: "cs-CZ",
+          timeFormatter: (t: unknown) =>
+            typeof t === "number" ? formatChartAxisUtcLabel(t) : String(t),
+        },
         grid: {
           vertLines: { color: "#27272a" },
           horzLines: { color: "#27272a" },
         },
         rightPriceScale: { borderColor: "#3f3f46" },
-        timeScale: { borderColor: "#3f3f46", rightOffset: 4 },
+        timeScale: {
+          borderColor: "#3f3f46",
+          rightOffset: 4,
+          timeVisible: true,
+          secondsVisible: false,
+        },
       });
 
       const candleSeries = chart.addCandlestickSeries({
@@ -148,19 +148,14 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
       const priceFmt = inferPriceFormat(windowOhlc);
       candleSeries.applyOptions({ priceFormat: priceFmt });
 
-      const candleData = windowOhlc.map((bar: OhlcBar, i: number) => ({
-        time: toUtcSeconds(bar.date, i) as import("lightweight-charts").UTCTimestamp,
+      const barTimes = prepareOhlcUtcSecondsSeries(windowOhlc);
+      const deduped = windowOhlc.map((bar: OhlcBar, i: number) => ({
+        time: barTimes[i]! as import("lightweight-charts").UTCTimestamp,
         open: bar.open,
         high: bar.high,
         low: bar.low,
         close: bar.close,
       }));
-      let prevT = -Infinity;
-      const deduped = candleData.map((c: (typeof candleData)[number]) => {
-        const t = bumpTimeIfNeeded(c.time, prevT);
-        prevT = t;
-        return { ...c, time: t as import("lightweight-charts").UTCTimestamp };
-      });
       candleSeries.setData(deduped);
 
       const ei = Math.max(0, Math.min(entryLocal, deduped.length - 1));
@@ -176,7 +171,8 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
       const markers: Marker[] = [];
       let lastT = -Infinity;
       const pushMarker = (timeSec: number, m: Omit<Marker, "time">) => {
-        const t = bumpTimeIfNeeded(timeSec, lastT);
+        let t = timeSec;
+        if (t <= lastT) t = lastT + 1e-6;
         lastT = t;
         markers.push({ ...m, time: t as import("lightweight-charts").UTCTimestamp });
       };
@@ -224,6 +220,41 @@ export function TradeHighlightChart({ ohlc, trade, height = 360 }: TradeHighligh
             lineStyle: 2,
             axisLabelVisible: true,
             title: `Exit ${trade.exitPrice.toFixed(priceFmt.precision)}`,
+          });
+        }
+        const zm = trade.zoneMeta && typeof trade.zoneMeta === "object" ? (trade.zoneMeta as Record<string, unknown>) : null;
+        const readPx = (keys: string[]): number | null => {
+          if (!zm) return null;
+          for (const k of keys) {
+            const v = zm[k];
+            if (typeof v === "number" && Number.isFinite(v)) return v;
+            if (typeof v === "string") {
+              const n = Number(v);
+              if (Number.isFinite(n)) return n;
+            }
+          }
+          return null;
+        };
+        const sl = readPx(["stopPrice", "stop_loss", "sl", "stop"]);
+        const tp = readPx(["targetPrice", "takeProfit", "tp", "target"]);
+        if (sl != null) {
+          cs.createPriceLine({
+            price: sl,
+            color: "rgba(248, 113, 113, 0.9)",
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true,
+            title: `Stop ${sl.toFixed(priceFmt.precision)}`,
+          });
+        }
+        if (tp != null) {
+          cs.createPriceLine({
+            price: tp,
+            color: "rgba(74, 222, 128, 0.9)",
+            lineWidth: 1,
+            lineStyle: 2,
+            axisLabelVisible: true,
+            title: `TP ${tp.toFixed(priceFmt.precision)}`,
           });
         }
       }

@@ -130,6 +130,22 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     withoutIt: "Hrozi optimistic bias, hlavne u rychlych strategii.",
     bestPractices: ["U volatilnich trhu testuj i horsi variantu slippage."],
   },
+  runTimeoutSec: {
+    id: "runTimeoutSec",
+    title: "Max. doba běhu backtestu (sekundy)",
+    whatItMeans:
+      "Kolik sekund může backend čekat na dokončení engine subprocessu před ukončením běhu (ochrana proti visícím jobům).",
+    whyItMatters:
+      "Pomalý počítač, slabé připojení nebo těžká strategie může překročit krátký limit — run se pak zastaví i když engine ještě počítá.",
+    howToUse: [
+      "Zvyš hodnotu (např. 7200–14400) pokud často vidíš „Run timed out“ kolem určitého % progress.",
+      "0 = bez časového limitu na straně runneru (pokud to nasazení povolí).",
+      "Globální výchozí na serveru lze nastavit i proměnnou RUN_TIMEOUT_SEC.",
+    ],
+    recommendedDefault: "3600 s (1 h) jako rozumný kompromis; náročné runy 7200+.",
+    withoutIt: "Krátký server default může useknout dlouhé backtesty.",
+    bestPractices: ["Na sdíleném serveru nepoužívej neomezeně 0 bez dohody — riziko zahlcení."],
+  },
   commissionPerc: {
     id: "commissionPerc",
     title: "Komise (%)",
@@ -454,7 +470,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     whatItMeans:
       "**Jak to u nás přesně běží (pořadí kroků):** " +
       "1) **Nejdřív** engine **dokončí celý backtest** na datech — projde svíčky, strategie otevře/zavře obchody a vznikne **seznam uzavřených obchodů** s jejich **PnL**. " +
-      "2) **Až potom**, stále **ve stejném jednom Runu** (stejný Docker/engine běh), engine z těchto obchodů udělá **Monte Carlo**: mnohokrát **náhodně přeskupí** (bootstrap) jejich zisky/ztráty podle zvoleného režimu a z toho spočítá např. **rozptyl drawdownu**, **konečné equity** a odhad **risk of ruin**. " +
+      "2) **Až potom**, stále **ve stejném jednom Runu** (stejný engine běh), engine z těchto obchodů udělá **Monte Carlo**: mnohokrát **náhodně přeskupí** (bootstrap) jejich zisky/ztráty podle zvoleného režimu a z toho spočítá např. **rozptyl drawdownu**, **konečné equity** a odhad **risk of ruin**. " +
       "**Neběží to „vedle sebe“ jako druhý paralelní backtest** — je to **druhá fáze** hned po tom hlavním: nejdřív simulace strategie, pak statistika z výsledných obchodů. " +
       "**Kde to uvidíš:** po doběhnutí běhu v **výsledcích** — v přehledu metrik / **Analytics** je sekce typu **Robustness & Monte Carlo** (počet simulací, metoda, režim, risk of ruin, poznámka). Ve struktuře výsledku je to pole **`monteCarlo`**. **Žádný samostatný progress bar jen pro MC** — prodlouží se celkový čas jednoho Run; loading pořád kryje celý výpočet. " +
       "Když strategie **neuzavře ani jeden obchod**, Monte Carlo **nemá z čeho počítat** a engine ho v podstatě přeskočí / vrátí hlášku, že MC nebylo možné.",
@@ -774,6 +790,166 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
       "Po úpravě zkontroluj syntaxi: **čárky** mezi objekty, **uvozovky** kolem řetězců.",
     ],
   },
+  stressMultiplier: {
+    id: "stressMultiplier",
+    title: "Stress multiplier (execution model)",
+    whatItMeans:
+      "Násobí slippage a spread penalty v execution modelu faktorem > 1.0. " +
+      "1.5× = cca o 50 % horší exekuce než baseline; 2.0× = dvojnásobné náklady — simuluje horší tržní podmínky (širší spread, větší skluz).",
+    whyItMatters:
+      "Reálná exekuce bývá horší než model. Stress test ukáže, zda edge přežije zvýšené náklady — důležité pro škálování a reálné obchodování.",
+    howToUse: [
+      "Nastav v execution modelu (nebo přes preset Prop conservative).",
+      "Porovnej metriky při 1.0 vs 1.5 vs 2.0 — robustní edge klesne mírně, křehký zmizí.",
+    ],
+    recommendedDefault: "1.0 baseline; 1.5 stress test; 2.0+ extrémní scénář.",
+    withoutIt: "Nevidíš citlivost edge na zhoršení exekuce.",
+    bestPractices: ["Vždy porovnej stress vs non-stress u stejné konfigurace validace."],
+  },
+  drawdownDuration: {
+    id: "drawdownDuration",
+    title: "Drawdown duration & recovery",
+    whatItMeans:
+      "Engine pocita delku nejdelsiho drawdown obdobi (bary i kalendarne dny), cas zotaveni od nejhlubsiho propadu a underwater integral (prumerne DD% pres vsechny bary).",
+    whyItMatters:
+      "Hloubka propadu sama o sobe nic nerika o tom, jak dlouho v nem sedis. Pro psychologii i alokaci kapitalu je casova dimenze DD stejna dulezita jako procentualni.",
+    howToUse: [
+      "V StatBlocks vidis DD Duration a Recovery primo v hlavnim prehledu.",
+      "V Analytics > Drawdown analysis jsou vsechny detaily vcetne underwater integralu a poctu DD period.",
+      "Recovery = null znamena, ze equity se nevrátila na predchozi peak pred koncem dat.",
+    ],
+    recommendedDefault: "Sleduj vzdy — neni co nastavovat, engine pocita automaticky z equity krivky.",
+    withoutIt: "Vidis jen hloubku DD, ale ne jak dlouho v nem sedis — kriticky blind spot.",
+    bestPractices: ["Porovnavej DD duration napric runy; strategii s kratsim recovery preferuj."],
+  },
+  tradePnlDistribution: {
+    id: "tradePnlDistribution",
+    title: "Trade PnL distribution",
+    whatItMeans:
+      "Engine z uzavrenych obchodu pocita histogram PnL, percentily (p1-p99), sikmost (skewness), spicatost (kurtosis), CVaR tail odhady a koncentraci zisku v top N obchodech.",
+    whyItMatters:
+      "Prumerny zisk/ztrata nestaci. Distribuce ukaze, zda je edge systematicky (mnoho malych zisku) nebo zavisi na par outlierech (top 5 obchodu = 80 % zisku).",
+    howToUse: [
+      "V Analytics > Trade PnL distribution jsou histogram, percentily, tail CVaR a koncentrace.",
+      "Pokud top5PnlPct > 70 %, UI zobrazi varovani — edge je fragile.",
+      "CVaR 5% ukazuje prumernou ztratu v nejhorsich 5 % obchodu.",
+    ],
+    recommendedDefault: "Engine pocita automaticky. Sleduj skewness (kladna = vic pravych vyheru, zaporna = vic levych ztrat).",
+    withoutIt: "Nevidis tvar distribuce a tail riziko — muzes prihlednouti k vysokemu prumeru, ktery stoji na jednom obchodu.",
+    bestPractices: ["Kombinuj s MC a WF validaci pro komplexni obraz."],
+  },
+  bootstrapCI: {
+    id: "bootstrapCI",
+    title: "Bootstrap confidence intervals",
+    whatItMeans:
+      `Engine provede tisíc opakování: z tvých obchodů pokaždé náhodně vybere vzorek (s opakováním) a spočítá metriku. ` +
+      `Ze všech výsledků udělá **95% interval** — říká ti: „s touto nejistotou je tvůj skutečný edge někde tady."`,
+    whyItMatters:
+      "Čísla na obrazovce jsou **bodové odhady** z jedné historie. CI ti řekne, **jak moc jim věřit**. " +
+      "Pokud CI pro mean PnL obsahuje nulu, **nemůžeš vyloučit, že strategie nemá edge** — to je klíčová informace.",
+    howToUse: [
+      "Podívej se na **[ciLow, ciHigh]** pro mean PnL — pokud obě strany jsou kladné, máš silnější signál.",
+      "Širší CI = více nejistoty, potřebuješ víc obchodů nebo delší data.",
+    ],
+    recommendedDefault: "Engine počítá automaticky (1000 resamplů, α = 0.05). Min. 5 obchodů.",
+    withoutIt: "Vidíš jen jedno číslo bez představy o jeho spolehlivosti — snadno přeceníš náhodný výsledek.",
+    bestPractices: [
+      "CI předpokládá i.i.d. obchody — u sériově korelovaných strategií mohou být intervaly příliš úzké.",
+      "Kombinuj s MC simulací a WF validací pro kompletní obraz.",
+    ],
+  },
+  payoffDecomposition: {
+    id: "payoffDecomposition",
+    title: "Payoff decomposition (edge equation)",
+    whatItMeans:
+      "Rozloží tvůj edge na dvě složky: **win rate** (jak často vyděláváš) a **payoff ratio** (kolik vyděláš vs kolik ztratíš). " +
+      "**Edge = WR × AvgWin − LR × AvgLoss.** Kelly fraction pak říká, jaký podíl kapitálu nasadit za ideálních podmínek.",
+    whyItMatters:
+      "Můžeš mít vysoký win rate, ale mizerný payoff ratio — nebo naopak. Obojí je validní strategie, ale vyžaduje " +
+      "**úplně jiný position sizing a psychologii**. Bez dekompozice to nevidíš.",
+    howToUse: [
+      "Porovnej payoff ratio s win rate — payoff ratio < 1 vyžaduje win rate > 50%.",
+      "Kelly fraction ber jako **horní limit** — reálně nasazuj **polovinu nebo méně** (half-Kelly).",
+    ],
+    recommendedDefault: "Engine počítá automaticky. Kelly je informativní, ne recept.",
+    withoutIt: "Nevidíš proč edge funguje (nebo nefunguje) — jenom že expectancy je kladná/záporná.",
+    bestPractices: ["Zkontroluj, zda edge nestojí na jednom obrovském výhru — kombinuj s koncentrací a CVaR."],
+  },
+  trialCount: {
+    id: "trialCount",
+    title: "Trial count & multiple testing",
+    whatItMeans:
+      `Kolik různých konfigurací jsi testoval v tomto sezení (hlavní run + param test + sweep). ` +
+      `**Naive Bonferroni α** = 0.05 / počet pokusů — hrubý odhad, jak přísný by měl být tvůj práh „signifikance".`,
+    whyItMatters:
+      `Čím víc věcí zkusíš, tím spíš něco „funguje" náhodou. Pokud testuješ 20 konfigurací a jedna má Sharpe 1.5, ` +
+      `**pravděpodobnost, že to je náhoda, je 20× vyšší** než u jednoho testu.`,
+    howToUse: [
+      `Sleduj trialCount v Analytics — je to tvůj „metr poctivosti".`,
+      "Naive adjusted α ti řekne: pod tímto prahem bys nemohl tvrdit significance ani s mnoha pokusy.",
+    ],
+    recommendedDefault: "Engine počítá automaticky. Zobrazeno v manifestu a UI.",
+    withoutIt: `Zapomeneš, kolik věcí jsi zkusil — a „nejlepší" výsledek vypadá jistěji, než je.`,
+    bestPractices: ["Drž trial count co nejnižší — méně testů = silnější evidence z každého testu."],
+  },
+  paramTestTrainOnly: {
+    id: "paramTestTrainOnly",
+    title: "Param test: train-only mode",
+    whatItMeans:
+      "Přepne param test tak, že OAT sweep běží **pouze na trénovací části** dat (např. 75%). " +
+      "Nejlepší nalezený parametr se pak **jednou otestuje na holdoutu** — a ty vidíš, jak moc se výsledek zhorší.",
+    whyItMatters:
+      `Bez toho hledáš špičky metrik na **stejných datech**, která pak používáš jako důkaz — to je ` +
+      `**klasický overfit**. Train-only split to zabrání: holdout ti řekne „realitu" bez zkreslení.`,
+    howToUse: [
+      "Zaškrtni **Train-only** v param test nastavení.",
+      "V Analytics uvidíš holdout metriky nejlepšího parametru — pokud je holdout výrazně horší, je to overfit.",
+    ],
+    recommendedDefault: "Zapni vždy, pokud máš dostatek dat (60+ barů). Train ratio 0.75.",
+    withoutIt: "Param test na celém datasetu = explorace, ne validace. Špičky metrik jsou nespolehlivé.",
+    bestPractices: [
+      "Holdout return záporný při kladném train = silný signál overfittingu.",
+      "Kombinuj s OOS/WF na finální výběr.",
+    ],
+  },
+  propRedFlags: {
+    id: "propRedFlags",
+    title: "Prop-level red flags & trust assessment",
+    whatItMeans:
+      "Automatická detekce podezřelých vzorů ve výsledcích: extrémní Sharpe, málo obchodů, žádné ztráty, " +
+      "PF nekonečno, příliš hladká equity, CI zahrnující nulu, koncentrovaný PnL. Každý flag má severity " +
+      "(critical / warning / info) a celkový trust level (not_trustworthy / low_trust / cautious / acceptable).",
+    whyItMatters:
+      "Backtest s krásnými čísly, který má 3 critical red flags, je pravděpodobně curve-fit. " +
+      "Red flags tě nutí ověřit, proč výsledky vypadají tak dobře — nebo tak špatně.",
+    howToUse: [
+      "V Analytics najdi 'Trust assessment' banner — barva a severity signalizují míru důvěryhodnosti.",
+      "Klikni na jednotlivé flagy a přečti detail s doporučením.",
+    ],
+    recommendedDefault: "Engine počítá automaticky. Nelze vypnout.",
+    withoutIt: "Hezká čísla bez kontextu — snadno přeceníš výsledek založený na 15 obchodech a Sharpe 4.",
+    bestPractices: [
+      "Nuluj critical flagy dříve, než bereš výsledek vážně.",
+      "Single run + execution off = minimum credibility. Zapni obojí.",
+    ],
+  },
+  propConservativePreset: {
+    id: "propConservativePreset",
+    title: "Prop conservative preset",
+    whatItMeans:
+      "Nejpřísnější přednastavení: WF 5 foldů, min 50 obchodů, max DD 15%, PF ≥ 1.5, MC 1000 sim (block bootstrap), " +
+      "execution se spread 1.5 bps, slippage ×vol 2, latency 1 bar, stress multiplier 1.5×. " +
+      "Param test automaticky v train-only režimu.",
+    whyItMatters:
+      "Odpovídá tomu, co by požadoval prop firma reviewer — přísné podmínky, realistická exekuce, robustní validace.",
+    howToUse: [
+      "V Edge finding klikni na 'Prop conservative' tlačítko.",
+      "Případně uprav jednotlivé hodnoty — preset je výchozí bod, ne dogma.",
+    ],
+    recommendedDefault: "Použij jako základ pro seriózní validaci. Uprav dle potřeby.",
+    withoutIt: "Musíš ručně nastavit desítku parametrů pro přísnou konfiguraci.",
+    bestPractices: ["Přidej i regime analýzu a portfolio multi-instrument pro komplexní obraz."],
+  },
   validationWalkForward: {
     id: "validationWalkForward",
     title: "Walk-forward / OOS (trénink vs test)",
@@ -794,6 +970,58 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
       "V každém **testovém segmentu** kontroluj **počet obchodů** — jinak je výsledek jako anketa mezi třemi lidmi.",
       "Guardrails ber jako **červené vlaječky**, ne jako důkaz pravdy.",
     ],
+  },
+  pessimistPreset: {
+    id: "pessimistPreset",
+    title: "Pessimist preset",
+    whatItMeans:
+      "Jedn\u00edm tla\u010d\u00edtkem nastav\u00ed agresivn\u00ed execution model: spread 2 bps, slippage 3\u00d7 volatility, " +
+      "latence 2 bary, stress multiplier 2\u00d7. Nem\u011bn\u00ed validaci ani jin\u00e1 nastaven\u00ed.",
+    whyItMatters:
+      "Re\u00e1ln\u00e1 exekuce je v\u017edy hor\u0161\u00ed ne\u017e model. Pesimistick\u00fd run okam\u017eit\u011b uk\u00e1\u017ee, " +
+      "jestli tv\u016fj edge p\u0159e\u017eije brutální execution podm\u00ednky \u2014 pokud ne, nem\u00e1 smysl ho tradovat.",
+    howToUse: [
+      "Klikni na Pessimist v rychl\u00fdch profilech.",
+      "Porovnej metriky s p\u016fvodn\u00edm runem \u2014 pokud edge zmiz\u00ed, je k\u0159ehk\u00fd.",
+    ],
+    recommendedDefault: "Pou\u017eij pro ka\u017ed\u00fd n\u00e1pad, kter\u00fd p\u0159e\u017eil z\u00e1kladn\u00ed test.",
+    withoutIt: "Nevid\u00ed\u0161, jestli tv\u016fj edge je re\u00e1ln\u00fd nebo jen artefakt nulov\u00e9ho slippage.",
+    bestPractices: ["Ka\u017ed\u00fd n\u00e1pad testuj minim\u00e1ln\u011b jednou s Pessimist presetem."],
+  },
+  underwaterChart: {
+    id: "underwaterChart",
+    title: "Underwater equity (drawdown %)",
+    whatItMeans:
+      "Graf drawdown % v \u010dase pod hlavn\u00ed equity k\u0159ivkou. Uk\u00e1\u017ee jak hlubok\u00e9 a jak dlouh\u00e9 " +
+      "jsou propady \u2014 \u201ejak dlouho jsi v pekle\u201c.",
+    whyItMatters:
+      "Jeden \u010d\u00edslo Max DD % nepostihuje \u010dasov\u00fd rozm\u011br bolesti. Strategie se stejn\u00fdm DD " +
+      "m\u016f\u017ee m\u00edt 2 t\u00fddny nebo 6 m\u011bs\u00edc\u016f underwater \u2014 psychologicky a finan\u010dn\u011b " +
+      "obrovsk\u00fd rozd\u00edl.",
+    howToUse: [
+      "V z\u00e1lo\u017ece Equity se graf zobrazuje automaticky.",
+      "Sleduj \u201e% bar\u016f pod vodou\u201c \u2014 v\u00edce ne\u017e 50 % znamen\u00e1 v\u011bt\u0161inu \u010dasu v propadu.",
+    ],
+    recommendedDefault: "V\u017edy sleduj spolu s equity k\u0159ivkou.",
+    withoutIt: "Vid\u00ed\u0161 jen p\u011bknou k\u0159ivku equity a ignoruje\u0161 bolest drawdown\u016f.",
+    bestPractices: ["\u0160irok\u00e9 + hlubok\u00e9 underwater oblasti = strategie nen\u00ed vhodn\u00e1 pro re\u00e1ln\u00fd trading."],
+  },
+  runNote: {
+    id: "runNote",
+    title: "Pozn\u00e1mka k runu (journal)",
+    whatItMeans:
+      "Voln\u00fd text, kter\u00fd si m\u016f\u017ee\u0161 p\u0159ipsat k v\u00fdsledk\u016fm runu. " +
+      "Export se do repro bundle (run_note.txt).",
+    whyItMatters:
+      "Bez pozn\u00e1mek za t\u00fdden nevid\u00ed\u0161, PRO\u010c jsi ten run spustil a CO jsi zjistil. " +
+      "Journal je z\u00e1klad discipl\u00edny.",
+    howToUse: [
+      "Klikni na tla\u010d\u00edtko \u201ePozn\u00e1mka\u201c vedle export tla\u010d\u00edtek.",
+      "Napi\u0161 hypot\u00e9zu, co testujes a co jsi zjistil.",
+    ],
+    recommendedDefault: "Ke ka\u017ed\u00e9mu runu napi\u0161 aspo\u0148 jednu v\u011btu.",
+    withoutIt: "Ztr\u00e1c\u00ed\u0161 kontext research procesu.",
+    bestPractices: ["Zapisuj hypot\u00e9zu P\u0158ED runem a zji\u0161t\u011bn\u00ed PO."],
   },
 };
 

@@ -16,7 +16,7 @@
 
 - Standard structured fields on logs:
   - `run_id`
-  - `phase` (prepare, docker_start, stream, parse_result, cleanup)
+  - `phase` (prepare, engine_spawn, stream, parse_result, cleanup)
   - `duration_ms`
   - `status`
 

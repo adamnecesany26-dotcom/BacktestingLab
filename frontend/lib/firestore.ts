@@ -357,7 +357,8 @@ export interface SavedBacktestRun {
     maxDrawdownPct?: number;
     sharpeRatio?: number;
     totalReturnUsd?: number;
-    profitFactor?: number;
+    profitFactor?: number | null;
+    profitFactorStatus?: string;
     expectancyUsd?: number;
     expectancyR?: number;
     winRate?: number;

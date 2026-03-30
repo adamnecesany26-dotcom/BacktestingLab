@@ -1,16 +1,26 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import type { DataInstrument, InstrumentType } from "@shared/types";
 import type { FirestoreItem } from "@/lib/firestore";
-import type { StrategyParams, StrategyParamsMeta } from "@/lib/strategyParams";
+import {
+  paramFieldVisible,
+  type StrategyParamValue,
+  type StrategyParams,
+  type StrategyParamsMeta,
+} from "@/lib/strategyParams";
 import { FieldHelpPopover } from "@/components/FieldHelpPopover";
 import { backtestFieldHelp, getParamFallbackHelp, type BacktestFieldHelp } from "@/components/backtestFieldMeta";
+
+export type CommissionMode = "percentage" | "per_contract";
 
 export interface BacktestParams {
   initialCapital: number;
   slippagePerc: number;
   commissionPerc: number;
+  /** Futures: fixed USD per contract per side (when commissionMode is per_contract). */
+  commissionMode: CommissionMode;
+  commissionPerContract: number;
   instrumentType: InstrumentType;
   /** Futures */
   tickSize?: number;
@@ -21,15 +31,26 @@ export interface BacktestParams {
   lotSize?: number;
   pipSize?: number;
   pipValue?: number;
+  /** Backend wall-clock timeout for engine subprocess (seconds). 0 = ask server for no limit (if supported). */
+  runTimeoutSec: number;
 }
 
 type PartialBacktestParams = Partial<BacktestParams>;
 
+/** Jedna řádka rozsahu pro Param test (jen strategie PARAMS, int/float). */
+export type ParamTestRangeRow = { enabled: boolean; min: number; max: number };
+
 export interface EdgeFindingSettings {
-  validationMode: "single" | "oos_split" | "walk_forward";
+  validationMode: "single" | "oos_split" | "walk_forward" | "param_test";
   oosRatio: number;
   wfFolds: number;
   wfTestRatio: number;
+  /** Param test: horní strop počtu dodatečných backtestů v engine (4–48). */
+  paramTestMaxRuns: number;
+  /** Param test: run OAT sweep only on train portion of data (prevents in-sample overfitting). */
+  paramTestTrainOnly: boolean;
+  /** Klíče = názvy PARAMS; pouze číselné parametry strategie. */
+  paramTestRanges: Record<string, ParamTestRangeRow>;
   minTradesGate: number;
   maxDdGate: number;
   minPfGate: number;
@@ -46,6 +67,7 @@ export interface EdgeFindingSettings {
   spreadBps: number;
   slippageVolMult: number;
   latencyBars: number;
+  stressMultiplier: number;
   forwardBridgeEnabled: boolean;
   forwardBridgeMode: "paper_shadow" | "live_shadow";
   forwardBridgeBaselineEquity: number;
@@ -84,15 +106,45 @@ const BEGINNER_EDGE_DEFAULTS: Partial<EdgeFindingSettings> = {
   spreadBps: 0.5,
   slippageVolMult: 1,
   latencyBars: 0,
+  stressMultiplier: 1.0,
   promoteOnPass: false,
   runFixedSeedEnabled: false,
   runFixedSeedValue: 42,
   batchEnabled: false,
   batchMaxRuns: 8,
   batchItemsJson: '[{"instrument":"NQ","data_file":"mock/NQ_5Y.csv","timeframe":"1d"}]',
+  paramTestMaxRuns: 24,
+  paramTestTrainOnly: false,
+  paramTestRanges: {},
 };
 
-const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingSettings>> = {
+const EDGE_PRESETS: Record<"safe" | "balanced" | "explore" | "prop_conservative" | "pessimist", Partial<EdgeFindingSettings>> = {
+  pessimist: {
+    executionEnabled: true,
+    spreadBps: 2.0,
+    slippageVolMult: 3,
+    latencyBars: 2,
+    stressMultiplier: 2.0,
+  },
+  prop_conservative: {
+    validationMode: "walk_forward",
+    wfFolds: 5,
+    wfTestRatio: 0.2,
+    minTradesGate: 50,
+    maxDdGate: 15,
+    minPfGate: 1.5,
+    sweepMode: "none",
+    monteCarloEnabled: true,
+    monteCarloSims: 1000,
+    monteCarloMode: "block_bootstrap",
+    executionEnabled: true,
+    spreadBps: 1.5,
+    slippageVolMult: 2,
+    latencyBars: 1,
+    stressMultiplier: 1.5,
+    promoteOnPass: false,
+    paramTestTrainOnly: true,
+  },
   safe: {
     validationMode: "walk_forward",
     wfFolds: 4,
@@ -109,6 +161,7 @@ const EDGE_PRESETS: Record<"safe" | "balanced" | "explore", Partial<EdgeFindingS
     spreadBps: 0.5,
     slippageVolMult: 1,
     latencyBars: 0,
+    stressMultiplier: 1.0,
     promoteOnPass: false,
   },
   balanced: {
@@ -203,12 +256,66 @@ function SettingsSection({
   );
 }
 
+/** Collapsible block for module / indicator VIEW_PARAMS (default closed). */
+function CollapsibleParamPanel({
+  panelId,
+  title,
+  subtitle,
+  open,
+  onToggle,
+  children,
+}: {
+  panelId: string;
+  title: string;
+  subtitle: string;
+  open: boolean;
+  onToggle: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="border border-zinc-800/90 rounded-lg overflow-hidden bg-zinc-950/40">
+      <button
+        type="button"
+        onClick={onToggle}
+        className="w-full flex items-center justify-between gap-2 px-3 py-2.5 text-left hover:bg-zinc-800/40 transition-colors"
+        aria-expanded={open}
+        aria-controls={`param-panel-${panelId}`}
+      >
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-zinc-200 truncate">{title}</div>
+          <div className="text-[10px] text-zinc-500 uppercase tracking-wider">{subtitle}</div>
+        </div>
+        <span className="text-zinc-500 shrink-0 text-xs tabular-nums">{open ? "▼" : "▶"}</span>
+      </button>
+      {open ? (
+        <div id={`param-panel-${panelId}`} className="px-3 pb-3 pt-1 space-y-3 border-t border-zinc-800/80">
+          {children}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Max instrumentů v jedné dávce (server cap batch_config). */
+export const MAX_INSTRUMENTS_BATCH = 48;
+
+/** Jedna položka v záložce Moduly (potvrzené moduly + PARAM_MODULE_CHAIN). */
+export interface ModuleParamPanelEntry {
+  id: string;
+  name: string;
+  /** Modul přidaný jen přes PARAM_MODULE_CHAIN v main.py strategie, ne přes „Potvrdit výběr“. */
+  fromParamChain?: boolean;
+}
+
 interface BacktestSettingsProps {
   instruments: DataInstrument[];
   instrumentsLoaded?: boolean;
   dataLoadError?: string | null;
   selectedInstrument: DataInstrument | null;
-  onSelectInstrument: (inv: DataInstrument) => void;
+  /** `DataInstrument.file` — pořadí = pořadí běhů v dávce */
+  selectedInstrumentFiles: string[];
+  onToggleInstrumentFile: (file: string) => void;
+  onSelectAllInstrumentsInList: () => void;
   years: number;
   onYearsChange: (y: number) => void;
   params: BacktestParams;
@@ -231,8 +338,14 @@ interface BacktestSettingsProps {
   moduleParams?: Record<string, StrategyParams>;
   moduleParamMeta?: Record<string, StrategyParamsMeta>;
   onModuleParamsChange?: (moduleName: string, params: StrategyParams) => void;
-  /** Module names for which to show params (from applied/selected modules) */
-  moduleNamesForParams?: string[];
+  /** Moduly pro VIEW_PARAMS panel (potvrzené + PARAM_MODULE_CHAIN). */
+  moduleParamPanels?: ModuleParamPanelEntry[];
+  /** Indicator VIEW_PARAMS (applied indicators with VIEW_PARAMS in main.py) */
+  indicatorParams?: Record<string, StrategyParams>;
+  indicatorParamMeta?: Record<string, StrategyParamsMeta>;
+  onIndicatorParamsChange?: (indicatorName: string, params: StrategyParams) => void;
+  /** Display names of applied indicators (same order as selection) */
+  indicatorNamesForParams?: string[];
   edgeSettings?: EdgeFindingSettings;
   onEdgeSettingsChange?: (next: EdgeFindingSettings) => void;
 }
@@ -242,7 +355,9 @@ export function BacktestSettings({
   instrumentsLoaded = true,
   dataLoadError = null,
   selectedInstrument,
-  onSelectInstrument,
+  selectedInstrumentFiles,
+  onToggleInstrumentFile,
+  onSelectAllInstrumentsInList,
   years,
   onYearsChange,
   params,
@@ -263,12 +378,27 @@ export function BacktestSettings({
   moduleParams = {},
   moduleParamMeta = {},
   onModuleParamsChange,
-  moduleNamesForParams = [],
+  moduleParamPanels = [],
+  indicatorParams = {},
+  indicatorParamMeta = {},
+  onIndicatorParamsChange,
+  indicatorNamesForParams = [],
   edgeSettings,
   onEdgeSettingsChange,
 }: BacktestSettingsProps) {
-  const maxYears = selectedInstrument?.yearsAvailable ?? 5;
+  const maxYears = useMemo(() => {
+    if (selectedInstrumentFiles.length === 0) return selectedInstrument?.yearsAvailable ?? 5;
+    const ys = instruments
+      .filter((i) => selectedInstrumentFiles.includes(i.file))
+      .map((i) => i.yearsAvailable);
+    return ys.length > 0 ? Math.min(...ys) : (selectedInstrument?.yearsAvailable ?? 5);
+  }, [instruments, selectedInstrumentFiles, selectedInstrument?.yearsAvailable]);
   const minYears = 1;
+  const selectedSet = useMemo(
+    () => new Set(selectedInstrumentFiles),
+    [selectedInstrumentFiles],
+  );
+  const multiCount = selectedInstrumentFiles.length;
   const [sectionsOpen, setSectionsOpen] = useState<Record<string, boolean>>({
     guided: true,
     basic: true,
@@ -279,15 +409,24 @@ export function BacktestSettings({
     run: true,
     edgeFinding: true,
   });
-  const [paramsTab, setParamsTab] = useState<"strategy" | string>("strategy");
+  /** Keys `module:Name` / `indicator:Name` — default false = collapsed */
+  const [paramPanelOpen, setParamPanelOpen] = useState<Record<string, boolean>>({});
+  const [paramScopeTab, setParamScopeTab] = useState<"strategy" | "modules">("strategy");
 
   const inputClass = "w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200";
   const labelTextClass = "text-sm text-zinc-400";
-  const getDynamicParamHelp = (paramName: string): BacktestFieldHelp => {
-    const source = paramsTab === "strategy" ? "PARAMS" : "VIEW_PARAMS";
-    const moduleMeta = paramsTab === "strategy" ? undefined : moduleParamMeta[paramsTab]?.[paramName];
-    const strategyMeta = paramsTab === "strategy" ? strategyParamMeta[paramName] : undefined;
-    const resolvedMeta = strategyMeta ?? moduleMeta;
+
+  type ParamHelpScope =
+    | { kind: "strategy" }
+    | { kind: "module"; name: string }
+    | { kind: "indicator"; name: string };
+
+  const getParamHelp = (scope: ParamHelpScope, paramName: string): BacktestFieldHelp => {
+    const source = scope.kind === "strategy" ? "PARAMS" : "VIEW_PARAMS";
+    const strategyMeta = scope.kind === "strategy" ? strategyParamMeta[paramName] : undefined;
+    const moduleMeta = scope.kind === "module" ? moduleParamMeta[scope.name]?.[paramName] : undefined;
+    const indMeta = scope.kind === "indicator" ? indicatorParamMeta[scope.name]?.[paramName] : undefined;
+    const resolvedMeta = strategyMeta ?? moduleMeta ?? indMeta;
     const fallback = getParamFallbackHelp(paramName, source);
     if (!resolvedMeta) return fallback;
     return {
@@ -304,10 +443,131 @@ export function BacktestSettings({
           : fallback.bestPractices,
     };
   };
+
+  const toggleParamPanel = (id: string) => {
+    setParamPanelOpen((prev) => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const renderParamFields = (
+    entries: [string, StrategyParamValue][],
+    current: StrategyParams,
+    onPatch: (next: StrategyParams) => void,
+    scope: ParamHelpScope,
+    metaMap: StrategyParamsMeta,
+  ) =>
+    entries.map(([key, value]) => {
+      const meta = metaMap[key] ?? {};
+      if (!paramFieldVisible(meta, current)) {
+        return null;
+      }
+      const displayLabel = meta.title?.trim() || key;
+      const opts = meta.options;
+      const useSelect = Array.isArray(opts) && opts.length > 0;
+      const isMultiselect = meta.widget === "multiselect" && useSelect;
+      const legacyBoolNumber =
+        meta.booleanWidget && typeof value === "number" && (value === 0 || value === 1);
+      const asBoolCheckbox = typeof value === "boolean" || legacyBoolNumber;
+      const boolVal =
+        typeof value === "boolean" ? value : legacyBoolNumber ? value === 1 : Boolean(value);
+
+      return (
+        <div key={key}>
+          <div className="mb-1 flex items-center gap-2">
+            <span className={labelTextClass}>{displayLabel}</span>
+            <FieldHelpPopover help={getParamHelp(scope, key)} />
+          </div>
+          {meta.whatItMeans ? (
+            <p className="text-xs text-zinc-500 mb-2 leading-relaxed">{meta.whatItMeans}</p>
+          ) : null}
+          {isMultiselect ? (
+            <div className="flex flex-wrap gap-x-3 gap-y-2">
+              {opts!.map((opt, i) => {
+                const selected = new Set(
+                  String(value ?? "")
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean),
+                );
+                const on = selected.has(opt);
+                return (
+                  <label key={`${key}-${opt}`} className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() => {
+                        const nextSel = new Set(selected);
+                        if (nextSel.has(opt)) nextSel.delete(opt);
+                        else nextSel.add(opt);
+                        const ordered = opts!.filter((o) => nextSel.has(o));
+                        onPatch({ ...current, [key]: ordered.join(",") });
+                      }}
+                      className="rounded border-zinc-600"
+                    />
+                    <span>{meta.optionLabels?.[i] ?? opt}</span>
+                  </label>
+                );
+              })}
+            </div>
+          ) : useSelect ? (
+            <select
+              value={String(value)}
+              onChange={(e) => {
+                onPatch({ ...current, [key]: e.target.value });
+              }}
+              className={inputClass}
+            >
+              {opts!.map((opt, i) => (
+                <option key={`${i}-${opt || "__empty"}`} value={opt}>
+                  {meta.optionLabels?.[i] ?? (opt === "" ? "(výchozí / prázdné)" : opt)}
+                </option>
+              ))}
+            </select>
+          ) : asBoolCheckbox ? (
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={boolVal}
+                onChange={(e) => onPatch({ ...current, [key]: e.target.checked })}
+                className="rounded"
+              />
+              <span className="text-sm text-zinc-300">{boolVal ? "Ano" : "Ne"}</span>
+            </label>
+          ) : typeof value === "number" ? (
+            <input
+              type="number"
+              value={value}
+              onChange={(e) => {
+                const v = parseFloat(e.target.value);
+                if (!Number.isNaN(v)) {
+                  onPatch({ ...current, [key]: v });
+                }
+              }}
+              step={Number.isInteger(value) ? 1 : 0.01}
+              className={inputClass}
+            />
+          ) : (
+            <input
+              type="text"
+              value={String(value)}
+              onChange={(e) => onPatch({ ...current, [key]: e.target.value })}
+              className={inputClass}
+            />
+          )}
+        </div>
+      );
+    });
   const edge = edgeSettings;
   const guidanceSteps = [
     { label: "1) Vyber instrument + roky", done: !!selectedInstrument && years >= minYears },
-    { label: "2) Nastav realistickou simulaci", done: params.initialCapital > 0 && params.slippagePerc >= 0 && params.commissionPerc >= 0 },
+    {
+      label: "2) Nastav realistickou simulaci",
+      done:
+        params.initialCapital > 0 &&
+        params.slippagePerc >= 0 &&
+        (params.commissionMode === "percentage"
+          ? params.commissionPerc >= 0
+          : params.commissionPerContract >= 0),
+    },
     { label: "3) Zapni validaci mimo single run", done: !!edge && edge.validationMode !== "single" },
     { label: "4) Použij quality gates", done: !!edge && edge.minTradesGate >= 20 && edge.minPfGate >= 1.0 },
   ];
@@ -331,26 +591,40 @@ export function BacktestSettings({
         "Fixní seed sice zaručí reprodukovatelnost, ale sweep na single runu pořád zvyšuje riziko přeladění.",
       );
     }
+    if (edge.validationMode === "param_test" && edge.sweepMode !== "none") {
+      guidanceWarnings.push("Param test + robustness sweep násobí počet simulací a riziko přeladění.");
+    }
+    if (edge.runFixedSeedEnabled && edge.validationMode === "param_test") {
+      guidanceWarnings.push("Param test s fixním seedem je reprodukovatelný, ale špičky metrik pořád mohou být náhodné.");
+    }
   }
 
   const strategyParamEntries = Object.entries(strategyParams);
+  const numericStrategyParamKeys = useMemo(
+    () =>
+      strategyParamEntries
+        .filter(([, v]) => typeof v === "number" && !Number.isNaN(v))
+        .map(([k]) => k)
+        .sort(),
+    [strategyParamEntries],
+  );
+  const paramTestBlocksRun = Boolean(
+    edge &&
+      edge.validationMode === "param_test" &&
+      numericStrategyParamKeys.length > 0 &&
+      !numericStrategyParamKeys.some((k) => !!edge.paramTestRanges[k]?.enabled),
+  );
   const hasStrategyParams = strategyParamEntries.length > 0;
-  const moduleTabs = moduleNamesForParams.filter((n) => {
-    const p = moduleParams[n];
-    return p && Object.keys(p).length > 0;
-  });
-  const hasModuleParams = moduleTabs.length > 0;
-  const hasAnyParams = hasStrategyParams || hasModuleParams;
-
-  const currentParams =
-    paramsTab === "strategy"
-      ? strategyParams
-      : moduleParams[paramsTab] ?? {};
-  const currentParamEntries = Object.entries(currentParams);
-  const onCurrentParamsChange =
-    paramsTab === "strategy"
-      ? (next: StrategyParams) => onStrategyParamsChange?.(next)
-      : (next: StrategyParams) => onModuleParamsChange?.(paramsTab, next);
+  const modulePanelRows = moduleParamPanels;
+  const hasModulePanels = modulePanelRows.length > 0;
+  const indicatorTabs = indicatorNamesForParams;
+  const hasIndicatorParams = indicatorTabs.length > 0;
+  const hasAnyParams = hasStrategyParams || hasModulePanels || hasIndicatorParams;
+  const dualParamTabs = hasStrategyParams && (hasModulePanels || hasIndicatorParams);
+  const tabBtnActive =
+    "flex-1 rounded-md px-2 py-1.5 text-xs font-medium bg-emerald-600/85 text-white border border-emerald-500/50";
+  const tabBtnIdle =
+    "flex-1 rounded-md px-2 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 border border-transparent hover:border-zinc-600";
 
   const toggleSection = (id: string) => {
     setSectionsOpen((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -361,6 +635,8 @@ export function BacktestSettings({
       initialCapital: 100000,
       slippagePerc: 0.001,
       commissionPerc: 0.0002,
+      commissionMode: "percentage",
+      commissionPerContract: 2.25,
     });
     if (edge && onEdgeSettingsChange) {
       onEdgeSettingsChange({
@@ -369,7 +645,7 @@ export function BacktestSettings({
       });
     }
   };
-  const applyEdgePreset = (preset: "safe" | "balanced" | "explore") => {
+  const applyEdgePreset = (preset: "safe" | "balanced" | "explore" | "prop_conservative" | "pessimist") => {
     if (!edge || !onEdgeSettingsChange) return;
     onEdgeSettingsChange({
       ...edge,
@@ -381,15 +657,19 @@ export function BacktestSettings({
       ? "nejbezpečnější validace"
       : edge?.validationMode === "oos_split"
         ? "rozumný kompromis validace"
-        : "rychlý test (vyšší riziko overfittingu)";
+        : edge?.validationMode === "param_test"
+          ? "systematický OAT průchod PARAMS (explorace citlivosti)"
+          : "rychlý test (vyšší riziko overfittingu)";
   const edgeTrustLabel =
     !edge
       ? "N/A"
       : edge.validationMode === "single"
         ? "Low confidence"
-        : edge.minTradesGate >= 30 && edge.monteCarloEnabled
-          ? "Higher confidence"
-          : "Medium confidence";
+        : edge.validationMode === "param_test"
+          ? "Exploratory (multiple comparisons)"
+          : edge.minTradesGate >= 30 && edge.monteCarloEnabled
+            ? "Higher confidence"
+            : "Medium confidence";
 
   const content = (
     <div className="space-y-4">
@@ -449,39 +729,66 @@ export function BacktestSettings({
           </select>
         </div>
         <div>
-          <SettingsFieldLabel label="Instrument" fieldId="instrument" />
-          <select
-            value={selectedInstrument?.file ?? ""}
-            onChange={(e) => {
-              const inv = instruments.find((i) => i.file === e.target.value);
-              if (inv) onSelectInstrument(inv);
-            }}
-            className={inputClass}
-          >
-            {!instrumentsLoaded ? (
-              <option value="">Načítám...</option>
-            ) : dataLoadError ? (
-              <option value="">Chyba načtení instrumentů</option>
-            ) : instruments.length === 0 ? (
-              <option value="">
-                {params.instrumentType === "futures"
-                  ? "Žádné futures"
-                  : params.instrumentType === "stocks"
-                    ? "Žádné akcie"
-                    : "Žádné forex páry"}
-              </option>
-            ) : (
-              instruments.map((inv) => (
-                <option key={inv.file} value={inv.file}>
-                  {inv.displayName ? `${inv.instrument} - ${inv.displayName}` : inv.instrument} ({inv.timeframe}, {inv.yearsAvailable} let)
-                </option>
-              ))
-            )}
-          </select>
-          {dataLoadError && (
+          <SettingsFieldLabel label="Instrument(y)" fieldId="instrument" />
+          <p className="text-xs text-zinc-500 mb-2 leading-relaxed">
+            Zaškrtni jeden nebo více — běží jako dávka po sobě (stejná strategie a parametry). Max {MAX_INSTRUMENTS_BATCH}{" "}
+            najednou. Výsledek v grafu = poslední instrument; tabulku všech runů najdeš v Analytics (
+            <span className="text-zinc-400">batchSummary</span>). Nelze kombinovat s dávkou JSON v Edge finding ani s portfoliem.
+          </p>
+          {!instrumentsLoaded ? (
+            <div className={`${inputClass} text-zinc-500`}>Načítám instrumenty…</div>
+          ) : dataLoadError ? (
             <div className="mt-2 rounded border border-rose-500/30 bg-rose-500/10 px-2 py-2 text-xs text-rose-100">
               {dataLoadError}
             </div>
+          ) : instruments.length === 0 ? (
+            <div className={`${inputClass} text-zinc-500`}>
+              {params.instrumentType === "futures"
+                ? "Žádné futures"
+                : params.instrumentType === "stocks"
+                  ? "Žádné akcie"
+                  : "Žádné forex páry"}
+            </div>
+          ) : (
+            <>
+              <div className="flex flex-wrap gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={onSelectAllInstrumentsInList}
+                  className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-xs text-zinc-200"
+                >
+                  Vybrat vše (max {MAX_INSTRUMENTS_BATCH})
+                </button>
+                <span className="text-xs text-zinc-400 self-center tabular-nums">
+                  Vybráno: {multiCount}
+                  {multiCount > 1 ? ` → ${multiCount} runů v dávce` : ""}
+                </span>
+              </div>
+              <div className="max-h-52 overflow-y-auto rounded border border-zinc-700 bg-zinc-800/50 px-2 py-2 space-y-2">
+                {instruments.map((inv) => {
+                  const on = selectedSet.has(inv.file);
+                  return (
+                    <label
+                      key={inv.file}
+                      className="flex items-start gap-2 cursor-pointer text-sm text-zinc-300 leading-snug"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        onChange={() => onToggleInstrumentFile(inv.file)}
+                        className="mt-0.5 rounded border-zinc-600"
+                      />
+                      <span>
+                        {inv.displayName ? `${inv.instrument} — ${inv.displayName}` : inv.instrument}{" "}
+                        <span className="text-zinc-500">
+                          ({inv.timeframe}, {inv.yearsAvailable} let)
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </>
           )}
         </div>
         <div>
@@ -602,16 +909,71 @@ export function BacktestSettings({
           />
         </div>
         <div>
-          <SettingsFieldLabel label="Komise (%)" fieldId="commissionPerc" />
+          <SettingsFieldLabel label="Komise — re\u017eim" fieldId="commissionMode" />
+          <select
+            id="commissionMode"
+            value={params.commissionMode}
+            onChange={(e) =>
+              onParamsChange({
+                ...params,
+                commissionMode: e.target.value as CommissionMode,
+              })
+            }
+            className={inputClass}
+          >
+            <option value="percentage">Procento z notion\u00e1lu</option>
+            <option value="per_contract">USD / kontrakt / strana (futures)</option>
+          </select>
+        </div>
+        {params.commissionMode === "percentage" ? (
+          <div>
+            <SettingsFieldLabel label="Komise (%)" fieldId="commissionPerc" />
+            <input
+              type="number"
+              min={0}
+              max={10}
+              step={0.001}
+              value={params.commissionPerc * 100}
+              onChange={(e) => onParamsChange({ ...params, commissionPerc: (parseFloat(e.target.value) || 0) / 100 })}
+              className={inputClass}
+            />
+          </div>
+        ) : (
+          <div>
+            <SettingsFieldLabel label="USD / kontrakt / strana" fieldId="commissionPerContract" />
+            <input
+              type="number"
+              min={0}
+              step={0.01}
+              value={params.commissionPerContract}
+              onChange={(e) =>
+                onParamsChange({ ...params, commissionPerContract: parseFloat(e.target.value) || 0 })
+              }
+              className={inputClass}
+            />
+            <p className="text-[10px] text-zinc-500 mt-0.5">
+              Pevn\u00fd poplatek za kontrakt na stranu (nap\u0159. futures). Pou\u017eije se jen u instrument type
+              futures.
+            </p>
+          </div>
+        )}
+        <div>
+          <SettingsFieldLabel label="Max. doba běhu (s)" fieldId="runTimeoutSec" />
           <input
             type="number"
             min={0}
-            max={10}
-            step={0.001}
-            value={params.commissionPerc * 100}
-            onChange={(e) => onParamsChange({ commissionPerc: (parseFloat(e.target.value) || 0) / 100 })}
+            max={86400}
+            step={60}
+            value={params.runTimeoutSec}
+            onChange={(e) =>
+              onParamsChange({ runTimeoutSec: Math.max(0, parseInt(e.target.value, 10) || 0) })
+            }
             className={inputClass}
           />
+          <p className="text-[11px] text-zinc-500 mt-1">
+            Limit na straně serveru (wall-clock subprocess / in-process engine). 0 = bez limitu (pokud to backend
+            povolí). Výchozí 3600 s; při pomalém PC nebo síti zvyš (např. 7200–14400).
+          </p>
         </div>
       </SettingsSection>
 
@@ -647,7 +1009,19 @@ export function BacktestSettings({
           )}
           {onSelectModules && (
             <div>
-              <SettingsFieldLabel label="Moduly (auto-detect + rucni uprava)" fieldId="selectedModuleIds" />
+              <SettingsFieldLabel
+                label="Moduly (auto-detect + ruční úprava)"
+                fieldId="selectedModuleIds"
+                helpOverride={{
+                  whatItMeans:
+                    "Automatika hledá v main.py: from/import modules.X, importlib.import_module(\"modules.X\") a názvy v PARAM_MODULE_CHAIN.",
+                  whyItMatters: "Bez výběru a Potvrdit se moduly nepřibalí k runu ani VIEW_PARAMS.",
+                  howToUse: [
+                    "Po změně importů v main.py počkej krátce (debounce) nebo znovu otevři strategii.",
+                    "Názvy v knihovně Moduly musí odpovídat Python balíčku (např. Swing HL → modules.Swing_HL).",
+                  ],
+                }}
+              />
               <div className="max-h-24 overflow-auto rounded bg-zinc-800 border border-zinc-700 p-2 space-y-1">
                 {modules.length === 0 ? (
                   <p className="text-zinc-500 text-xs">Žádné moduly. Vytvoř v sekci Moduly.</p>
@@ -681,6 +1055,13 @@ export function BacktestSettings({
               Potvrdit → zobrazit v menu
             </button>
           )}
+          <p className="text-[11px] text-zinc-500 leading-snug">
+            Další moduly (např. Swing HL u S/D strategie) mohou být doplněny v{" "}
+            <code className="text-zinc-400">main.py</code> jako{" "}
+            <code className="text-zinc-400">PARAM_MODULE_CHAIN = &quot;Název|Druhý&quot;</code> — zobrazí se v záložce
+            Moduly, přibalí se při runu a jejich VIEW_PARAMS jdou do <code className="text-zinc-400">module_params</code>{" "}
+            stejně jako u potvrzených modulů.
+          </p>
         </SettingsSection>
       )}
 
@@ -722,13 +1103,27 @@ export function BacktestSettings({
               </div>
               <div className="rounded border border-zinc-700/60 bg-zinc-800/20 p-3 space-y-2">
                 <div className="text-xs uppercase tracking-wider text-zinc-500">Rychlé profily nastavení</div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => applyEdgePreset("pessimist")}
+                    className="px-2 py-1 rounded bg-amber-900/60 hover:bg-amber-800/70 border border-amber-700/50 text-xs text-amber-100 font-medium"
+                  >
+                    Pessimist
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => applyEdgePreset("prop_conservative")}
+                    className="px-2 py-1 rounded bg-rose-900/60 hover:bg-rose-800/70 border border-rose-700/50 text-xs text-rose-100 font-medium"
+                  >
+                    Prop conservative
+                  </button>
                   <button
                     type="button"
                     onClick={() => applyEdgePreset("safe")}
                     className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-xs text-zinc-100"
                   >
-                    Safe (institucional)
+                    Safe
                   </button>
                   <button
                     type="button"
@@ -742,11 +1137,12 @@ export function BacktestSettings({
                     onClick={() => applyEdgePreset("explore")}
                     className="px-2 py-1 rounded bg-zinc-700 hover:bg-zinc-600 text-xs text-zinc-100"
                   >
-                    Explore (rychlé)
+                    Explore
                   </button>
                 </div>
                 <div className="text-xs text-zinc-500">
-                  Safe = vyšší důvěra, Explore = rychlá iterace a vyšší riziko overfittingu.
+                  Pessimist = pouze agresivn\u00ed execution (spread 2 bps, slip 3\u00d7vol, latence 2 bary, stress 2\u00d7).
+                  Prop conservative = cel\u00fd pipeline. Safe = validace + execution. Explore = rychl\u00e1 iterace.
                 </div>
               </div>
               <div>
@@ -764,6 +1160,7 @@ export function BacktestSettings({
                   <option value="single">Single run</option>
                   <option value="oos_split">Out-of-sample split</option>
                   <option value="walk_forward">Walk-forward</option>
+                  <option value="param_test">Param test (OAT sweep)</option>
                 </select>
               </div>
               {edge.validationMode === "oos_split" && (
@@ -815,6 +1212,149 @@ export function BacktestSettings({
                   WF/OOS: engine vrací foldy s daty a test metrikami; guardrails v Analytics jsou{" "}
                   <strong>heuristiky</strong> (krátké okno, málo obchodů) — ne důkaz absence leakage.
                 </p>
+              )}
+              {edge.validationMode === "param_test" && (
+                <div className="space-y-3 rounded-lg border border-zinc-700/60 bg-zinc-900/40 p-3">
+                  <div>
+                    <SettingsFieldLabel
+                      label="Param test — max. počet běhů (budget)"
+                      fieldId="paramTestMaxRuns"
+                      helpOverride={{
+                        whatItMeans:
+                          "Horní strop dodatečných backtestů po baseline. Engine rozdělí budget mezi zapnuté parametry (OAT, linspace v rozsahu).",
+                        whyItMatters: "Omezí čas běhu a riziko náhodných špiček při mnoha porovnáních.",
+                        howToUse: ["Začni 16–24 běhů.", "Max. 48.", "Zapni jen parametry, které chceš zkoumat."],
+                      }}
+                    />
+                    <input
+                      type="number"
+                      min={4}
+                      max={48}
+                      step={1}
+                      value={edge.paramTestMaxRuns}
+                      onChange={(e) => {
+                        const n = Math.min(48, Math.max(4, parseInt(e.target.value, 10) || 24));
+                        onEdgeSettingsChange?.({ ...edge, paramTestMaxRuns: n });
+                      }}
+                      className={inputClass}
+                    />
+                    <p className="text-xs text-zinc-500 mt-1">
+                      Pouze <strong>číselné PARAMS strategie</strong> (ne moduly). Baseline run = aktuální hodnoty v
+                      záložce Strategie; poté engine systematicky mění jeden parametr najednou v zadaném rozsahu.
+                    </p>
+                  </div>
+                  {numericStrategyParamKeys.length > 0 &&
+                    !numericStrategyParamKeys.some((k) => edge.paramTestRanges[k]?.enabled) && (
+                      <p className="text-xs text-amber-200/90">
+                        Zaškrtni „Test“ u alespoň jednoho parametru — bez toho engine neprovede OAT sweep (proběhne jen
+                        baseline).
+                      </p>
+                    )}
+                  <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
+                    <input
+                      type="checkbox"
+                      checked={edge.paramTestTrainOnly}
+                      onChange={(e) => onEdgeSettingsChange?.({ ...edge, paramTestTrainOnly: e.target.checked })}
+                      className="accent-indigo-500 w-4 h-4"
+                    />
+                    <span>
+                      Train-only <span className="text-zinc-500">(OAT sweep na train \u010d\u00e1sti, holdout ov\u011b\u0159en\u00ed nejlep\u0161\u00edho parametru)</span>
+                    </span>
+                  </label>
+                  {numericStrategyParamKeys.length === 0 ? (
+                    <p className="text-xs text-amber-200/90">Žádné číselné PARAMS — přidej v kódu strategie nebo panelu.</p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs text-left border-collapse">
+                        <thead>
+                          <tr className="text-zinc-500 border-b border-zinc-700">
+                            <th className="py-1 pr-2 font-medium">Parametr</th>
+                            <th className="py-1 pr-2 font-medium">Test</th>
+                            <th className="py-1 pr-2 font-medium">Min</th>
+                            <th className="py-1 pr-2 font-medium">Max</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {numericStrategyParamKeys.map((paramKey) => {
+                            const base = Number(strategyParams[paramKey]);
+                            const row = edge.paramTestRanges[paramKey] ?? {
+                              enabled: false,
+                              min: base,
+                              max: base,
+                            };
+                            return (
+                              <tr key={paramKey} className="border-b border-zinc-800/80">
+                                <td className="py-1.5 pr-2 font-mono text-zinc-300">{paramKey}</td>
+                                <td className="py-1.5 pr-2">
+                                  <input
+                                    type="checkbox"
+                                    checked={row.enabled}
+                                    onChange={() =>
+                                      onEdgeSettingsChange?.({
+                                        ...edge,
+                                        paramTestRanges: {
+                                          ...edge.paramTestRanges,
+                                          [paramKey]: {
+                                            enabled: !row.enabled,
+                                            min: row.min,
+                                            max: row.max,
+                                          },
+                                        },
+                                      })
+                                    }
+                                    className="rounded border-zinc-600"
+                                  />
+                                </td>
+                                <td className="py-1.5 pr-2">
+                                  <input
+                                    type="number"
+                                    step="any"
+                                    value={row.min}
+                                    onChange={(e) => {
+                                      const n = parseFloat(e.target.value);
+                                      onEdgeSettingsChange?.({
+                                        ...edge,
+                                        paramTestRanges: {
+                                          ...edge.paramTestRanges,
+                                          [paramKey]: {
+                                            ...row,
+                                            min: Number.isFinite(n) ? n : row.min,
+                                          },
+                                        },
+                                      });
+                                    }}
+                                    className={`${inputClass} w-full min-w-[5rem]`}
+                                  />
+                                </td>
+                                <td className="py-1.5 pr-2">
+                                  <input
+                                    type="number"
+                                    step="any"
+                                    value={row.max}
+                                    onChange={(e) => {
+                                      const n = parseFloat(e.target.value);
+                                      onEdgeSettingsChange?.({
+                                        ...edge,
+                                        paramTestRanges: {
+                                          ...edge.paramTestRanges,
+                                          [paramKey]: {
+                                            ...row,
+                                            max: Number.isFinite(n) ? n : row.max,
+                                          },
+                                        },
+                                      });
+                                    }}
+                                    className={`${inputClass} w-full min-w-[5rem]`}
+                                  />
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
               )}
               <div className="grid grid-cols-3 gap-2">
                 <div>
@@ -1054,7 +1594,7 @@ export function BacktestSettings({
                         onChange={(e) => onEdgeSettingsChange?.({ ...edge, batchEnabled: e.target.checked })}
                         className="rounded"
                       />
-                      Enabled (sekvenční Docker runy, max 48)
+                      Enabled (batch engine runs, max 48; paralelizace env BATCH_PARALLEL_WORKERS)
                     </label>
                   </div>
                   {edge.batchEnabled && (
@@ -1139,6 +1679,23 @@ export function BacktestSettings({
                         />
                       </div>
                     </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <SettingsFieldLabel label="Stress multiplier" fieldId="stressMultiplier" />
+                        <input
+                          type="number"
+                          min={1}
+                          max={5}
+                          step={0.1}
+                          value={edge.stressMultiplier}
+                          onChange={(e) => onEdgeSettingsChange?.({ ...edge, stressMultiplier: parseFloat(e.target.value) || 1.0 })}
+                          className={inputClass}
+                        />
+                        <p className="text-[10px] text-zinc-500 mt-0.5">
+                          N\u00e1sob\u00ed slippage/spread p\u0159i backtestu. 1.0 = norm\u00e1ln\u00ed, 1.5 = prop stress test, 2.0+ = extr\u00e9mn\u00ed.
+                        </p>
+                      </div>
+                    </div>
                     <div className="space-y-1">
                       <SettingsFieldLabel label="Forward testing bridge" fieldId="forwardBridgeEnabled" />
                       <label className="flex items-center gap-2 cursor-pointer text-sm text-zinc-300">
@@ -1200,86 +1757,124 @@ export function BacktestSettings({
       {canRun && (
         <SettingsSection id="parameters" title="Parameters" open={sectionsOpen.parameters} onToggle={toggleSection}>
           {hasAnyParams ? (
-            <>
-              <div className="flex gap-1 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => setParamsTab("strategy")}
-                  className={`px-2 py-1 rounded text-xs ${
-                    paramsTab === "strategy"
-                      ? "bg-zinc-600 text-white"
-                      : "bg-zinc-800 text-zinc-400 hover:text-zinc-200"
-                  }`}
-                >
-                  Strategie
-                </button>
-                {moduleTabs.map((name) => (
+            <div className="space-y-4">
+              {dualParamTabs ? (
+                <div className="flex gap-1 p-0.5 rounded-lg bg-zinc-800/70 border border-zinc-700/80">
                   <button
-                    key={name}
                     type="button"
-                    onClick={() => setParamsTab(name)}
-                    className={`px-2 py-1 rounded text-xs ${
-                      paramsTab === name
-                        ? "bg-zinc-600 text-white"
-                        : "bg-zinc-800 text-zinc-400 hover:text-zinc-200"
-                    }`}
+                    className={paramScopeTab === "strategy" ? tabBtnActive : tabBtnIdle}
+                    onClick={() => setParamScopeTab("strategy")}
                   >
-                    {name}
+                    Strategie · PARAMS
                   </button>
-                ))}
-              </div>
-              {currentParamEntries.length > 0 ? (
-                currentParamEntries.map(([key, value]) => (
-                  <div key={key}>
-                    <div className="mb-1 flex items-center gap-2">
-                      <span className={labelTextClass}>{key}</span>
-                      <FieldHelpPopover help={getDynamicParamHelp(key)} />
-                    </div>
-                    {typeof value === "number" ? (
-                      <input
-                        type="number"
-                        value={value}
-                        onChange={(e) => {
-                          const v = parseFloat(e.target.value);
-                          if (!Number.isNaN(v)) {
-                            onCurrentParamsChange?.({ ...currentParams, [key]: v });
-                          }
-                        }}
-                        step={Number.isInteger(value) ? 1 : 0.01}
-                        className={inputClass}
-                      />
-                    ) : typeof value === "boolean" ? (
-                      <label className="flex items-center gap-2 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={value}
-                          onChange={(e) =>
-                            onCurrentParamsChange?.({ ...currentParams, [key]: e.target.checked })
-                          }
-                          className="rounded"
-                        />
-                        <span className="text-sm text-zinc-300">{value ? "Yes" : "No"}</span>
-                      </label>
-                    ) : (
-                      <input
-                        type="text"
-                        value={String(value)}
-                        onChange={(e) =>
-                          onCurrentParamsChange?.({ ...currentParams, [key]: e.target.value })
-                        }
-                        className={inputClass}
-                      />
-                    )}
+                  <button
+                    type="button"
+                    className={paramScopeTab === "modules" ? tabBtnActive : tabBtnIdle}
+                    onClick={() => setParamScopeTab("modules")}
+                  >
+                    Moduly / indikátory · VIEW_PARAMS
+                  </button>
+                </div>
+              ) : null}
+
+              {(dualParamTabs ? paramScopeTab === "strategy" : hasStrategyParams) ? (
+                <div>
+                  <div className="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-2">
+                    {dualParamTabs ? "Parametry strategie" : "Strategie"}
                   </div>
-                ))
-              ) : (
-                <p className="text-zinc-500 text-xs">
-                  {paramsTab === "strategy"
-                    ? "Žádné parametry strategie"
-                    : `Žádné parametry pro ${paramsTab}`}
-                </p>
-              )}
-            </>
+                  {hasStrategyParams ? (
+                    <div className="space-y-3 pl-0.5">
+                      {renderParamFields(
+                        strategyParamEntries,
+                        strategyParams,
+                        (next) => onStrategyParamsChange?.(next),
+                        { kind: "strategy" },
+                        strategyParamMeta,
+                      )}
+                    </div>
+                  ) : (
+                    <p className="text-zinc-500 text-xs">Žádné PARAMS v main.py strategie</p>
+                  )}
+                </div>
+              ) : null}
+
+              {(dualParamTabs ? paramScopeTab === "modules" : !hasStrategyParams && (hasModulePanels || hasIndicatorParams))
+                ? (
+                <div className="space-y-4">
+                  {hasModulePanels ? (
+                    <div className="space-y-2">
+                      <div className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Moduly</div>
+                      <p className="text-[11px] text-zinc-600 leading-snug">
+                        Hodnoty jdou do <code className="text-zinc-400">params.module_params</code> pod klíčem názvu
+                        modulu — strategie je sloučí podle své logiky (nesčítají se s PARAMS, pokud strategie výslovně
+                        nepřenáší klíče).
+                      </p>
+                      {modulePanelRows.map((row: ModuleParamPanelEntry) => {
+                        const mid = `module:${row.name}`;
+                        const cur = moduleParams[row.name] ?? {};
+                        const ent = Object.entries(cur);
+                        const subtitle = row.fromParamChain
+                          ? "VIEW_PARAMS · PARAM_MODULE_CHAIN (přibaleno při runu)"
+                          : "Parametry modulu (VIEW_PARAMS)";
+                        return (
+                          <CollapsibleParamPanel
+                            key={mid}
+                            panelId={mid.replace(/[^a-zA-Z0-9_-]/g, "_")}
+                            title={row.fromParamChain ? `${row.name} · řetěz` : row.name}
+                            subtitle={subtitle}
+                            open={!!paramPanelOpen[mid]}
+                            onToggle={() => toggleParamPanel(mid)}
+                          >
+                            {ent.length === 0 ? (
+                              <p className="text-zinc-500 text-xs">
+                                Modul nemá VIEW_PARAMS v main.py — přidej dict VIEW_PARAMS nebo uprav výchozí v kódu.
+                              </p>
+                            ) : (
+                              renderParamFields(ent, cur, (next) => onModuleParamsChange?.(row.name, next), {
+                                kind: "module",
+                                name: row.name,
+                              }, moduleParamMeta[row.name] ?? {})
+                            )}
+                          </CollapsibleParamPanel>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+
+                  {hasIndicatorParams ? (
+                    <div className="space-y-2">
+                      <div className="text-xs font-medium text-zinc-500 uppercase tracking-wider">Indikátory</div>
+                      {indicatorTabs.map((name) => {
+                        const iid = `indicator:${name}`;
+                        const cur = indicatorParams[name] ?? {};
+                        const ent = Object.entries(cur);
+                        return (
+                          <CollapsibleParamPanel
+                            key={iid}
+                            panelId={iid.replace(/[^a-zA-Z0-9_-]/g, "_")}
+                            title={name}
+                            subtitle="Parametry indikátoru (VIEW_PARAMS)"
+                            open={!!paramPanelOpen[iid]}
+                            onToggle={() => toggleParamPanel(iid)}
+                          >
+                            {ent.length === 0 ? (
+                              <p className="text-zinc-500 text-xs">
+                                Indikátor nemá VIEW_PARAMS v main.py.
+                              </p>
+                            ) : (
+                              renderParamFields(ent, cur, (next) => onIndicatorParamsChange?.(name, next), {
+                                kind: "indicator",
+                                name,
+                              }, indicatorParamMeta[name] ?? {})
+                            )}
+                          </CollapsibleParamPanel>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           ) : (
             <p className="text-zinc-500 text-xs">Žádné parametry</p>
           )}
@@ -1289,7 +1884,7 @@ export function BacktestSettings({
       <SettingsSection id="run" title="Run" open={sectionsOpen.run} onToggle={toggleSection}>
         <button
           onClick={onRun}
-          disabled={isRunning || !canRun}
+          disabled={isRunning || !canRun || paramTestBlocksRun}
           className="w-full py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
         >
           {isRunning ? "Běží..." : canRun ? "Run" : "Otevřete strategii"}

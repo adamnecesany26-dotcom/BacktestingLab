@@ -79,8 +79,8 @@ const FAQ_ITEMS: FaqItem[] = [
     a: "V záložce Results klikněte na Export. Stáhne se JSON soubor s equity křivkou, metrikami a obchody.",
   },
   {
-    q: "Proč se backtest spouští v Dockeru?",
-    a: "Strategie je cizí Python kód. Docker zajišťuje izolaci – bez síťového přístupu, omezenou paměť a CPU. Nemůže poškodit váš systém. Timeout je 3 minuty.",
+    q: "Kde se backtest spouští?",
+    a: "Backend spustí engine jako samostatný Python proces na stejném počítači (stejné prostředí jako API). Pro vlastní použití je to nejjednodušší; timeout běhu nastavíš v nastavení backtestu (výchozí je řádově hodiny na straně serveru).",
   },
   {
     q: "Jak přidám další soubor ke strategii?",

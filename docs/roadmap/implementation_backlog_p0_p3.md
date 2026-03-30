@@ -2,9 +2,11 @@
 
 This document turns the dual audit into execution backlog with acceptance criteria.
 
+> **Note:** The app now runs `engine.py` as a **host subprocess** (no Docker required). Some P0 bullets below are historical; treat “Docker” as optional hardening, not current architecture.
+
 ## P0 - Security and Determinism
 
-- Move all user module execution into Docker engine.
+- (Historical) Move all user module execution into Docker engine — current: subprocess on host for single-user.
 - Introduce per-run isolation in `.backtest_run/<run_id>`.
 - Add strict path traversal protection for uploaded strategy files.
 - Enforce unified request validation before stream/non-stream divergence.
@@ -12,7 +14,7 @@ This document turns the dual audit into execution backlog with acceptance criter
 
 ### Acceptance Criteria
 
-- No user Python code is executed on backend host outside Docker.
+- (Relax for single-user host runs) User strategy code runs in a child process on the host.
 - Parallel runs do not share files and cannot overwrite each other.
 - Traversal attempts (`../`) are rejected.
 - `runId` is present in result payload and persisted to run history.

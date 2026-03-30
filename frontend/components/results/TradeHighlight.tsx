@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { TradeHighlightChart } from "@/components/charts/TradeHighlightChart";
 import type { Trade } from "@shared/types";
 import type { OhlcBar } from "@shared/types";
@@ -30,18 +30,51 @@ function formatPnl(n: number | undefined): string {
   return `${s}$${n.toFixed(2)}`;
 }
 
+type TradeSort =
+  | "index"
+  | "pnl_desc"
+  | "pnl_asc"
+  | "entry_desc"
+  | "entry_asc"
+  | "exit_desc"
+  | "exit_asc";
+
 export function TradeHighlight({ ohlc, trades, chartHeight = 360 }: TradeHighlightProps) {
-  const [selectedIndex, setSelectedIndex] = useState<number | null>(
-    trades.length > 0 ? 0 : null
-  );
+  const [sort, setSort] = useState<TradeSort>("index");
+  const order = useMemo(() => {
+    const idx = trades.map((_, i) => i);
+    const entryMs = (t: Trade) => {
+      const s = t.entryDate ?? t.date ?? "";
+      const ms = Date.parse(s);
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    const exitMs = (t: Trade) => {
+      const s = t.exitDate ?? t.date ?? "";
+      const ms = Date.parse(s);
+      return Number.isFinite(ms) ? ms : 0;
+    };
+    const pnl = (t: Trade) => (t.pnl != null && Number.isFinite(t.pnl) ? t.pnl : 0);
+    if (sort === "index") return idx;
+    if (sort === "pnl_desc") return [...idx].sort((a, b) => pnl(trades[b]!) - pnl(trades[a]!));
+    if (sort === "pnl_asc") return [...idx].sort((a, b) => pnl(trades[a]!) - pnl(trades[b]!));
+    if (sort === "entry_desc") return [...idx].sort((a, b) => entryMs(trades[b]!) - entryMs(trades[a]!));
+    if (sort === "entry_asc") return [...idx].sort((a, b) => entryMs(trades[a]!) - entryMs(trades[b]!));
+    if (sort === "exit_desc") return [...idx].sort((a, b) => exitMs(trades[b]!) - exitMs(trades[a]!));
+    return [...idx].sort((a, b) => exitMs(trades[a]!) - exitMs(trades[b]!));
+  }, [trades, sort]);
+
+  const [selectedOrderPos, setSelectedOrderPos] = useState(0);
   useEffect(() => {
     if (trades.length === 0) {
-      setSelectedIndex(null);
+      setSelectedOrderPos(0);
       return;
     }
-    setSelectedIndex((prev) => (prev == null || prev >= trades.length ? 0 : prev));
-  }, [trades]);
-  const selectedTrade = selectedIndex != null && trades[selectedIndex] ? trades[selectedIndex] : null;
+    setSelectedOrderPos((p) => (p >= order.length ? 0 : p));
+  }, [trades.length, order.length]);
+
+  const selectedOriginalIndex = order.length > 0 ? order[Math.min(selectedOrderPos, order.length - 1)]! : null;
+  const selectedTrade =
+    selectedOriginalIndex != null && trades[selectedOriginalIndex] ? trades[selectedOriginalIndex] : null;
 
   if (trades.length === 0) {
     return (
@@ -104,8 +137,29 @@ export function TradeHighlight({ ohlc, trades, chartHeight = 360 }: TradeHighlig
           </div>
         )}
       </div>
-      <div className="shrink-0">
-        <h3 className="text-sm font-medium text-zinc-400 mb-2">Všechny obchody – klikněte pro detail</h3>
+      <div className="shrink-0 rounded-xl border border-zinc-700/45 bg-zinc-950/35 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h3 className="text-sm font-medium text-zinc-300">Obchody — klikni pro detail na grafu</h3>
+          <label className="flex items-center gap-2 text-xs text-zinc-400">
+            Řazení
+            <select
+              value={sort}
+              onChange={(e) => {
+                setSort(e.target.value as TradeSort);
+                setSelectedOrderPos(0);
+              }}
+              className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-zinc-200 text-xs"
+            >
+              <option value="index">Pořadí ve strategii</option>
+              <option value="pnl_desc">PnL nejvyšší → nejnižší</option>
+              <option value="pnl_asc">PnL nejnižší → nejvyšší</option>
+              <option value="entry_desc">Datum vstupu ↓</option>
+              <option value="entry_asc">Datum vstupu ↑</option>
+              <option value="exit_desc">Datum výstupu ↓</option>
+              <option value="exit_asc">Datum výstupu ↑</option>
+            </select>
+          </label>
+        </div>
         <div className="overflow-x-auto rounded-lg border border-zinc-800 max-h-64 overflow-y-auto">
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-zinc-800/95 z-10">
@@ -118,21 +172,22 @@ export function TradeHighlight({ ohlc, trades, chartHeight = 360 }: TradeHighlig
               </tr>
             </thead>
             <tbody>
-              {trades.map((t, i) => {
+              {order.map((origIdx, rowPos) => {
+                const t = trades[origIdx]!;
                 const pnl = t.pnl ?? 0;
                 const isWin = pnl >= 0;
-                const isSelected = selectedIndex === i;
+                const isSelected = selectedOrderPos === rowPos;
                 return (
                   <tr
-                    key={i}
-                    onClick={() => setSelectedIndex(i)}
+                    key={`${origIdx}-${rowPos}`}
+                    onClick={() => setSelectedOrderPos(rowPos)}
                     className={`border-b border-zinc-800/80 cursor-pointer transition-colors ${
                       isSelected
                         ? "bg-emerald-500/20 hover:bg-emerald-500/25"
                         : "hover:bg-zinc-800/50"
                     }`}
                   >
-                    <td className="px-4 py-2 text-zinc-400">{i + 1}</td>
+                    <td className="px-4 py-2 text-zinc-400">{origIdx + 1}</td>
                     <td className="px-4 py-2 text-zinc-300">{formatDate(t.entryDate ?? t.date)}</td>
                     <td className="px-4 py-2 text-zinc-300">{formatDate(t.exitDate ?? t.date)}</td>
                     <td className="px-4 py-2">
