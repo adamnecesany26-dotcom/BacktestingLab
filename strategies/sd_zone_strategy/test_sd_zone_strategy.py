@@ -47,9 +47,6 @@ class TestExecTfMinutes(unittest.TestCase):
     def test_expected_30m(self):
         self.assertEqual(sd._exec_timeframe_expected_minutes("30m"), 30.0)
 
-    def test_expected_2h(self):
-        self.assertEqual(sd._exec_timeframe_expected_minutes("2h"), 120.0)
-
     def test_infer_median(self):
         idx = pd.date_range("2025-01-01", periods=5, freq="30min", tz="UTC")
         df = pd.DataFrame({"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}, index=idx)

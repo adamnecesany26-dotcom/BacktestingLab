@@ -16,7 +16,7 @@ Interface pro View:
   detect(ohlc, params=None) -> [{"date","type":"high"|"low"|"internal_high"|"internal_low","value"}, ...]
   get_zones(ohlc, params=None) -> zóny + "has_touch", "touch_bar_index", "touch_marker_price", "touch_date" (View),
   get_line(ohlc, params=None) -> stejný trend jako v HL_identificator/Swing_HL (klíč „HL trend“), barvy podle stavu ve View,
-    "active_demand_zones_below" (Demand), inducement s "index"; životnost vpravo = 2× zone_extend_right_bars + far-invalidate + střih při překryvu.
+    "active_demand_zones_below" (Demand), inducement s "index"; životnost vpravo do konce řady nebo ukončení (close / dotyk po odchodu / far-invalidate mimo major BOS zóny); střih při překryvu.
   base_length: svíčka je v base jen pokud současně platí práh % rozpětí H–L v zóně a práh % těla v zóně (VIEW_PARAMS).
 
 VIEW_PARAMS musí být bez inline komentářů za hodnotami (např. NE: 1.0, #x) — parser ve View maže komentář
@@ -27,7 +27,7 @@ Pravidla S/D v-1.0 (viz SD_def.md):
 - Supply: bearish BOS + pivot = bar s max(high) v momentum leg (od swing high k BOS)
 - Výška zóny: H/L pivot svíčky
 - Šířka vlevo: prodloužení doleva, pokud předchozí svíčka má ≥33% H-L v zóně A ≥10% těla v zóně
-- Šířka vpravo: 2× zone_extend_right_bars; close invalidace; dotyk; volitelně daleko od zóny (far-invalidate, výchozí vypnuto); střih při ≥60 % překryvu se stejným typem
+- Šířka vpravo: až do posledního baru řady; ukončení — close pod/nad zónou, dotyk po odchodu, far-invalidate (u zón z major BOS se far-invalidate neaplikuje); střih při ≥60 % překryvu se stejným typem
 - Dotyk krátce po odchodu od zóny (rychlá korekce) nemusí ukončit život zóny doprava — viz zone_touch_departure_cooldown_bars.
 - Odchod musí mít minimální vzdálenost od hranice v ATR (zone_departure_min_atr), jinak návrat u okraje neukončí zónu falešným „dotykem po departure“.
 - V chop/range (okno trend skóre mezi bull a bear prahy) lze doplnit úzké D/S u Major H/L — viz range_major_proximity_*.
@@ -249,7 +249,6 @@ def _append_major_proximity_chop_zones(
     internals: list[dict],
     threshold: float,
     body_threshold: float,
-    effective_max_right: int,
     touch_vicinity_atr: float,
     far_inv_bars: int,
     far_inv_atr: float,
@@ -370,7 +369,6 @@ def _append_major_proximity_chop_zones(
             mi,
             zone_low,
             zone_high,
-            effective_max_right,
             zone_type,
             atr_series,
             touch_vicinity_atr,
@@ -379,6 +377,7 @@ def _append_major_proximity_chop_zones(
             far_inv_atr,
             major_prot,
             params,
+            skip_far_invalidate=False,
         )
         leftmost = _compute_zone_width(ohlc, mi, zone_low, zone_high, threshold, body_threshold)
         base_length = _compute_base_width(ohlc, mi, zone_low, zone_high, rightmost, params)
@@ -465,6 +464,60 @@ def _hl_swing_overrides_from_params(params: dict | None) -> dict[str, int]:
     return out
 
 
+def _sd_zone_max_base_cap(params: dict | None) -> int:
+    """
+    Max. délka base (počet barů) pro registraci Demand/Supply. 0 = bez stropu.
+    Výchozí 11: vyřadí typické konsolidační zóny s dlouhou bází.
+    Klíč sd_zone_max_base_bars má přednost, pak max_base_length ze strategie; pokud chybí oba → 11.
+    """
+    p = params or {}
+    for key in ("sd_zone_max_base_bars", "max_base_length"):
+        raw = p.get(key)
+        if raw is None:
+            continue
+        try:
+            c = int(raw)
+            return max(0, c)
+        except (TypeError, ValueError):
+            continue
+    return 11
+
+
+def _event_bos_swing_kind(ev: dict) -> str:
+    k = ev.get("bos_swing_kind")
+    if isinstance(k, str) and k.strip():
+        return k.strip()
+    return "major" if ev.get("is_major") else "swing"
+
+
+def _sd_skip_zone_after_metrics(
+    bos_kind: str,
+    base_length: int,
+    base_cap: int,
+    bos_idx: int,
+    swing_idx: int,
+    impulse_score: int,
+    params: dict,
+) -> bool:
+    if base_cap > 0 and int(base_length) > base_cap:
+        return True
+    if bos_kind != "internal":
+        return False
+    try:
+        min_leg = int(params.get("internal_bos_min_leg_bars", 5))
+    except (TypeError, ValueError):
+        min_leg = 5
+    if min_leg > 0 and (int(bos_idx) - int(swing_idx)) < min_leg:
+        return True
+    try:
+        min_imp = int(params.get("internal_bos_min_impulse_score", 2))
+    except (TypeError, ValueError):
+        min_imp = 2
+    if min_imp > 0 and int(impulse_score) < min_imp:
+        return True
+    return False
+
+
 def _params_for_hl_calls(params: dict | None) -> dict:
     """Sloučení parametrů pro get_swings / get_bos / get_major_swings včetně volitelných hl_swing_* override."""
     p = dict(params or {})
@@ -514,13 +567,24 @@ VIEW_PARAMS = {
     "pivot_volume_spike_min_range_atr": 1.0,
     "pivot_zone_height_cap_atr": 3.0,
     "pivot_zone_height_cap_atr_supply": 1.75,
-    "zone_far_invalidate_enabled": 0,
+    "zone_far_invalidate_enabled": 1,
     "zone_touch_departure_cooldown_bars": 6,
     "zone_departure_min_atr": 0.25,
+    "zone_near_duplicate_keep_newer_enabled": 1,
+    "zone_near_duplicate_max_pivot_gap": 14,
+    "zone_near_duplicate_min_overlap_ratio": 0.18,
+    "zone_near_duplicate_gap_atr": 0.45,
     "range_major_proximity_zones_enabled": 1,
     "range_major_zone_width_atr": 0.85,
     "range_major_require_chop_trend": 1,
     "range_major_impulse_lookahead_bars": 8,
+    "sd_zone_max_base_bars": 11,
+    "bos_include_internal_pivots": 1,
+    "show_sd_zones_from_major_bos": 1,
+    "show_sd_zones_from_swing_bos": 1,
+    "show_sd_zones_from_internal_bos": 0,
+    "internal_bos_min_leg_bars": 5,
+    "internal_bos_min_impulse_score": 2,
 }
 
 VIEW_PARAMS_META = {
@@ -554,9 +618,8 @@ VIEW_PARAMS_META = {
         "whatItMeans": "Násobí minimální vzdálenost swingů proti presetu daného timeframe zón a mírně zpřísní ATR potvrzení. Stejné číslo na 30m i 4h = stejná *relativní* hustota vůči výchozímu TF. Zkus 1.3–1.8 když jsou swingy moc časté na jemnějším TF.",
     },
     "zone_extend_right_bars": {
-        "title": "Horizont zóny doprava (×2 bary)",
-        "whatItMeans": "Smyčka sleduje nejvýše 2× tuto hodnotu barů za pivotem. Ukončení: close za zónou, volitelný far-invalidate (výchozí vypnuto), nebo dotyk (kromě rychlé korekce v zone_touch_departure_cooldown_bars).",
-        "howToUse": ["Příklad 60 → až ~120 barů; na 30m přepočítej podle toho, jak dlouho chceš zónu sledovat."],
+        "title": "Horizont zóny doprava (zastaralé)",
+        "whatItMeans": "Dříve omezovalo počet barů vpravo od pivotu; nyní se zóna táhne až do konce načtené řady. Ukončení řídí close, dotyk po odchodu a far-invalidate (parametr níže). Hodnotu může strategie stále posílat kvůli kompatibilitě, algoritmus ji ignoruje.",
     },
     "base_bar_range_in_zone_min": {
         "title": "Base — min. podíl rozpětí H–L uvnitř zóny",
@@ -653,8 +716,8 @@ VIEW_PARAMS_META = {
         "whatItMeans": "U Supply často stačí užší pásmo (vrcholové svíčky bývají extrémně dlouhé). Kladné číslo přepíše pro Supply hodnotu pivot_zone_height_cap_atr. Nula = použij jen pivot_zone_height_cap_atr.",
     },
     "zone_far_invalidate_enabled": {
-        "title": "Ukončit zónu při dlouhém „odstupu“ od ceny (far invalidate)",
-        "whatItMeans": "0 = vypnuto (zóna nekončí jen tím, že je cena dlouho daleko podle A×ATR v řadě). 1 = zapnuto původní logiku N po sobě jdoucích barů mimo pásmo.",
+        "title": "Ukončit zónu při dlouhém „odstupu“ od ceny (far invalidate, ne u major BOS)",
+        "whatItMeans": "1 = po N po sobě jdoucích barech mimo pásmo (×ATR) se zóna zkrátí; u zón z major BOS se far-invalidate neaplikuje (až close / dotyk). 0 = far kill vypnutý.",
     },
     "zone_touch_departure_cooldown_bars": {
         "title": "Ignorovat ukončující dotyk po odchodu (bary)",
@@ -663,6 +726,22 @@ VIEW_PARAMS_META = {
     "zone_departure_min_atr": {
         "title": "Min. odchod od zóny (× ATR)",
         "whatItMeans": "Demand: celý bar musí být alespoň tento násobek ATR nad horní hranou zóny, než se počítá odchod (a může platit návrat/dotyk). Supply symetricky dolů. 0 = původní chování (stačilo lehce nad horní hranou).",
+    },
+    "zone_near_duplicate_keep_newer_enabled": {
+        "title": "Sloučit těsné duplicitní zóny (novější výhra)",
+        "whatItMeans": "Pokud jsou dvě zóny stejného typu s podobným pivotem a cenami těsně u sebe, starší se zahodí a zůstane jen novější.",
+    },
+    "zone_near_duplicate_max_pivot_gap": {
+        "title": "Max. rozestup pivotů pro „podobný origin“ (bary)",
+        "whatItMeans": "Jen pokud |pivot_A − pivot_B| ≤ této hodnotě, uvažuje se duplicita.",
+    },
+    "zone_near_duplicate_min_overlap_ratio": {
+        "title": "Min. vertikální překryv (vůči nižší výšce zóny)",
+        "whatItMeans": "Poměr překryvu pásma low–high jako u zone_overlap_trim; nad prahem = považovat za stejné místo.",
+    },
+    "zone_near_duplicate_gap_atr": {
+        "title": "„Téměř dotyk“ — mezera hran (× ATR)",
+        "whatItMeans": "Nedisjunktní překryv: pokud je vertikální mezi boxy > 0 a ≤ tento násobek ATR (ref. větší z pivotů), bereme jako duplicitu.",
     },
     "range_major_proximity_zones_enabled": {
         "title": "Doplnit zóny u Major v chop/range",
@@ -679,6 +758,38 @@ VIEW_PARAMS_META = {
     "range_major_impulse_lookahead_bars": {
         "title": "Major-proximity — lookahead pro impulse_score (bary)",
         "whatItMeans": "Syntetický „BOS“ index = pivot + tato hodnota (strop konce řady) pro výpočet impulse_score u doplněných zón.",
+    },
+    "sd_zone_max_base_bars": {
+        "title": "Max. délka base — zónu vůbec neregistrovat",
+        "whatItMeans": "Demand/Supply s base_length větší než tato hodnota se ignorují (typicky dlouhá konsolidace). 0 = bez limitu.",
+    },
+    "bos_include_internal_pivots": {
+        "title": "Počítat BOS i na Internal H/L",
+        "whatItMeans": "Zapnuto = třetí nezávislý proud BOS událostí z internal pivotů (pro zóny); oranžové BOS čáry z internalů se ve View nevykreslují.",
+        "boolean_widget": True,
+    },
+    "show_sd_zones_from_major_bos": {
+        "title": "Zobrazit S/D zóny z BOS na Major swing",
+        "whatItMeans": "Demand/Supply vzniklé z prolomení major high/low.",
+        "boolean_widget": True,
+    },
+    "show_sd_zones_from_swing_bos": {
+        "title": "Zobrazit S/D zóny z BOS na běžném swing",
+        "whatItMeans": "Demand/Supply z klasického swing BOS.",
+        "boolean_widget": True,
+    },
+    "show_sd_zones_from_internal_bos": {
+        "title": "Zobrazit S/D zóny z BOS na Internal H/L",
+        "whatItMeans": "Výchozí vypnuto — zapni pro více zón; doporučeno s přísnějšími prahy internal_bos_*.",
+        "boolean_widget": True,
+    },
+    "internal_bos_min_leg_bars": {
+        "title": "Internal BOS — min. bary od pivotu k BOS",
+        "whatItMeans": "Kratší „nohy“ se zahodí (méně šumu v chopu). 0 = vypnuto.",
+    },
+    "internal_bos_min_impulse_score": {
+        "title": "Internal BOS — min. impulse score (1–4)",
+        "whatItMeans": "Zóna z internal BOS jen pokud impulzní skóre legu ≥ této hodnoty. 0 = vypnuto.",
     },
 }
 
@@ -932,6 +1043,81 @@ def _trim_overlapping_sd_zones(
                     older["date_end"] = _to_date_str(index[end_older])
 
 
+def _vertical_price_gap_between_boxes(
+    z_lo: float, z_hi: float, k_lo: float, k_hi: float,
+) -> float:
+    """Kladná mezera mezi disjunktními cenovými intervaly; 0 pokud se překrývají."""
+    if min(z_hi, k_hi) >= max(z_lo, k_lo):
+        return 0.0
+    if z_hi < k_lo:
+        return float(k_lo - z_hi)
+    if k_hi < z_lo:
+        return float(z_lo - k_hi)
+    return 0.0
+
+
+def _dedupe_near_duplicate_sd_zones_newer_wins(
+    zones: list[dict],
+    atr_series: pd.Series,
+    params: dict | None,
+) -> list[dict]:
+    """
+    Stejný typ, podobný pivot (časový origin) a ceny těsně u sebe (překryv nebo mezera ≤ gap×ATR):
+    ponechat jen novější zónu (vyšší pivot_idx).
+    """
+    p = params or {}
+    if not bool(int(p.get("zone_near_duplicate_keep_newer_enabled", 1))):
+        return zones
+    try:
+        max_pivot_gap = max(1, int(p.get("zone_near_duplicate_max_pivot_gap", 14)))
+    except (TypeError, ValueError):
+        max_pivot_gap = 14
+    try:
+        min_ol = float(p.get("zone_near_duplicate_min_overlap_ratio", 0.18))
+    except (TypeError, ValueError):
+        min_ol = 0.18
+    try:
+        gap_atr = float(p.get("zone_near_duplicate_gap_atr", 0.45))
+    except (TypeError, ValueError):
+        gap_atr = 0.45
+
+    sd_sorted = sorted(
+        (z for z in zones if z.get("name") in ("Demand", "Supply")),
+        key=lambda x: int(x.get("pivot_idx", 0)),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for z in sd_sorted:
+        pz = int(z.get("pivot_idx", 0))
+        z_lo = float(z["value_low"])
+        z_hi = float(z["value_high"])
+        zi = max(0, min(pz, len(atr_series) - 1))
+        atr_z = float(atr_series.iloc[zi])
+        drop = False
+        for k in kept:
+            if k.get("name") != z.get("name"):
+                continue
+            pk = int(k.get("pivot_idx", 0))
+            if abs(pk - pz) > max_pivot_gap:
+                continue
+            k_lo = float(k["value_low"])
+            k_hi = float(k["value_high"])
+            ki = max(0, min(pk, len(atr_series) - 1))
+            atr_k = float(atr_series.iloc[ki])
+            atr_ref = max(atr_z, atr_k, 1e-12)
+            vratio = _vertical_overlap_ratio(z_lo, z_hi, k_lo, k_hi)
+            pgap = _vertical_price_gap_between_boxes(z_lo, z_hi, k_lo, k_hi)
+            near_price = vratio >= min_ol or (pgap > 0 and pgap <= gap_atr * atr_ref)
+            if near_price:
+                drop = True
+                break
+        if not drop:
+            kept.append(z)
+
+    kept_ids = {id(x) for x in kept}
+    return [z for z in zones if z.get("name") not in ("Demand", "Supply") or id(z) in kept_ids]
+
+
 def _annotate_demand_zones_below(zones: list[dict]) -> None:
     """Počet aktivních Demand zón hlouběji (nižší ceny) než tato zóna."""
     demands = [z for z in zones if z.get("name") == "Demand"]
@@ -960,7 +1146,6 @@ def _compute_zone_width_right(
     pivot_idx: int,
     zone_low: float,
     zone_high: float,
-    max_bars: int,
     zone_type: str,
     atr_series: pd.Series,
     touch_vicinity_atr: float,
@@ -969,6 +1154,8 @@ def _compute_zone_width_right(
     far_atr_mult: float,
     major_protect_atr_mult: float,
     params: dict | None = None,
+    *,
+    skip_far_invalidate: bool = False,
 ) -> tuple[int, bool, int | None, float | None]:
     """
     Vrátí (rightmost_idx, has_touch, touch_bar_idx | None, touch_marker_price | None).
@@ -979,7 +1166,9 @@ def _compute_zone_width_right(
         touch_cooldown = max(0, int(p.get("zone_touch_departure_cooldown_bars", 6)))
     except (TypeError, ValueError):
         touch_cooldown = 6
-    far_enabled = bool(int(p.get("zone_far_invalidate_enabled", 0)))
+    far_enabled = (
+        not skip_far_invalidate and bool(int(p.get("zone_far_invalidate_enabled", 1)))
+    )
     try:
         dep_min_atr = float(p.get("zone_departure_min_atr", 0.25))
     except (TypeError, ValueError):
@@ -1000,7 +1189,7 @@ def _compute_zone_width_right(
     touch_marker_price: float | None = None
     consecutive_far = 0
 
-    for j in range(pivot_idx + 1, min(pivot_idx + max_bars + 1, n)):
+    for j in range(pivot_idx + 1, n):
         bar_close = float(close[j])
         bar_high = float(high[j])
         bar_low = float(low[j])
@@ -1417,6 +1606,7 @@ def _find_pivot_momentum_leg(
     high_col: Any,
     low_col: Any,
     major_swings: list[dict] | None = None,
+    internals: list[dict] | None = None,
 ) -> int | None:
     """
     Pivot = bar s extrémem v momentum leg.
@@ -1426,6 +1616,11 @@ def _find_pivot_momentum_leg(
     """
     if bos_type == "bos_bullish":
         before = [s for s in swings if s["type"] == "low" and s["index"] < swing_idx]
+        if internals:
+            before = before + [
+                s for s in internals
+                if s.get("type") == "low" and int(s.get("index", -1)) < swing_idx
+            ]
         if not before and major_swings:
             before = [
                 s for s in major_swings
@@ -1446,6 +1641,11 @@ def _find_pivot_momentum_leg(
         return min_low_idx
     else:
         before = [s for s in swings if s["type"] == "high" and s["index"] < swing_idx]
+        if internals:
+            before = before + [
+                s for s in internals
+                if s.get("type") == "high" and int(s.get("index", -1)) < swing_idx
+            ]
         if not before and major_swings:
             before = [
                 s for s in major_swings
@@ -1775,8 +1975,6 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     hp = _params_for_hl_calls(params)
     threshold = _ZONE_EXTEND_LEFT_RANGE_RATIO
     body_threshold = _ZONE_EXTEND_LEFT_BODY_RATIO
-    max_right_bars = int(params.get("zone_extend_right_bars", 60))
-    effective_max_right = max(1, max_right_bars * 2)
     far_inv_bars = _ZONE_FAR_INVALIDATE_BARS
     far_inv_atr = _ZONE_FAR_INVALIDATE_ATR
     major_prot = _ZONE_MAJOR_PROTECT_ATR
@@ -1820,9 +2018,12 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         swings = _fallback_swings_from_three_bar_pivots(ohlc)
 
     zones: list[dict] = []
+    base_cap = _sd_zone_max_base_cap(params)
 
-    # BOS - horizontální čára od Swing H/L k místu BOS
+    # BOS - horizontální čára od Swing H/L k místu BOS (internal BOS jen do logiky zón, ne jako čára)
     for ev in events:
+        if _event_bos_swing_kind(ev) == "internal":
+            continue
         is_major = ev.get("is_major", False)
         name = "BOS (M)" if is_major else "BOS"
         fill = "rgba(251, 191, 36, 0.45)" if is_major else "rgba(245, 158, 11, 0.35)"
@@ -1846,8 +2047,16 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         if bos_idx < 1:
             continue
 
+        bos_kind = _event_bos_swing_kind(ev)
+        if bos_kind == "major" and not bool(int(params.get("show_sd_zones_from_major_bos", 1))):
+            continue
+        if bos_kind == "swing" and not bool(int(params.get("show_sd_zones_from_swing_bos", 1))):
+            continue
+        if bos_kind == "internal" and not bool(int(params.get("show_sd_zones_from_internal_bos", 0))):
+            continue
+
         pivot_idx = _find_pivot_momentum_leg(
-            ohlc, swings, bos_idx, swing_idx, ev["type"], high_col, low_col, major_swings
+            ohlc, swings, bos_idx, swing_idx, ev["type"], high_col, low_col, major_swings, internals
         )
         if pivot_idx is None:
             continue
@@ -1913,12 +2122,12 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         if skip_duplicate:
             continue
 
+        is_major_bos = bool(ev.get("is_major", False))
         rightmost, has_touch, touch_bi, touch_mp = _compute_zone_width_right(
             ohlc,
             pivot_idx,
             zone_low,
             zone_high,
-            effective_max_right,
             zone_type,
             atr_series,
             touch_vicinity_atr,
@@ -1927,6 +2136,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
             far_inv_atr,
             major_prot,
             params,
+            skip_far_invalidate=is_major_bos,
         )
 
         if ev["type"] == "bos_bullish":
@@ -1936,6 +2146,10 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 ohlc, pivot_idx, bos_idx, "Demand",
                 high_col, low_col, open_col, close_col, atr_series, atr_period,
             )
+            if _sd_skip_zone_after_metrics(
+                bos_kind, base_length, base_cap, bos_idx, swing_idx, impulse_score, params
+            ):
+                continue
             inducements, inducement_count, inducement_points = _find_inducements(
                 ohlc, zone_low, zone_high, pivot_idx, rightmost, "Demand",
                 swings, internals, major_swings, atr_series,
@@ -1955,6 +2169,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
+                "bos_swing_kind": bos_kind,
                 "inducements": inducements,
                 "inducement_count": inducement_count,
                 "inducement_points": inducement_points,
@@ -1974,6 +2189,10 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 ohlc, pivot_idx, bos_idx, "Supply",
                 high_col, low_col, open_col, close_col, atr_series, atr_period,
             )
+            if _sd_skip_zone_after_metrics(
+                bos_kind, base_length, base_cap, bos_idx, swing_idx, impulse_score, params
+            ):
+                continue
             inducements, inducement_count, inducement_points = _find_inducements(
                 ohlc, zone_low, zone_high, pivot_idx, rightmost, "Supply",
                 swings, internals, major_swings, atr_series,
@@ -1993,6 +2212,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
+                "bos_swing_kind": bos_kind,
                 "inducements": inducements,
                 "inducement_count": inducement_count,
                 "inducement_points": inducement_points,
@@ -2021,7 +2241,6 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         internals,
         threshold,
         body_threshold,
-        effective_max_right,
         touch_vicinity_atr,
         far_inv_bars,
         far_inv_atr,
@@ -2031,17 +2250,17 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         atr_period,
     )
 
-    max_base = int(params.get("max_base_length", 0))
-    if max_base > 0:
+    if base_cap > 0:
         zones = [
             z
             for z in zones
             if z.get("name") not in ("Demand", "Supply")
-            or int(z.get("base_length") or 0) <= max_base
+            or int(z.get("base_length") or 0) <= base_cap
         ]
 
     if 0 < overlap_trim <= 1.0:
         _trim_overlapping_sd_zones(zones, index, overlap_trim)
+    zones = _dedupe_near_duplicate_sd_zones_newer_wins(zones, atr_series, params)
     zones = _drop_young_sd_near_dominant(zones, atr_series, params)
     zones = _filter_demands_low_rrr_vs_major_supply(zones, atr_series, params)
     _annotate_demand_zones_below(zones)

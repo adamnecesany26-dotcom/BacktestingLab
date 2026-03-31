@@ -440,7 +440,6 @@ function zoneTfToMinutesForChart(tf: string): number {
   const mNum = /^(\d+)m$/.exec(t);
   if (mNum) return Math.max(1, parseInt(mNum[1], 10));
   if (t === "1h" || t === "60m") return 60;
-  if (t === "2h") return 120;
   if (t === "4h") return 240;
   if (t === "1d" || t === "daily") return 1440;
   if (t === "1w" || t === "weekly") return 10080;

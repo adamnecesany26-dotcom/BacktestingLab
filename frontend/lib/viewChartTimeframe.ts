@@ -9,7 +9,6 @@ export const VIEW_CHART_TF_LADDER: { id: string; label: string; minutes: number 
   { id: "15m", label: "15m", minutes: 15 },
   { id: "30m", label: "30m", minutes: 30 },
   { id: "1h", label: "1h", minutes: 60 },
-  { id: "2h", label: "2h", minutes: 120 },
   { id: "4h", label: "4h", minutes: 240 },
   { id: "1D", label: "1D", minutes: 1440 },
   { id: "1W", label: "1W", minutes: 10080 },
@@ -23,7 +22,6 @@ export function instrumentTimeframeToMinutes(tf: string | undefined | null): num
   const mNum = /^(\d+)m$/.exec(t);
   if (mNum) return Math.max(1, parseInt(mNum[1], 10));
   if (t === "1h" || t === "60m") return 60;
-  if (t === "2h") return 120;
   if (t === "4h") return 240;
   if (t === "1d" || t === "1day" || t === "daily") return 1440;
   if (t === "1w" || t === "1week") return 10080;

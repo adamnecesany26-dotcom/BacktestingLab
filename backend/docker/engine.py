@@ -96,7 +96,6 @@ TF_TO_MINUTES = {
     "15m": 15,
     "30m": 30,
     "1h": 60,
-    "2h": 120,
     "4h": 240,
     "1d": 1440,
     "1w": 10080,
@@ -109,7 +108,6 @@ TF_TO_PANDAS_RULE = {
     "15m": "15min",
     "30m": "30min",
     "1h": "1h",
-    "2h": "2h",
     "4h": "4h",
     "1d": "1D",
     "1w": "1W",
@@ -3202,7 +3200,9 @@ def run_backtest(
             equity_list.append(self.broker.getvalue())
             if self.params.total_bars > 0:
                 pct = min(99, int((len(self) / self.params.total_bars) * 100))
-                if pct != self._last_pct and pct % 5 == 0:
+                if len(self) == 1:
+                    pct = max(pct, 5)
+                if pct != self._last_pct and (len(self) == 1 or pct % 5 == 0):
                     print(f"PROGRESS:{pct}", file=sys.stderr, flush=True)
                     _emit_engine_progress(pct)
                     self._last_pct = pct

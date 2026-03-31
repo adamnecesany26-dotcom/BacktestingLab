@@ -31,6 +31,8 @@ import {
   groupIndexedTrendSegments,
 } from "@/lib/viewChartLines";
 
+type ViewMarker = { date: string; type: string; value: number; bar_index?: number };
+
 function toModuleName(name: string): string {
   return (name || "module").replace(/\s+/g, "_").replace(/-/g, "_").replace(/\./g, "_") || "module";
 }
@@ -39,6 +41,50 @@ function parseViewDependencies(code: string): string[] {
   const m = code.match(/#\s*VIEW_DEPENDENCIES:\s*(.+)/);
   if (!m) return [];
   return m[1].split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/**
+ * Mapuje date_start / date_end zóny na indexy svíček v aktuálním okně OHLC.
+ * Na rozdíl od mapMarkerToIndex funguje i když začátek leží před první viditelnou svíčkou
+ * (BOS od swingu mimo okno) — úsek ořízne na [0, n−1].
+ */
+function zoneEndpointsToBarIndices(
+  z: Pick<ViewZone, "date_start" | "date_end">,
+  ohlc: OhlcBar[],
+  n: number
+): [number, number] | null {
+  if (n < 1) return null;
+  const barMs = (i: number) => Date.parse(ohlc[i]?.date ?? "");
+  let zs = Date.parse(z.date_start);
+  let ze = Date.parse(z.date_end);
+  if (!Number.isFinite(zs) || !Number.isFinite(ze)) return null;
+  if (ze < zs) {
+    const t = zs;
+    zs = ze;
+    ze = t;
+  }
+  const firstMs = barMs(0);
+  const lastMs = barMs(n - 1);
+  if (!Number.isFinite(firstMs) || !Number.isFinite(lastMs)) return null;
+  if (ze < firstMs || zs > lastMs) return null;
+  let idxStart = 0;
+  for (let i = 0; i < n; i++) {
+    const t = barMs(i);
+    if (Number.isFinite(t) && t >= zs) {
+      idxStart = i;
+      break;
+    }
+  }
+  let idxEnd = n - 1;
+  for (let i = n - 1; i >= 0; i--) {
+    const t = barMs(i);
+    if (Number.isFinite(t) && t <= ze) {
+      idxEnd = i;
+      break;
+    }
+  }
+  if (idxStart > idxEnd) return null;
+  return [idxStart, idxEnd];
 }
 
 /** Po slice(startIdx) drží bar indexy relativní k oknu (0…len−1). */
@@ -67,6 +113,83 @@ function remapViewZonesToWindow(zones: ViewZone[], startIdx: number, windowLen: 
     }
     return copy;
   });
+}
+
+/**
+ * View demo: API počítá na celé sérii (years=0), graf zúžíme na posledních N svíček jako u Shuffle — jen tail bez náhodného posunu.
+ */
+function applyViewDemoObdobiSlice(
+  fullOhlc: OhlcBar[],
+  fullMarkers: ViewMarker[],
+  fullLines: ViewLine[],
+  fullZones: ViewZone[],
+  yearsSelected: number,
+  chartTimeframe: string,
+  nativeTf: string | undefined | null
+): { ohlc: OhlcBar[]; markers: ViewMarker[]; lines: ViewLine[]; zones: ViewZone[] } {
+  if (fullOhlc.length < 2) {
+    return { ohlc: fullOhlc, markers: fullMarkers, lines: fullLines, zones: fullZones };
+  }
+  const windowBars = shuffleWindowBarCount(
+    fullOhlc.length,
+    yearsSelected,
+    chartTimeframe,
+    nativeTf
+  );
+  if (windowBars >= fullOhlc.length) {
+    return { ohlc: fullOhlc, markers: fullMarkers, lines: fullLines, zones: fullZones };
+  }
+  const startIdx = fullOhlc.length - windowBars;
+  const windowOhlc = fullOhlc.slice(startIdx);
+  const startTime = Date.parse(windowOhlc[0]?.date ?? "");
+  const endTime = Date.parse(windowOhlc[windowOhlc.length - 1]?.date ?? "");
+
+  const inRange = (d: string) => {
+    const ts = Date.parse(d);
+    if (Number.isFinite(ts) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+      return ts >= startTime && ts <= endTime;
+    }
+    const ds = d.slice(0, 10);
+    const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+    const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+    return ds >= startDate && ds <= endDate;
+  };
+
+  const markers = fullMarkers.filter((m) => inRange(m.date));
+  const lines = fullLines
+    .map((line) => {
+      if (isViewRegimeHistogramLine(line)) {
+        const data = (line.data ?? []).filter((p) => inRange(p.date));
+        return data.length ? { ...line, data } : null;
+      }
+      const data = (line.data ?? []).filter((p) => inRange(p.date));
+      return data.length ? { ...line, data } : null;
+    })
+    .filter((line): line is ViewLine => line != null);
+  const zonesInWindow = fullZones.filter((z) => {
+    const zStart = Date.parse(z.date_start);
+    const zEnd = Date.parse(z.date_end);
+    if (Number.isFinite(zStart) && Number.isFinite(zEnd) && Number.isFinite(startTime) && Number.isFinite(endTime)) {
+      return (
+        (zStart >= startTime && zStart <= endTime) ||
+        (zEnd >= startTime && zEnd <= endTime) ||
+        (zStart <= startTime && zEnd >= endTime)
+      );
+    }
+    const startDate = windowOhlc[0]?.date?.slice(0, 10) ?? "";
+    const endDate = windowOhlc[windowOhlc.length - 1]?.date?.slice(0, 10) ?? "";
+    return (
+      (z.date_start.slice(0, 10) >= startDate && z.date_start.slice(0, 10) <= endDate) ||
+      (z.date_end.slice(0, 10) >= startDate && z.date_end.slice(0, 10) <= endDate) ||
+      (z.date_start.slice(0, 10) <= startDate && z.date_end.slice(0, 10) >= endDate)
+    );
+  });
+  return {
+    ohlc: windowOhlc,
+    markers,
+    lines,
+    zones: remapViewZonesToWindow(zonesInWindow, startIdx, windowOhlc.length),
+  };
 }
 
 function hexToRgba(hex: string, alpha: number): string {
@@ -247,8 +370,6 @@ interface StrategyViewChartProps {
   strategyZoneSyncCode?: string | null;
 }
 
-type ViewMarker = { date: string; type: string; value: number };
-
 export function StrategyViewChart({
   instruments,
   modules,
@@ -390,8 +511,16 @@ export function StrategyViewChart({
           if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
             merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
           }
+          if (
+            inv &&
+            "timeframe" in schema &&
+            "data_timeframe" in schema &&
+            !strategyZoneSyncCode
+          ) {
+            merged["timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
           const seedTf = strategyZoneSyncCode ? coarsestZoneTfFromStrategyCode(strategyZoneSyncCode) : null;
-          if (seedTf && "timeframe" in merged) {
+          if (seedTf && "timeframe" in merged && strategyZoneSyncCode) {
             merged["timeframe"] = seedTf;
           }
           const current = viewParamsRef.current;
@@ -402,6 +531,17 @@ export function StrategyViewChart({
           // při native 30m a Swing HL vrátí prázdné swingy / zóny.
           if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
             merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          if (
+            inv &&
+            "timeframe" in schema &&
+            "data_timeframe" in schema &&
+            !strategyZoneSyncCode
+          ) {
+            merged["timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          if (seedTf && "timeframe" in merged && strategyZoneSyncCode) {
+            merged["timeframe"] = seedTf;
           }
           setViewParamsValues(merged);
           paramsToSend = Object.keys(merged).length > 0 ? merged : null;
@@ -424,10 +564,29 @@ export function StrategyViewChart({
         chartTimeframe
       );
       if (gen !== viewRequestGenRef.current) return;
-      setOhlc(res.ohlc);
-      setMarkers(res.markers);
-      setLines(res.lines ?? []);
-      setZones(res.zones ?? []);
+      let nextOhlc = res.ohlc;
+      let nextMarkers = res.markers ?? [];
+      let nextLines = res.lines ?? [];
+      let nextZones = res.zones ?? [];
+      if (viewDemo && years > 0) {
+        const sliced = applyViewDemoObdobiSlice(
+          nextOhlc,
+          nextMarkers,
+          nextLines,
+          nextZones,
+          years,
+          chartTimeframe,
+          selectedInstrument?.timeframe
+        );
+        nextOhlc = sliced.ohlc;
+        nextMarkers = sliced.markers;
+        nextLines = sliced.lines;
+        nextZones = sliced.zones;
+      }
+      setOhlc(nextOhlc);
+      setMarkers(nextMarkers);
+      setLines(nextLines);
+      setZones(nextZones);
       setPlotRevision((r) => r + 1);
     } catch (e) {
       if (gen !== viewRequestGenRef.current) return;
@@ -474,10 +633,18 @@ export function StrategyViewChart({
           if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
             merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
           }
+          if (
+            inv &&
+            "timeframe" in schema &&
+            "data_timeframe" in schema &&
+            !strategyZoneSyncCode
+          ) {
+            merged["timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
           const seedTfShuffle = strategyZoneSyncCode
             ? coarsestZoneTfFromStrategyCode(strategyZoneSyncCode)
             : null;
-          if (seedTfShuffle && "timeframe" in merged) {
+          if (seedTfShuffle && "timeframe" in merged && strategyZoneSyncCode) {
             merged["timeframe"] = seedTfShuffle;
           }
           const current = viewParamsRef.current;
@@ -486,6 +653,17 @@ export function StrategyViewChart({
           }
           if (inv && ("timeframe" in schema || "data_timeframe" in schema)) {
             merged["data_timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          if (
+            inv &&
+            "timeframe" in schema &&
+            "data_timeframe" in schema &&
+            !strategyZoneSyncCode
+          ) {
+            merged["timeframe"] = effectiveViewDataTimeframe(chartTimeframe, inv.timeframe);
+          }
+          if (seedTfShuffle && "timeframe" in merged && strategyZoneSyncCode) {
+            merged["timeframe"] = seedTfShuffle;
           }
           paramsToSend = Object.keys(merged).length > 0 ? merged : null;
         }
@@ -592,7 +770,17 @@ export function StrategyViewChart({
       };
 
       setOhlc(windowOhlc);
-      setMarkers(fullMarkers.filter((m) => inRange(m.date)));
+      setMarkers(
+        fullMarkers.filter((m) => inRange(m.date)).map((m) => {
+          const copy: ViewMarker = { ...m };
+          if (typeof copy.bar_index === "number" && Number.isFinite(copy.bar_index)) {
+            const ri = Math.round(copy.bar_index - startIdx);
+            if (ri >= 0 && ri < windowOhlc.length) copy.bar_index = ri;
+            else delete copy.bar_index;
+          }
+          return copy;
+        })
+      );
       setLines(
         fullLines
           .map((line) => {
@@ -730,6 +918,11 @@ export function StrategyViewChart({
   })();
 
   const mapMarkerToIndex = (m: ViewMarker) => {
+    // bar_index jen pokud leží v aktuálním okně OHLC — jinak spadneme na datum (jinak všechny mimo rozsah skončí na n−1 vpravo).
+    if (typeof m.bar_index === "number" && Number.isFinite(m.bar_index) && n > 0) {
+      const i = Math.floor(m.bar_index);
+      if (i >= 0 && i < n) return i;
+    }
     const exact = dateToIndex.get(m.date);
     if (exact !== undefined && exact >= 0) return exact;
     const t = Date.parse(m.date);
@@ -1094,11 +1287,9 @@ export function StrategyViewChart({
     if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
     if ((z.name === "Discount" || z.name === "Mid" || z.name === "Premium") && !visibility.premium_discount_zones) continue;
 
-    const i0 = mapMarkerToIndex({ date: z.date_start, type: "high", value: z.value_high });
-    const i1 = mapMarkerToIndex({ date: z.date_end, type: "high", value: z.value_high });
-    if (i0 < 0 || i1 < 0) continue;
-    const idxStart = Math.min(i0, i1);
-    const idxEnd = Math.max(i0, i1);
+    const span = zoneEndpointsToBarIndices(z, ohlc, n);
+    if (!span) continue;
+    const [idxStart, idxEnd] = span;
     const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
     const isLine = z.value_low === z.value_high;
     const lineColor =
@@ -1323,7 +1514,12 @@ export function StrategyViewChart({
           </select>
         </div>
         <div>
-          <label className="text-xs text-zinc-500 block mb-1">Období</label>
+          <label
+            className="text-xs text-zinc-500 block mb-1"
+            title="U View demo modul stále počítá na celé dostupné historii (API years=0). Tento výběr jen upravuje okno zobrazení na grafu (poslední N svíček). „Max“ = celá načtená řada."
+          >
+            Období
+          </label>
           <select
             value={years}
             onChange={(e) => setYears(parseFloat(e.target.value))}
@@ -1750,7 +1946,22 @@ export function StrategyViewChart({
                       ))}
                     </ul>
                   )}
-                  {typeof value === "number" ? (
+                  {meta?.booleanWidget && typeof value === "number" && (value === 0 || value === 1) ? (
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={value === 1}
+                        onChange={(e) =>
+                          setViewParamsValues((prev) => ({
+                            ...prev,
+                            [key]: e.target.checked ? 1 : 0,
+                          }))
+                        }
+                        className="rounded"
+                      />
+                      <span className="text-sm text-zinc-300">{value === 1 ? "Zapnuto" : "Vypnuto"}</span>
+                    </label>
+                  ) : typeof value === "number" ? (
                     <input
                       type="number"
                       value={value}

@@ -3,6 +3,7 @@ GET/POST /api/view - OHLC data + optional module markers for Strategy View chart
 Used for visual testing of modules/indicators (e.g. H/L detection).
 """
 
+import math
 import re
 import sys
 import uuid
@@ -250,7 +251,6 @@ _CHART_TF_TO_PANDAS: dict[str, str] = {
     "15m": "15min",
     "30m": "30min",
     "1h": "1h",
-    "2h": "2h",
     "4h": "4h",
     "1D": "1D",
     "1W": "1W",
@@ -262,7 +262,6 @@ _CHART_TF_MINUTES: dict[str, float] = {
     "15m": 15,
     "30m": 30,
     "1h": 60,
-    "2h": 120,
     "4h": 240,
     "1D": 1440,
     "1W": 10080,
@@ -379,6 +378,8 @@ async def _run_view_code_in_subprocess(
     module_dependencies: dict[str, str] | None,
     actor_id: str,
     chart_timeframe: str | None = None,
+    start_iso: str | None = None,
+    end_iso: str | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     backend_root = Path(__file__).resolve().parent.parent.parent
     project_root = backend_root.parent
@@ -540,11 +541,17 @@ def _run_view_code(
             if isinstance(result, list):
                 for item in result:
                     if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
-                        markers.append({
+                        mk: dict[str, Any] = {
                             "date": _to_iso(item["date"]),
                             "type": str(item["type"]).lower(),
                             "value": float(item["value"]),
-                        })
+                        }
+                        bi = item.get("bar_index")
+                        if isinstance(bi, int):
+                            mk["bar_index"] = bi
+                        elif isinstance(bi, float) and math.isfinite(bi):
+                            mk["bar_index"] = int(bi)
+                        markers.append(mk)
 
         lines = []
         if hasattr(mod, "get_line"):
@@ -771,6 +778,9 @@ class ViewRequest(BaseModel):
     module_dependencies: dict[str, str] | None = None
     # native / None = source bars; else 1m,5m,…,1Mo (must be coarser than native bar size)
     chart_timeframe: str | None = None
+    # Optional slice after years cutoff: ISO8601 timestamps (inclusive), timezone-naive matches index
+    start_iso: str | None = None
+    end_iso: str | None = None
 
 
 def _call_with_params(fn, df: pd.DataFrame, params: dict):
@@ -839,11 +849,17 @@ def _merge_major_markers_from_deps(
                     continue
                 key = (_to_iso(item["date"]), t)
                 if key not in existing:
-                    markers.append({
+                    mk2: dict[str, Any] = {
                         "date": key[0],
                         "type": t,
                         "value": float(item["value"]),
-                    })
+                    }
+                    bi2 = item.get("bar_index")
+                    if isinstance(bi2, int):
+                        mk2["bar_index"] = bi2
+                    elif isinstance(bi2, float) and math.isfinite(bi2):
+                        mk2["bar_index"] = int(bi2)
+                    markers.append(mk2)
                     existing.add(key)
             break  # stačí jeden dependency
         except Exception:

@@ -149,8 +149,8 @@ PARAMS_META = {
         "title": "Časové rámce zón",
         "what_it_means": "Více TF pro výpočet zón; stejný typ na různých TF se při překryvu sloučí.",
         "widget": "multiselect",
-        "options": "1w|1d|4h|2h|1h|30m",
-        "option_labels": "1 týden|1 den|4 hod|2 hod|1 hod|30 min",
+        "options": "1w|1d|4h|1h|30m",
+        "option_labels": "1 týden|1 den|4 hod|1 hod|30 min",
     },
     "prefer_higher_tf": {
         "title": "Preferovat zónu vyššího TF",
@@ -159,8 +159,8 @@ PARAMS_META = {
     "exec_timeframe": {
         "title": "Exekuční timeframe",
         "what_it_means": "Záměr TF simulace; skutečný krok řídí data. Nejmenší rozlišitelný TF = podle souboru dat.",
-        "options": "15m|30m|1h|2h|4h|1d|1w",
-        "option_labels": "15 min|30 min|1 hod|2 hod|4 hod|1 den|1 týden",
+        "options": "15m|30m|1h|4h|1d|1w",
+        "option_labels": "15 min|30 min|1 hod|4 hod|1 den|1 týden",
     },
     "entry_model": {
         "title": "Model vstupu",
@@ -251,8 +251,6 @@ def _exec_timeframe_expected_minutes(tf: str) -> float | None:
         "30min": 30.0,
         "1h": 60.0,
         "60m": 60.0,
-        "2h": 120.0,
-        "120m": 120.0,
         "4h": 240.0,
         "1d": 1440.0,
         "daily": 1440.0,
@@ -782,8 +780,8 @@ class Strategy(bt.Strategy):
     def _sd_module_params_for_tf(self, zone_tf: str) -> dict:
         """Sloučí nested module_params z UI a ploché parametry strategie; timeframe = zone_tf.
 
-        Hodnota zone_extend_right_bars předaná do modulu je vždy přepsána z params.zone_max_bars
-        (UI pole zone_extend_right_bars u modulu v backtestu tím pro výpočet zón neplatí).
+        zone_max_bars se mapuje na zone_extend_right_bars kvůli kompatibilitě API modulu; S/D výpočet
+        tou hodnotou už neomezuje horizont zóny vpravo (životnost řeší close, dotyk, far-invalidate).
         """
         raw = dict(self.params.module_params or {})
         nested: dict = {}

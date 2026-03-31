@@ -891,6 +891,7 @@ async def run_strategy_streaming(
             engine_task = asyncio.create_task(
                 asyncio.to_thread(run_engine_in_process, env_str, _inprocess_progress_cb)
             )
+            yield {"type": "progress", "value": 5}
             try:
                 while not engine_task.done():
                     get_task = asyncio.create_task(progress_queue.get())
@@ -977,6 +978,7 @@ async def run_strategy_streaming(
         stderr_buffer: list[str] = []
         loop = asyncio.get_event_loop()
         _read_stream_sync(proc, queue, loop, stdout_buffer, stderr_buffer)
+        yield {"type": "progress", "value": 5}
         wall_timeout = _resolve_run_timeout_seconds(run_timeout_sec)
         idle_timeout = _resolve_stream_idle_timeout_seconds(stream_idle_timeout_sec)
 

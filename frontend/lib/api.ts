@@ -8,7 +8,7 @@ import { getFirebaseAuth } from "@/lib/firebase";
 /**
  * API base URL.
  * - If `NEXT_PUBLIC_API_URL` is set (non-empty): direct calls (production / custom).
- * - If unset in the browser: `""` → same-origin `/api/...` via Next.js rewrites to `127.0.0.1:8000` (recommended local dev on Windows).
+ * - If unset in the browser: `""` → same-origin `/api/...` přes `app/api/[...path]/route.ts` (streaming SSE na FastAPI; nepoužívat samotné next rewrites).
  * - SSR / Node fallback: explicit IPv4 avoids `localhost` → ::1 mismatches with uvicorn.
  */
 function resolveApiBase(): string {

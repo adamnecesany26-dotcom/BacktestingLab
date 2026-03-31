@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import json
+import math
 import os
 import sys
 from collections import OrderedDict
@@ -104,7 +105,6 @@ _CHART_TF_TO_PANDAS: dict[str, str] = {
     "15m": "15min",
     "30m": "30min",
     "1h": "1h",
-    "2h": "2h",
     "4h": "4h",
     "1D": "1D",
     "1W": "1W",
@@ -116,7 +116,6 @@ _CHART_TF_MINUTES: dict[str, float] = {
     "15m": 15,
     "30m": 30,
     "1h": 60,
-    "2h": 120,
     "4h": 240,
     "1D": 1440,
     "1W": 10080,
@@ -147,6 +146,44 @@ def _normalize_chart_tf_key(raw: str | None) -> str | None:
         if k.lower() == low:
             return k
     return None
+
+
+def _swing_hl_canonical_view_chart_tf(norm_key: str | None) -> str | None:
+    """Klíče TF stejné jako v modules/Swing_HL.py TF_FINE_TO_COARSE (1d/1w/1M)."""
+    if not norm_key:
+        return None
+    return {
+        "1m": "1m",
+        "5m": "5m",
+        "15m": "15m",
+        "30m": "30m",
+        "1h": "1h",
+        "4h": "4h",
+        "1D": "1d",
+        "1W": "1w",
+        "1Mo": "1M",
+    }.get(norm_key)
+
+
+def _swing_hl_tf_from_bar_minutes(minutes: float) -> str:
+    """Stejné prahy jako Swing_HL._infer_data_timeframe (medián mezer < 48 h)."""
+    if minutes <= 1.5:
+        return "1m"
+    if minutes <= 7:
+        return "5m"
+    if minutes <= 22:
+        return "15m"
+    if minutes <= 45:
+        return "30m"
+    if minutes <= 90:
+        return "1h"
+    if minutes <= 720:
+        return "4h"
+    if minutes <= 4320:
+        return "1d"
+    if minutes <= 20160:
+        return "1w"
+    return "1M"
 
 
 def _resample_ohlc_dataframe(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -344,11 +381,17 @@ def _run_view_code(main_path: Path, module_key: str, df: pd.DataFrame, params: d
         if isinstance(result, list):
             for item in result:
                 if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
-                    markers.append({
+                    mkr: dict[str, Any] = {
                         "date": _to_iso(item["date"]),
                         "type": str(item["type"]).lower(),
                         "value": float(item["value"]),
-                    })
+                    }
+                    bi = item.get("bar_index")
+                    if isinstance(bi, int):
+                        mkr["bar_index"] = bi
+                    elif isinstance(bi, float) and math.isfinite(bi):
+                        mkr["bar_index"] = int(bi)
+                    markers.append(mkr)
 
     if hasattr(mod, "get_line"):
         result = _call_with_params(mod.get_line, df, params)
@@ -493,7 +536,6 @@ def main() -> None:
     # years == 0 = celá historie (bez cutoff). Nepoužívat `or 0.25` — 0 je v Pythonu falsy.
     _yr = req.get("years", None)
     years = float(0.25 if _yr is None else _yr)
-    params = req.get("params") if isinstance(req.get("params"), dict) else {}
     start_iso = req.get("start_iso")
     end_iso = req.get("end_iso")
     if isinstance(start_iso, str):
@@ -505,13 +547,24 @@ def main() -> None:
     else:
         end_iso = None
 
-    df = _load_ohlc(data_path, data_file, years, start_iso, end_iso)
+    df_native = _load_ohlc(data_path, data_file, years, start_iso, end_iso)
     chart_tf = req.get("chart_timeframe")
     try:
-        df = _apply_view_chart_timeframe(df, chart_tf if isinstance(chart_tf, str) else None)
+        df = _apply_view_chart_timeframe(df_native, chart_tf if isinstance(chart_tf, str) else None)
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         sys.exit(1)
+    params = dict(req.get("params") if isinstance(req.get("params"), dict) else {})
+    _norm_ctf = _normalize_chart_tf_key(chart_tf if isinstance(chart_tf, str) else None)
+    _vctf = _swing_hl_canonical_view_chart_tf(_norm_ctf)
+    if _vctf:
+        params["_view_chart_tf"] = _vctf
+    try:
+        _inf_m = _infer_native_bar_minutes(df)
+        params["_view_ohlc_inferred_tf"] = _swing_hl_tf_from_bar_minutes(_inf_m)
+    except Exception:
+        pass
+    params["_view_ohlc_native"] = df_native
     markers, lines, zones = _run_view_code(main_path, "sandbox_view_module", df, params)
     ohlc_df = pd.DataFrame({
         "date": [_to_iso(ts) for ts in df.index],
