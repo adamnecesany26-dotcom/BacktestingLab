@@ -5,10 +5,10 @@ Strategie hledá na grafu **oblasti poptávky (Demand)** a **nabídky (Supply)**
 ## Co musíš mít v aplikaci
 
 1. Ve strategii vložený kód z tohoto `main.py`.  
-2. V pravém panelu v sekci **Moduly** vybraný modul **S/D Zones** (`get_zones`, např. `S_D_Zones` / `SD_identificator`) a **Potvrdit**.  
-3. Volitelně **HL identificator** nebo **Swing HL** — potřeba jen pokud používáš **filtr trendu** (`trend_filter_enabled`), protože strategie volá `get_trend` ze stejného modulu jako S/D view.
+2. **Legacy režim (`use_sd_artifacts` vypnutý):** v sekci **Moduly** vybraný **S/D Zones** (`get_zones`) a **Potvrdit**. Volitelně **Swing HL** — pro **trend filtr** (`trend_filter_enabled`) nebo kvůli závislostem modulu.  
+3. **Režim artefaktů (`use_sd_artifacts` zapnutý):** modul S/D v runtime **nepočítá zóny bar-po-baru** — strategie načte `sd/v1/zones.parquet` z **`.backtest_artifacts/`** (stejný `dataset_id` jako data + roky). Před runem musíš mít hotový **Build features** ve View (nebo CLI `hl_precompute` + `sd_precompute`). Moduly ve stacku mohou být pořád potřeba kvůli importům/trendu — viz `PARAMS` v `main.py`.
 
-Bez modulu S/D zón strategie neobchoduje.
+Bez zdroje zón (live modul nebo platný Parquet) strategie neobchoduje.
 
 ## Jak vstup funguje (zjednodušeně)
 
@@ -43,7 +43,7 @@ Další hodnoty (max hold, čekání na limit, momentum detaily, práh merge MTF
 
 **View:** náhled zón a trend drž v shodě přes `VIEW_PARAMS` modulů S/D a Swing HL.
 
-**Detailed (Results):** obchody jsou ze simulace; zóny z `moduleOutputs` musí používat stejný TF jako strategie (v `VIEW_PARAMS` modulu S/D pole `timeframe` = např. `1d`). Na intraday grafu frontend zarovná období zóny z čistého data `YYYY-MM-DD` na první/poslední svíčku v těchto dnech. Volitelně lze v Detailed zvolit hrubší **TF grafu** (agregace svíček).
+**Detailed (Results):** obchody jsou ze simulace; zóny z `moduleOutputs` (legacy) nebo zaškrtnutím **vrstvy z cache** přes `/api/view` + `use_artifacts` (shoda s View). TF zón musí sedět se strategií. Volitelně hrubší **TF grafu**.
 
 Kontrakt polí z `get_zones`: viz **[MODULE_CONTRACT.md](MODULE_CONTRACT.md)**.
 

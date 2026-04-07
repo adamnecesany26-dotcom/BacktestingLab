@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — examples/hmm_regime_indicator.py — indikátor — celý soubor vložit do Firestore (Indikátory → main.py).
 """
 Demo indikátor režimu trhu pro View: spodní histogram ve StrategyViewChart.
 

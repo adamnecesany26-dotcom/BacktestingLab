@@ -185,6 +185,42 @@ function zoneMetaPrice(zm: unknown, keys: string[]): number | null {
   return null;
 }
 
+/** Přesný obdélník zóny z zoneMeta (stejný jako při vstupu ve strategii) — odliší se od ostatních D/S z moduleOutputs. */
+function tradeZoneHighlightShapeFromMeta(
+  ohlc: OhlcBar[],
+  zm: Record<string, unknown>
+): { type: string; x0: string; x1: string; y0: number; y1: number; fillcolor: string; line: object; layer: string } | null {
+  if (!ohlc.length) return null;
+  const zl = zoneMetaPrice(zm, ["zoneValueLow", "value_low"]);
+  const zh = zoneMetaPrice(zm, ["zoneValueHigh", "value_high"]);
+  const ds = String(zm.zoneDateStart ?? "").trim();
+  const de = String(zm.zoneDateEnd ?? "").trim();
+  if (zl == null || zh == null || !ds || !de) return null;
+  const z: ModuleZone = {
+    date_start: ds,
+    date_end: de,
+    value_low: zl,
+    value_high: zh,
+    name: String(zm.zoneName ?? ""),
+  };
+  const { x0, x1 } = zoneTimeBoundsForOhlc(z, ohlc);
+  const isDemand = z.name === "Demand";
+  return {
+    type: "rect",
+    x0,
+    x1,
+    y0: Math.min(zl, zh),
+    y1: Math.max(zl, zh),
+    fillcolor: isDemand ? "rgba(34,197,94,0.14)" : "rgba(239,68,68,0.14)",
+    line: {
+      color: isDemand ? "rgba(250,204,21,0.95)" : "rgba(250,204,21,0.95)",
+      width: 2.5,
+      dash: "6px,3px",
+    },
+    layer: "below",
+  };
+}
+
 interface ModuleOutputChartProps {
   ohlc: OhlcBar[];
   moduleName: string;
@@ -696,6 +732,16 @@ export function ModuleOutputChart({
   const isPremiumDiscountZone = (name?: string) =>
     name === "Discount" || name === "Mid" || name === "Premium";
 
+  const tradeZoneHighlightShapes: any[] = [];
+  if (orderLevelsMode && trades.length > 0) {
+    for (const t of trades) {
+      const zm = t.zoneMeta;
+      if (!zm || typeof zm !== "object") continue;
+      const sh = tradeZoneHighlightShapeFromMeta(ohlc, zm as Record<string, unknown>);
+      if (sh) tradeZoneHighlightShapes.push(sh);
+    }
+  }
+
   const zoneShapes: any[] = [];
   const zoneAnnotations: any[] = [];
   for (const z of zones) {
@@ -821,7 +867,7 @@ export function ModuleOutputChart({
     dragmode: "zoom",
     showlegend: traces.length > 1,
     legend: { x: 0, y: 1.02, orientation: "h" },
-    shapes: [...zoneShapes, ...tradeShapes],
+    shapes: [...zoneShapes, ...tradeZoneHighlightShapes, ...tradeShapes],
     annotations: zoneAnnotations,
   };
 

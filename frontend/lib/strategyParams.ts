@@ -475,6 +475,13 @@ export function coarsestZoneTfFromStrategyCode(code: string): string | null {
   return normalizeZoneTfToken(best);
 }
 
+/** Seznam `zone_timeframes` ze strategie (PARAMS) — pro S/D precompute build. */
+export function zoneTimeframesFromStrategyCode(code: string | null | undefined): string[] {
+  if (!code || typeof code !== "string") return [];
+  const params = parsePythonDict(code, "PARAMS");
+  return parseZoneTimeframesFromParamsDict(params);
+}
+
 export function parseViewParams(code: string): StrategyParams {
   if (!code || typeof code !== "string") return {};
   const parsed = parsePythonDict(code, "VIEW_PARAMS");

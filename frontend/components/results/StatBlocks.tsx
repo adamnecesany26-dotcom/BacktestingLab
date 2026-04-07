@@ -3,6 +3,9 @@
 import { useState } from "react";
 import type { RunResponse } from "@shared/types";
 import { formatProfitFactorDisplay } from "@/lib/formatProfitFactor";
+import { summarizeTradeRMultiples } from "@/lib/tradeMetrics";
+import { FieldHelpPopover } from "@/components/FieldHelpPopover";
+import { backtestFieldHelp } from "@/components/backtestFieldMeta";
 
 interface StatBlocksProps {
   results: RunResponse | null;
@@ -47,13 +50,14 @@ type StatItem = { key: string; label: string; format: (v: number) => string; gro
 
 const STAT_ITEMS: StatItem[] = [
   { key: "totalReturn", label: "Return %", format: (v) => `${v}%`, group: "pnl" },
-  { key: "totalReturnUsd", label: "Return USD", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
-  { key: "finalEquity", label: "Final Equity", format: (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2 }), group: "pnl" },
+  { key: "winRate", label: "Win Rate", format: (v) => `${v}%`, group: "pnl" },
   { key: "profitFactor", label: "Profit Factor", format: (v) => v.toFixed(2), group: "pnl" },
   { key: "expectancyUsd", label: "Expect. USD", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
   { key: "expectancyR", label: "Expect. R", format: (v) => v.toFixed(2), group: "pnl" },
   { key: "payoffRatio", label: "Payoff Ratio", format: (v) => v.toFixed(2), group: "pnl" },
   { key: "kellyFraction", label: "Kelly %", format: (v) => `${(v * 100).toFixed(1)}%`, group: "pnl" },
+  { key: "finalEquity", label: "Final Equity", format: (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2 }), group: "pnl" },
+  { key: "totalReturnUsd", label: "Return USD", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
   { key: "sharpeRatio", label: "Sharpe", format: (v) => v.toFixed(2), group: "risk" },
   { key: "sortinoRatio", label: "Sortino", format: (v) => v.toFixed(2), group: "risk" },
   { key: "maxDrawdown", label: "Max DD %", format: (v) => `${v.toFixed(2)}%`, group: "risk" },
@@ -62,7 +66,6 @@ const STAT_ITEMS: StatItem[] = [
   { key: "pnlConcentration", label: "Top 5 PnL %", format: () => "", group: "risk" },
   { key: "tradeCount", label: "Trades", format: (v) => String(v), group: "activity" },
   { key: "longShort", label: "L / S", format: () => "", group: "activity" },
-  { key: "winRate", label: "Win Rate", format: (v) => `${v}%`, group: "activity" },
 ];
 
 const GROUP_LABELS: Record<string, string> = { pnl: "PnL", risk: "Risk", activity: "Activity" };
@@ -99,6 +102,8 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
     ? (pnlDist.concentration as Record<string, unknown>)
     : null;
   const top5Pct = concentration != null ? Number(concentration.top5PnlPct ?? NaN) : NaN;
+
+  const tradeRSummary = summarizeTradeRMultiples(results.trades ?? []);
 
   const agg = batchAggregates && typeof batchAggregates === "object" ? batchAggregates : null;
   const aggItems: { label: string; value: string }[] = agg
@@ -208,10 +213,12 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
                 const value = resolveValue(key, format);
                 const alert = alertBorderFor(key);
                 const tip = showTips ? METH_TIPS[key] : undefined;
+                const mutedUsd =
+                  key === "finalEquity" || key === "totalReturnUsd" ? "opacity-90 ring-1 ring-zinc-700/35" : "";
                 return (
                   <div
                     key={key}
-                    className={`rounded-xl px-2.5 py-2 min-w-0 min-h-[58px] flex flex-col justify-between shadow-sm shadow-black/10 ${alert || "bg-zinc-800/85 border border-zinc-700/50"}`}
+                    className={`rounded-xl px-2.5 py-2 min-w-0 min-h-[58px] flex flex-col justify-between shadow-sm shadow-black/10 ${alert || "bg-zinc-800/85 border border-zinc-700/50"} ${mutedUsd}`}
                   >
                     <span className="text-[10px] text-zinc-500 uppercase tracking-wider truncate flex items-center gap-0.5">
                       {label}
@@ -228,6 +235,33 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
           </div>
         );
       })}
+      {tradeRSummary != null && (
+        <div>
+          <div className="text-[9px] uppercase tracking-widest text-zinc-600 mb-1 px-0.5 flex items-center gap-1">
+            R-multiple (obchody)
+            <FieldHelpPopover help={backtestFieldHelp.resultsRMultipleStats} />
+            {showTips ? (
+              <MethTip text="Z uzavřených obchodů, kde jde z zoneMeta odvodit vstup a stop: R = PnL / (|entry\u2212stop|\u00d7|size|). Chybí-li stop v metadatech, obchod se do statistiky nepočítá." />
+            ) : null}
+          </div>
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(7.5rem,1fr))] gap-2">
+            {[
+              { label: "Počet R", value: `${tradeRSummary.count} / ${results.trades?.length ?? 0}` },
+              { label: "Pr\u016fm\u011br R", value: tradeRSummary.mean.toFixed(2) },
+              { label: "Medi\u00e1n R", value: tradeRSummary.median.toFixed(2) },
+              { label: "5\u201395 %", value: `${tradeRSummary.p5.toFixed(2)} \u2026 ${tradeRSummary.p95.toFixed(2)}` },
+            ].map(({ label, value }) => (
+              <div
+                key={label}
+                className="rounded-xl px-2.5 py-2 min-w-0 min-h-[58px] flex flex-col justify-between shadow-sm shadow-black/10 bg-emerald-950/25 border border-emerald-800/40"
+              >
+                <span className="text-[10px] text-emerald-600/90 uppercase tracking-wider truncate">{label}</span>
+                <span className="font-mono text-[15px] text-emerald-100/95 truncate">{value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {mc != null && Number.isFinite(ror) && (
         <div className="rounded-lg bg-zinc-800/60 border border-zinc-700/40 px-3 py-2 text-xs text-zinc-400 space-y-1">
           <div className="flex flex-wrap gap-x-3 gap-y-1 items-center">

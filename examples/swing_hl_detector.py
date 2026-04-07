@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — examples/swing_hl_detector.py — zástupný import — do Firestore vlož spíš strategies/sd_zone_strategy/modules/Swing_HL.py (tento soubor jen přeposílá).
 """
 Zástupný modul pro zpětnou kompatibilitu importů (`examples.swing_hl_detector`).
 

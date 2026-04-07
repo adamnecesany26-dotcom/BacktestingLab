@@ -11,6 +11,7 @@ Přehled všech důležitých příkazů, jak spustit aplikaci, co dělat při p
 | **READMEAI.md** | Pro vývoj: kde v kódu měnit chování, kontrakty request/response. |
 | **audit/README.md** | Index uložených auditů (review později). |
 | **docs/QUANT_AUDIT.md** | Technický quant audit dat a engine. |
+| **docs/BACKTEST_PIPELINE_REFACTOR.md** | Artefakty `.backtest_artifacts/`, precompute H/L + S/D, View cache. |
 | **SCRIPTS.md** (tento soubor) | Jen příkazy a běh lokálně. |
 
 ---
@@ -103,6 +104,20 @@ http://localhost:3000
 | `uvicorn app.main:app --port 8000` | Spustí bez reload (produkce) |
 | `python -m pytest` | Spustí testy (`backend/tests/`, z adresáře `backend/`) |
 | `python backend/scripts/build_nq_view_demo_2025.py` | Z `data/futures_30m/NQ.txt` vyřízne rok 2025 → `nq_view_demo_2025.parquet` (View demo instrument) |
+
+### Precompute artefaktů (volitelné — CLI)
+
+Z adresáře **`backend`** s aktivním venv (kvůli importům `app.*`):
+
+```powershell
+cd c:\Users\adamn\Desktop\Backtesting_app\backend
+.\venv\Scripts\activate
+$env:PYTHONPATH = "..\;$(Get-Location)"
+python -m app.services.hl_precompute --help
+python -m app.services.sd_precompute --help
+```
+
+Výstup se ukládá do **`.backtest_artifacts/`** v kořeni projektu (není v gitu). Stejný výsledek lze dosáhnout tlačítkem **Build features** ve View — viz **`docs/BACKTEST_PIPELINE_REFACTOR.md`**.
 
 ---
 

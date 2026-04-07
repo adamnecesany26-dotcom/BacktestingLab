@@ -42,6 +42,9 @@ def append_audit_event(
         "status": status,
         "details": details or {},
     }
-    with _audit_file_path().open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        with _audit_file_path().open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 

@@ -25,7 +25,8 @@ def main() -> None:
         "entry_mode": "edge",
         "entry_pct": 0.5,
         "target_rr": 1.5,
-        "zone_max_bars": 60,
+        # Align s výchozím PARAMS ve strategii — příliš malé okno (60) často vygeneruje 0 obchodů na krátkém úseku.
+        "zone_max_bars": 6000,
         "require_inducement": False,
         "stop_offset_pct": 0.10,
         "trend_filter_enabled": False,
@@ -43,8 +44,8 @@ def main() -> None:
             "DATA_CACHE_PATH": cache_path,
             "INSTRUMENT": "NQ",
             "TIMEFRAME": "30m",
-            # Default: ~1 měsíc pro rychlý benchmark; nastav proměnnou BENCH_SD_YEARS (např. 1) pro delší běh.
-            "YEARS": os.environ.get("BENCH_SD_YEARS", "0.08"),
+            # Default ~0.12 y aby často vznikl alespoň 1 obchod (0.08 často 0 kvůli řídkému 1D + limit logice).
+            "YEARS": os.environ.get("BENCH_SD_YEARS", "0.12"),
             "DATA_FILE": "futures_30m/NQ.txt",
             "INITIAL_CAPITAL": "100000",
             "SLIPPAGE_PERC": "0.001",

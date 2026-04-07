@@ -134,19 +134,36 @@ export const guideSections: GuideSection[] = [
     id: "view-mode",
     title: "4) View mód: jak z něj vytěžit maximum",
     intro:
-      "View mód je rychlá vizuální validace. Ověříš, že signály a výpočty opravdu odpovídají tomu, co sis v kódu myslel.",
+      "View mód je rychlá vizuální validace. Kromě „živého“ výpočtu z kódu umí zobrazit H/L a S/D z předpočtených artefaktů (.backtest_artifacts) — stejný zdroj zón jako backtest s USE_SD_ARTIFACTS.",
     topics: [
       {
         id: "view-basics",
         title: "Co je View mód",
         whatItIs:
-          "Svíčkový graf s markery/liniemi/zónami z `detect()`, `get_line()` a `get_zones()` bez plného backtestu.",
+          "Svíčkový graf s markery/liniemi/zónami z `detect()`, `get_line()` a `get_zones()` bez plného backtestu. Volitelně režim „H/L + S/D z cache“: vrstvy z build pipeline místo online výpočtu modulu.",
         whyItMatters:
-          "Odhalí chyby dřív, než ztratíš čas na plných runech.",
+          "Odhalí chyby dřív, než ztratíš čas na plných runech; cache režim ověří shodu s Parquet zónami po Build features.",
         howToUse: [
-          "Přepni na View a vyber strategii/modul/indikátor.",
-          "Uprav `VIEW_PARAMS` a ihned sleduj změnu výstupu.",
+          "Přepni na View; vlevo zvol instrument (data_file) — Build features i modul vždy běží nad tímto souborem.",
+          "Timeframe svíček + období zobrazení řídí agregaci a okno grafu; Shuffle náhodně posune okno stejné šířky (u Max je Shuffle vypnutý).",
+          "Vyber strategii/modul/indikátor v druhém dropdownu.",
+          "Pro shodu s artefaktovým backtestem: dokonči Build features, pak zaškrtni H/L + S/D z cache a sleduj stav artefaktů pod lištou.",
+          "Drž konzistentní data_file a roky mezi View, buildem a backtestem (dataset_id).",
+          "Uprav `VIEW_PARAMS` a ihned sleduj změnu výstupu v živém režimu.",
           "Porovnej chování na více úsecích trhu (trend, chop, volatilita).",
+        ],
+      },
+      {
+        id: "view-cache-vs-live",
+        title: "Živý výpočet vs. H/L + S/D z cache",
+        whatItIs:
+          "Živý výpočet počítá výstupy z aktuálního kódu přes API. Cache režim načte stejné vrstvy jako `.backtest_artifacts` po H/L precompute a S/D buildu — odpovídá tomu, co engine používá při USE_SD_ARTIFACTS.",
+        whyItMatters:
+          "Bez cache porovnáváš backtest k Parquet z jiného geometrického zdroje než to, co vidíš ve View; s cache vidíš jednu pravdu.",
+        howToUse: [
+          "Stav badge u „Cache (dataset)“ musí být hotový před vykreslením z artefacts.",
+          "Po změně `zone_timeframes` ve strategii znovu spusť Build features.",
+          "Řádek nápovědy u tlačítka Build features v UI popisuje přesný rozsah dat.",
         ],
       },
       {
@@ -225,12 +242,12 @@ export const guideSections: GuideSection[] = [
         id: "tabs",
         title: "Co znamenají záložky výsledků",
         whatItIs:
-          "Equity, Highlight, Detailed, Analytics a Run history společně tvoří vícevrstvou analýzu; nad záložkami jsou StatBlocks (metriky + ⓘ) a tlačítka Export JSON / Repro bundle (ZIP).",
+          "Equity, Highlight, Detailed, Analytics a Run history společně tvoří vícevrstvou analýzu; nad záložkami jsou StatBlocks (metriky + ⓘ a u R-multiple též nápověda „?“), dvě equity křivky (účet v USD a kumulativní R z obchodů s metadaty) a tlačítka Export JSON / Repro bundle (ZIP).",
         whyItMatters:
           "Každá záložka odpovídá jiné otázce; jedna metrika nikdy nestačí.",
         howToUse: [
-          "Equity: hodnotíš tvar křivky, drawdown a stabilitu růstu.",
-          "Highlight/Detailed: kontroluješ kvalitu jednotlivých obchodů.",
+          "Equity (USD): tvar křivky, drawdown, náklady modelu. Druhý graf: součet R — potřebuje platné stopPrice v zoneMeta u obchodů.",
+          "Highlight/Detailed: kontrola obchodů; v Detailed lze zapnout „vrstvy z cache“ (stejný formát jako View z .backtest_artifacts) pro shodu zón s USE_SD_ARTIFACTS.",
           "Analytics: robustnost, Monte Carlo, validace, foldy, guardrails, cost attribution, heuristický readiness a overfitting varování.",
           "Run history: porovnáváš iterace, branch vývoj, N-way compare a lifecycle stavy.",
           "Repro bundle: manifest + souhrn + snapshot main.py z editoru pro pozdější audit (ulož kód před exportem).",
@@ -519,6 +536,19 @@ export const guideSections: GuideSection[] = [
         howToUse: [
           "Před exportem ZIP ulož main.py, pokud chceš shodu s Firestore.",
           "Dataset a verze backendu/engineu by měly sedět s původním během — README uvnitř ZIP to připomíná.",
+        ],
+      },
+      {
+        id: "pipeline-artifacts-precompute",
+        title: "Pipeline: precompute, dataset_id a .backtest_artifacts",
+        whatItIs:
+          "Dlouhý technický popis je v `docs/BACKTEST_PIPELINE_REFACTOR.md`. Stručně: H/L a S/D se mohou předpočítat do workspace složky `.backtest_artifacts`; `dataset_id` identifikuje kombinaci dat a okna; runner pro USE_SD_ARTIFACTS musí odkazovat na stejný strom souborů jako View po Build features.",
+        whyItMatters:
+          "Bez sjednocení zdroje zón se mezi View, Detailed a backtestem rozcházejí markery a obchody.",
+        howToUse: [
+          "Ve View používej Build features a kontroluj stav cache před důležitým runem.",
+          "V nastavení strategie čti nápovědu u `use_sd_artifacts` a souvisejících parametrů (popover „?“ u parametru).",
+          "Při úpravě pipeline čti vývojářský dokument výše — README v repu popisuje uživatelský workflow.",
         ],
       },
     ],

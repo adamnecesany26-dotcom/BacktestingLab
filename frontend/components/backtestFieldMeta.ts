@@ -1023,9 +1023,181 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     withoutIt: "Ztr\u00e1c\u00ed\u0161 kontext research procesu.",
     bestPractices: ["Zapisuj hypot\u00e9zu P\u0158ED runem a zji\u0161t\u011bn\u00ed PO."],
   },
+  artifactViewHlSdCache: {
+    id: "artifactViewHlSdCache",
+    title: "View: H/L + S/D z cache (.backtest_artifacts)",
+    whatItMeans:
+      "Zapnuto = vrstvy high/low a S/D z\u00f3n se berou z p\u0159edpo\u010dten\u00fdch artefakt\u016f (stejn\u00fd dataset_id jako u \u0161t\u00edtku Cache), ne z \u017eiv\u00e9ho vol\u00e1n\u00ed modulu na klientovi. " +
+      "Vypnuto = klasick\u00e9 View: modul/indik\u00e1tor/strategie po\u010d\u00edt\u00e1 v\u00fdstup z aktu\u00e1ln\u00edho k\u00f3du.",
+    whyItMatters:
+      "Backtest se strategi\u00ed USE_SD_ARTIFACTS m\u00e1 sed\u011bt se stejn\u00fdmi z\u00f3nami jako po Build features. Cache re\u017eim ve View ti uk\u00e1\u017ee p\u0159esn\u011b ty z\u00f3ny; live re\u017eim m\u016f\u017ee kv\u016fli jin\u00e9mu oknu, k\u00f3du nebo TF vypadat jinak.",
+    howToUse: [
+      "Nejd\u0159\u00edv Build features (nebo ov\u011b\u0159 zelen\u00fd/ok stav cache), pak za\u0161krtni tento re\u017eim.",
+      "Build v\u017edy po\u010d\u00edt\u00e1 na **cel\u00fd** data_file; **Obdob\u00ed** ve View jen zu\u017euje co vid\u00ed\u0161 na grafu.",
+      "Strategick\u00fd parametr use_sd_artifacts v backtestu mus\u00ed m\u00edt k dispozici cestu k Parquet z runneru (viz README / pipeline).",
+    ],
+    recommendedDefault: "P\u0159i lad\u011bn\u00ed shody View\u2194backtest zapni cache; p\u0159i \u00faprav\u00e1ch algoritmu \u010dasto vypni a kontroluj live v\u00fdstup.",
+    withoutIt: "Porovn\u00e1v\u00e1\u0161 jen \u017eiv\u00fd v\u00fdpo\u010det, ne nutn\u011b stejn\u00e9 z\u00f3ny jako v engine s artefakty.",
+    bestPractices: [
+      "Kter\u00e9 TF z\u00f3n strategie pou\u017e\u00edv\u00e1 \u0159e\u0161\u00ed **zone_timeframes** v PARAMS; artefakty u\u017e obsahuj\u00ed v\u0161echny TF \u017eeb\u0159\u00ed\u010dku Buildu.",
+      "dataset_id na \u0161t\u00edtku = **data_file** + fingerprint (jeden kl\u00ed\u010d pro cel\u00fd soubor, ne z\u00fa\u017een\u00e9 Obdob\u00ed ve View).",
+    ],
+  },
+  artifactViewDatasetStatus: {
+    id: "artifactViewDatasetStatus",
+    title: "View: stav cache (dataset)",
+    whatItMeans:
+      "Shrnut\u00ed, jestli pro aktu\u00e1ln\u00ed data existuj\u00ed H/L precompute a S/D zones v .backtest_artifacts (souhrn z API). " +
+      "dataset_id identifikuje **data_file** + fingerprint cel\u00e9ho souboru (bez \u0159ezu podle Obdob\u00ed ve View); runner pro USE_SD_ARTIFACTS pou\u017e\u00edv\u00e1 stejn\u00fd kl\u00ed\u010d.",
+    whyItMatters:
+      "Bez \u00fasp\u011b\u0161n\u00e9ho buildu nem\u00e1 \u0161ma\u010dn\u00e9 H/L + S/D z cache co kreslit a backtest s artefacts sel\u017ee nebo spadne na legacy v\u00fdpo\u010det.",
+    howToUse: [
+      "Klikni Build features, kdy\u017e stav chyb\u00ed nebo je zastaral\u00fd po zm\u011bn\u011b dat.",
+      "Obnovit stav znovu na\u010dte pr\u016fb\u011bh z backendu.",
+      "Tooltip na \u0161t\u00edtku uk\u00e1\u017ee detail H/L a S/D pod-\u00fakol\u016f.",
+    ],
+    recommendedDefault: "P\u0159ed d\u016fle\u017eit\u00fdm runem zkontroluj zelen\u00fd / complete stav.",
+    withoutIt: "Riskuje\u0161 nejasnosti, pro\u010d se z\u00f3ny v View a v runu li\u0161\u00ed.",
+    bestPractices: ["Dr\u017e **stejn\u00fd data_file** ve View a v backtestu; Obdob\u00ed ve View je jen zobrazen\u00ed."],
+  },
+  artifactViewBuildFeatures: {
+    id: "artifactViewBuildFeatures",
+    title: "View: Build features",
+    whatItMeans:
+      "Spust\u00ed na serveru H/L precompute na **cel\u00fd** obsah **data_file** a na **ka\u017ed\u00fd timeframe** v intern\u00edm \u017eeb\u0159\u00ed\u010dku, pak S/D z\u00f3ny pro **v\u0161echny** tyto TF. **Obdob\u00ed** ve View se buildu net\u00fdk\u00e1 \u2014 jen omezuje, co se na grafu vykresl\u00ed. " +
+      "Velk\u00e9 soubory mohou trvat **des\u00edtky minut**; HTTP 500 po dlouh\u00e9 \u010dek\u00e1n\u00ed: pod\u00edvej se do termin\u00e1lu **uvicorn** (traceback) nebo zda t\u011b proxy nep\u0159eru\u0161ila spojen\u00ed. " +
+      "V\u00fdsledek se ulo\u017e\u00ed do workspace .backtest_artifacts (z\u00e1mek se po p\u00e1du procesu uvoln\u00ed, pokud PID u\u017e neb\u011b\u017e\u00ed).",
+    whyItMatters:
+      "Artefakty jsou zdroj pravdy pro USE_SD_ARTIFACTS a pro vrstvy z cache ve View \u2014 bez buildu nejsou Parquet z\u00f3ny k dispozici.",
+    howToUse: [
+      "Po zm\u011bn\u011b dat, k\u00f3du H/L nebo S/D, nebo parametr\u016f z\u00f3n build spus\u0165 znovu.",
+      "\u010cekni chybovou hl\u00e1\u0161ku pod tla\u010d\u00edtky, pokud build spadne.",
+    ],
+    recommendedDefault: "Build po ka\u017ed\u00e9 v\u00fdznamn\u011b\u0161\u00ed zm\u011bn\u011b konfigurace z\u00f3n nebo datasetu.",
+    withoutIt: "use_sd_artifacts a cache vrstvy nemaj\u00ed garantovan\u011b data.",
+    bestPractices: [
+      "Kter\u00e9 TF z\u00f3n pou\u017e\u00edv\u00e1 **strategie** nastav\u00ed\u0161 v **zone_timeframes**; Build u\u017e p\u0159edpo\u010d\u00edt\u00e1 v\u0161echny TF \u017eeb\u0159\u00ed\u010dku.",
+      "Build pipeline v\u017edy b\u011b\u017e\u00ed z repozit\u00e1\u0159ov\u00e9ho **Swing_HL** a **examples/sd_zones** \u2014 volba modulu HL_identificator ve View na backendov\u00fd precompute nesah\u00e1.",
+      "Dlouh\u00e9 \u0159ady = dlouh\u00fd b\u011bh; sleduj log backendu.",
+    ],
+  },
+  resultsEquityUsd: {
+    id: "resultsEquityUsd",
+    title: "V\u00fdsledky: Equity \u00fa\u010dtu (USD / broker)",
+    whatItMeans:
+      "K\u0159ivka equity z backtestu podle brokeru Backtraderu: zahrnuje velikost pozic, poplatky modelu, p\u0159\u00edpadn\u00fd execution stress z nastaven\u00ed.",
+    whyItMatters:
+      "To je hlavn\u00ed \u201epeni\u017een\u00ed\u201c pohled \u2014 kolik by \u00fa\u010det nabobtnal nebo proml\u010dl.",
+    howToUse: [
+      "Srovn\u00e1vej se stejn\u00fdm initial capital a execution nastaven\u00edm.",
+      "P\u0158i OOS/WF pamatuj, \u017ee hlavn\u00ed k\u0159ivka je z pln\u00e9ho b\u011bhu (viz banner ve StatBlocks).",
+    ],
+    recommendedDefault: "V\u017edy ji \u010dti spolu s druhou k\u0159ivkou (R) a drawdown metrikami.",
+    withoutIt: "Vid\u00ed\u0161 jen abstraktn\u00ed R bez v\u00e1hy pen\u011bz a poplatk\u016f.",
+    bestPractices: ["Pod\u00edvej se na underwater graf pod k\u0159ivkou."],
+  },
+  resultsEquityR: {
+    id: "resultsEquityR",
+    title: "V\u00fdsledky: Kumulativn\u00ed R (uzav\u0159en\u00e9 obchody)",
+    whatItMeans:
+      "Sou\u010det realizovan\u00e9ho R po obchodech; R odhad z PnL a odvozen\u00e9ho risku ze zoneMeta (entry, stop, size). Obchody bez platn\u00e9ho stopPrice v metadatech se do sou\u010dtu nepo\u010d\u00edtaj\u00ed.",
+    whyItMatters:
+      "Odd\u011bluje \u201ev\u00fdkonnost podle definovan\u00e9ho risku\u201c od nominalu \u00fa\u011btu \u2014 u\u017eite\u010dn\u00e9 pro srovn\u00e1n\u00ed styl\u016f vstup\u016f.",
+    howToUse: [
+      "Kdy\u017e k\u0159ivka chyb\u00ed, zkontroluj, \u017ee strategie pln\u00ed zoneMeta stop u z\u00e1kazn\u00ed m\u00edchy.",
+      "Srovnej s blokem R-multiple ve statistik\u00e1ch.",
+    ],
+    recommendedDefault: "Pou\u017e\u00edvej vedle equity USD pro kontext risk-adjusted dr\u017eeni.",
+    withoutIt: "M\u00f9\u017ee\u0161 p\u0159ece\u0148ovat strategii s velk\u00fdm size nebo \u0161t\u011bst\u00edm na volatilit\u011b.",
+    bestPractices: ["Shoda R grafu a o\u010dek\u00e1v\u00e1n\u00ed strategie = dobr\u00fd sign\u00e1l konzistentn\u00edch metadat."],
+  },
+  resultsDetailedArtifactLayers: {
+    id: "resultsDetailedArtifactLayers",
+    title: "Detailed: vrstvy z .backtest_artifacts",
+    whatItMeans:
+      "Zapnuto = pro zobrazen\u00fd \u010dasov\u00fd v\u00fd\u0159ez se nat\u00e1hnou markery/linie/z\u00f3ny ve stejn\u00e9m form\u00e1tu jako ve View z cache (API view + adapter na ModuleOutput). " +
+      "Vypnuto = standardn\u00ed detailed v\u00fdstup z b\u011bhu backtestu.",
+    whyItMatters:
+      "U strategi\u00ed s USE_SD_ARTIFACTS ov\u011b\u0159\u00ed\u0161, \u017ee vid\u00ed\u0161 stejnou geometrii z\u00f3n v detailu obchodu jako v p\u0159edpo\u010dtu.",
+    howToUse: [
+      "Vy\u017eaduje platn\u00e9 artefakty pro run (stejn\u00fd dataset jako p\u0159i b\u011bhu).",
+      "P\u0159i chyb\u011b \u010dti banner nebo chybovou hl\u00e1\u0161ku pod checkboxem.",
+    ],
+    recommendedDefault: "Zapni p\u0159i debugu shody z\u00f3n mezi runem a vizualizac\u00ed.",
+    withoutIt: "Detailed ukazuje pouze to, co engine ulo\u017eil v module outputu z simulace.",
+    bestPractices: ["Kombinuj s View H/L+S/D z cache pro stejn\u00fd ment\u00e1ln\u00ed model."],
+  },
+  resultsRMultipleStats: {
+    id: "resultsRMultipleStats",
+    title: "Statistiky R-multiple (obchody)",
+    whatItMeans:
+      "Agregace z uzav\u0159en\u00fdch obchod\u016f, kde jde z zoneMeta odvodit vstup, stop a size. R = PnL d\u011bleno rizikem v bodech (|entry\u2212stop|\u00d7|size|). Obchody bez pot\u0159ebn\u00fdch pol\u00ed se vynechaj\u00ed.",
+    whyItMatters:
+      "Expect. R v m\u0159\u00ed\u017ek\u00e1ch PnL je hrub\u00fd proxy; tento blok ukazuje rozlo\u017een\u00ed skute\u010dn\u00fdch R u obchod\u016f s metadaty.",
+    howToUse: [
+      "Srovnej po\u010det \u201epo\u010d\u00edtan\u00fdch\u201c vs celkov\u00fd po\u010det obchod\u016f \u2014 velk\u00fd rozd\u00edl = chyb\u00edc\u00ed zoneMeta.",
+      "Pou\u017eij percentily a medi\u00e1n pro odolnost proti jednomu outlieru.",
+    ],
+    recommendedDefault: "Kontroluj po ka\u017ed\u00e9 zm\u011bn\u011b logiky vstupu/v\u00fdstupu.",
+    withoutIt: "\u0158\u00edk\u00e1\u0161 si, \u017ee strategie m\u00e1 R edge, ale nem\u00e1\u0161 spo\u010d\u00edtan\u00fd rozptyl.",
+    bestPractices: ["Dr\u017e v k\u00f3du konzistentn\u00ed zapisov\u00e1n\u00ed stop do metadat z\u00f3n."],
+  },
+};
+
+/** Plné popisy pro strategické PARAMS, kde Python PARAMS_META neobsahuje všechny sekce — sloučí se v getParamHelp. */
+const PARAM_FALLBACK_OVERRIDES: Record<string, BacktestFieldHelp> = {
+  use_sd_artifacts: {
+    id: "use_sd_artifacts",
+    title: "Strategie: z\u00f3ny z Parquet (USE_SD_ARTIFACTS)",
+    whatItMeans:
+      "Zapnuto = engine na\u010d\u00edte z\u00f3ny z p\u0159edpo\u010dten\u00e9ho zones.parquet v .backtest_artifacts m\u00edsto pln\u00e9ho v\u00fdpo\u010dtu S/D modulu uvnit\u0159 b\u011bhu. Vy\u017eaduje, \u017ee runner nastav\u00ed cestu k artefakt\u016fm (viz prom\u011bnn\u00e9 prost\u0159ed\u00ed / Docker pipeline).",
+    whyItMatters:
+      "Garantuje stejnou geometrii z\u00f3n jako po Build features a ve View z cache \u2014 eliminuje drift mezi view a backtestem.",
+    howToUse: [
+      "Nejd\u0159\u00edv dokon\u010dete Build features pro **stejn\u00fd data_file** (build jde v\u017edy p\u0159es cel\u00fd soubor).",
+      "P\u0159i zm\u011bn\u011b dat nebo k\u00f3du/parametr\u016f z\u00f3n znovu Build; **zone_timeframes** v strategii jen vyb\u00edr\u00e1, kter\u00e9 TF z p\u0159edpo\u010dtu pou\u017e\u00edt.",
+      "Legacy re\u017eim (bez artefakt\u016f) nechte vypnut\u00fd, pokud nezkoum\u00e1te star\u00e9 chov\u00e1n\u00ed.",
+    ],
+    recommendedDefault: "Zapnuto u workflowu zalo\u017een\u00e9ho na artefacts; vypnuto jen p\u0159i porovn\u00e1n\u00ed s live v\u00fdpo\u010dtem.",
+    withoutIt: "Engine m\u016f\u017ee pou\u017e\u00edt jin\u00fd zdroj z\u00f3n ne\u017e View po buildu.",
+    bestPractices: ["Dr\u017e dataset_id v souladu mezi UI, runnerem a soubory na disku."],
+  },
+  sd_artifact_only_with_trend: {
+    id: "sd_artifact_only_with_trend",
+    title: "Artefakt: jen z\u00f3ny with_trend",
+    whatItMeans:
+      "Filtr \u0159\u00e1dk\u016f v zones.parquet podle p\u0159edpo\u010dtu trendu (sloupec / flag z build pipeline). Plat\u00ed jen kdy\u017e use_sd_artifacts je zapnuto.",
+    whyItMatters:
+      "Zu\u017euje obchodov\u00e1n\u00ed jen na z\u00f3ny, kter\u00e9 build ozna\u010dil jako s trendem \u2014 mus\u00ed sed\u011bt s t\u00edm, co vid\u00ed\u0161 ve filtrovan\u00e9m exportu.",
+    howToUse: [
+      "Zap\u00ednej a\u017e po ov\u011b\u0159en\u00ed, \u017ee trendov\u00e1 klasifikace v artefaktech d\u00e1v\u00e1 smysl pro tv\u016fj TF.",
+      "Porovnej po\u010det z\u00f3n s/v bez filtru v diagnostice.",
+    ],
+    recommendedDefault: "Podle hypot\u00e9zy u trendov\u00e9 strategie; jinak vypnuto.",
+    withoutIt: "Obchoduj\u00ed se v\u0161echny z\u00f3ny z Parquet bez ohledu na p\u0159edpo\u010dt trendu.",
+    bestPractices: ["Kombinuj s vizu\u00e1ln\u00ed kontrolou ve View z cache."],
+  },
+  entry_min_touch_tier: {
+    id: "entry_min_touch_tier",
+    title: "Vstup po \u00farovni dotyku z\u00f3ny",
+    whatItMeans:
+      "1 = povolen vstup po prvn\u00edm dotyku (nebo z\u00f3na bez druh\u00e9ho dotyku v datech). 2 = jen z\u00f3ny s druh\u00fdm dotykem (has_touch2 / touches\u22652 v artefaktu nebo modulech).",
+    whyItMatters:
+      "M\u011bn\u00ed, jak \u010dest\u00e9 jsou vstupy \u2014 vy\u0161\u0161\u00ed tier vy\u017eaduje v\u00edce potvrzen\u00ed od ceny.",
+    howToUse: [
+      "P\u0159i USE_SD_ARTIFACTS ov\u011b\u0159, \u017ee touch metadada v Parquet odpov\u00eddaj\u00ed o\u010dek\u00e1v\u00e1n\u00ed.",
+      "Srovnej statistiky obchod\u016f mezi 1 a 2.",
+    ],
+    recommendedDefault: "Za\u010d\u00ednej na 1 pro v\u00edce vzorku; 2 pro konzervativn\u011bj\u0161\u00ed filtr.",
+    withoutIt: "Vychoz\u00ed logika strategie rozhoduje bez explicitn\u00edho tier filtru v parametru.",
+    bestPractices: ["Nem\u011b\u0148 tier uprost\u0159ed s\u00e9rie run\u016f bez z\u00e1znamu v hypothesis note."],
+  },
 };
 
 export function getParamFallbackHelp(paramName: string, source: "PARAMS" | "VIEW_PARAMS"): BacktestFieldHelp {
+  if (source === "PARAMS" && PARAM_FALLBACK_OVERRIDES[paramName]) {
+    return PARAM_FALLBACK_OVERRIDES[paramName];
+  }
   const normalized = paramName.replace(/_/g, " ");
   const prettyName = normalized.charAt(0).toUpperCase() + normalized.slice(1);
   const isView = source === "VIEW_PARAMS";

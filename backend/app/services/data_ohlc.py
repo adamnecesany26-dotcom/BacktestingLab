@@ -9,6 +9,7 @@ import hashlib
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 try:
     import polars as pl
@@ -51,6 +52,58 @@ def resolve_safe_data_path(data_dir: Path, data_file: str) -> Path | None:
     if not p.is_file():
         return None
     return p
+
+
+def parse_iso_timestamp_for_index(idx: pd.DatetimeIndex, iso_s: str | None) -> pd.Timestamp | None:
+    """
+    Parsuje ISO z artefaktů tak, aby šel porovnat a použít v ``searchsorted`` na ``idx``.
+
+    ``futures_30m/*.txt`` dává typicky **tz-naive** index; v Parquet mohou být časy s offsetem/Z.
+    Přímo ``idx.min() <= pd.Timestamp(iso)`` pak hodí **TypeError** → dříve HTTP 500 na ``/api/view``.
+    """
+    if idx is None or idx.empty or iso_s is None:
+        return None
+    raw = str(iso_s).strip()
+    if not raw:
+        return None
+    try:
+        ts = pd.Timestamp(raw)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    idx_tz = getattr(idx, "tz", None)
+    if idx_tz is None:
+        if ts.tzinfo is not None:
+            try:
+                ts = ts.tz_convert("UTC")
+            except Exception:
+                return None
+            try:
+                ts = pd.Timestamp(
+                    ts.year,
+                    ts.month,
+                    ts.day,
+                    ts.hour,
+                    ts.minute,
+                    ts.second,
+                    ts.microsecond,
+                )
+            except Exception:
+                return None
+        return ts
+    if ts.tzinfo is None:
+        try:
+            return ts.tz_localize("UTC").tz_convert(idx_tz)
+        except Exception:
+            try:
+                return ts.tz_localize(idx_tz, ambiguous=True, nonexistent="shift_forward")
+            except Exception:
+                return None
+    try:
+        return ts.tz_convert(idx_tz)
+    except Exception:
+        return None
 
 
 def polars_scan_ohlc_schema(path: Path) -> dict[str, str] | None:

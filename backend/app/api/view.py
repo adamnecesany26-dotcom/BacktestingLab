@@ -21,6 +21,8 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 from app.services.audit import append_audit_event
+from app.services import view_artifacts
+from app.services.view_chart_timeframe import apply_view_chart_timeframe_hl_parity
 
 router = APIRouter()
 MAX_VIEW_CODE_CHARS = 500_000
@@ -332,8 +334,7 @@ def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -
         raise ValueError(
             f"chart_timeframe {key} is finer than native data (~{native_min:.1f} min bars); use native or a coarser step."
         )
-    rule = _CHART_TF_TO_PANDAS[key]
-    return _resample_ohlc_dataframe(df, rule)
+    return apply_view_chart_timeframe_hl_parity(df, chart_timeframe)
 
 
 def _validate_module_dependencies(module_dependencies: dict[str, str] | None) -> None:
@@ -781,6 +782,10 @@ class ViewRequest(BaseModel):
     # Optional slice after years cutoff: ISO8601 timestamps (inclusive), timezone-naive matches index
     start_iso: str | None = None
     end_iso: str | None = None
+    # Fáze 5: číst H/L + S/D z .backtest_artifacts (bez view_engine / přepočtu modulů)
+    use_artifacts: bool = False
+    artifact_include_sd: bool = True
+    artifact_dataset_id: str | None = None
 
 
 def _call_with_params(fn, df: pd.DataFrame, params: dict):
@@ -884,6 +889,70 @@ async def get_view_data(req: ViewRequest, request: Request):
     lines: list = []
     zones: list = []
 
+    if req.use_artifacts:
+        try:
+            df_chart = _apply_view_chart_timeframe(df, req.chart_timeframe)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Nelze připravit OHLC pro zobrazený timeframe (H/L parity): {e}",
+            ) from e
+        art = view_artifacts.build_view_from_artifacts(
+            data_dir=_get_data_dir(),
+            data_file=req.data_file,
+            years=req.years,
+            start_iso=req.start_iso,
+            end_iso=req.end_iso,
+            df_chart=df_chart,
+            chart_tf_normalized=_normalize_chart_tf_key(req.chart_timeframe),
+            include_sd=req.artifact_include_sd,
+            dataset_id_override=(req.artifact_dataset_id or "").strip() or None,
+        )
+        markers = art["markers"]
+        lines = art["lines"]
+        zones = art["zones"]
+        ohlc_df = pd.DataFrame({
+            "date": [_to_iso(ts) for ts in df_chart.index],
+            "open": _series_as_float(df_chart, "open", "Open"),
+            "high": _series_as_float(df_chart, "high", "High"),
+            "low": _series_as_float(df_chart, "low", "Low"),
+            "close": _series_as_float(df_chart, "close", "Close"),
+        })
+        ohlc = ohlc_df.to_dict(orient="records")
+        markers_out: list = []
+        for m in markers:
+            if isinstance(m, dict):
+                mm = dict(m)
+                mm.pop("bar_index", None)
+                markers_out.append(mm)
+            else:
+                markers_out.append(m)
+        append_audit_event(
+            action="view.artifacts",
+            actor_id=actor_id,
+            entity="view",
+            status="ok",
+            details={
+                "data_file": req.data_file,
+                "years": req.years,
+                "chart_timeframe": req.chart_timeframe,
+                "artifact_status": art["artifact_status"],
+                "dataset_id": art.get("dataset_id"),
+                "markers_count": len(markers_out),
+            },
+        )
+        return {
+            "ohlc": ohlc,
+            "markers": markers_out,
+            "lines": lines,
+            "zones": zones,
+            "artifact_status": art["artifact_status"],
+            "artifact_banner": art["artifact_banner"],
+            "dataset_id": art["dataset_id"],
+        }
+
     if req.module_code and req.module_code.strip():
         try:
             ohlc, markers, lines, zones = await _run_view_code_in_subprocess(
@@ -931,6 +1000,11 @@ async def get_view_data(req: ViewRequest, request: Request):
         df_chart = _apply_view_chart_timeframe(df, req.chart_timeframe)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nelze připravit OHLC pro zobrazený timeframe (H/L parity): {e}",
+        ) from e
 
     ohlc_df = pd.DataFrame({
         "date": [_to_iso(ts) for ts in df_chart.index],

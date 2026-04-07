@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — strategies/sd_zone_strategy/main.py — strategie — celý soubor vložit do Firestore (Strategie → main.py).
 """
 S/D Zone Strategy – zóny na vyšším TF (výchozí 1D), vstup/výstup na exekučním TF (výchozí 30m).
 
@@ -12,7 +13,8 @@ Parametr `exec_timeframe` popisuje záměr; skutečný TF řídí data feedu —
 (`warn_exec_timeframe_mismatch`). Momentum větev: po signálu se zadá limitní příkaz uvnitř zóny (ne market mimo zónu).
 
 Detailed — moduleOutputs: engine slučuje `zone_timeframes` + `zone_max_bars` ze strategie s get_zones, aby graf
-odpovídal výpočtu (dříve stačil timeframe „1d“ z VIEW_PARAMS modulu).
+odpovídal výpočtu. UI kreslí navíc obdélník z `zoneMeta` (ceny + datum zóny při vstupu, žlutý obrys) — to je přesná
+zóna obchodu; ostatní D/S obdélníky jsou všechny zóny v časovém okně z modulu.
 
 MTF: `zone_timeframes` = čárkou oddělené TF (např. "1w,1d"); překryvy stejného typu se slučují,
     `prefer_higher_tf` vybere geometrii z hrubšího nebo jemnějšího TF.
@@ -50,6 +52,7 @@ except ImportError:
 
 from app.services.sd_zone_merge import (
     build_merged_sd_zones as _merge_zones_core,
+    build_merged_sd_zones_from_artifact as _merge_zones_from_artifact,
     merged_zone_key,
     min_zone_ohlc_bars,
     parse_zone_timeframes_dict,
@@ -134,6 +137,7 @@ PARAMS = {
     "target_rr": 1.5,
     "zone_max_bars": 6000,
     "retest_entry_max": 1,
+    "entry_min_touch_tier": 1,
     "zone_trading_far_atr_mult": 8.0,
     "zone_trading_far_consecutive_exec_bars": 12,
     "zone_trading_far_min_track_exec_bars": 36,
@@ -141,6 +145,12 @@ PARAMS = {
     "stop_offset_pct": 0.10,
     "trend_filter_enabled": False,
     "max_base_length": 0,
+    "max_zone_age_bars": 0,
+    "allow_zones_with_touch": True,
+    "min_impulse_score": 0,
+    "max_impulse_score": 0,
+    "use_sd_artifacts": 0,
+    "sd_artifact_only_with_trend": 0,
 }
 
 # Popisky a výběrová pole pro panel Parametry (frontend parsuje PARAMS_META).
@@ -196,6 +206,14 @@ PARAMS_META = {
         "title": "Max. pokusů o vstup po odchodu od zóny",
         "what_it_means": "1 = jeden cyklus odchod→limit; 2 = po nevyplnění limitu lze znovu po novém odchodu ceny od zóny.",
     },
+    "entry_min_touch_tier": {
+        "title": "Vstup po úrovni dotyku",
+        "what_it_means": "1 = stačí 1. dotyk (nebo zóna bez touch2); 2 = jen zóny s druhým dotykem (artefakt has_touch2 nebo touches≥2).",
+        "why_it_matters": "Mění počet vstupů a kvalitu potvrzení od ceny; u USE_SD_ARTIFACTS musí sedět touch metadata v Parquet.",
+        "without_it": "Špatná volba tieru vůči artefaktům = málo obchodů nebo vstupy, které ve View z cache nevidíš.",
+        "options": "1|2",
+        "option_labels": "Po 1. dotyku|Po 2. dotyku",
+    },
     "zone_trading_far_atr_mult": {
         "title": "Vypnout obchod — vzdálenost (× ATR od zóny)",
         "what_it_means": "Close dál než tento násobek ATR od nejbližší hrany zóny po N po sobě jdoucích barech → přestaneme hledat vstup (výjimka Major zóny).",
@@ -223,6 +241,41 @@ PARAMS_META = {
     "max_base_length": {
         "title": "Max. délka base (0 = vypnuto)",
         "what_it_means": "Odfiltruje zóny s delší base než tento počet svíček.",
+    },
+    "max_zone_age_bars": {
+        "title": "Max. stáří zóny (exekuční bary, 0 = bez limitu)",
+        "what_it_means": "Od pivot_idx / vzniku zóny na TF zóny — starší zóny se neobchodují.",
+    },
+    "allow_zones_with_touch": {
+        "title": "Povolit zóny už s prvním dotykem",
+        "what_it_means": "Ne = vstup jen u „čistých“ zón bez registrovaného dotyku v modulu.",
+    },
+    "min_impulse_score": {
+        "title": "Min. impulse score (0 = vypnuto)",
+        "what_it_means": "Filtr síly impulsu z modulu S/D.",
+    },
+    "max_impulse_score": {
+        "title": "Max. impulse score (0 = vypnuto)",
+        "what_it_means": "Horní mez impulse; 0 = bez omezení.",
+    },
+    "use_sd_artifacts": {
+        "title": "Strategie: načíst zóny z Parquet (USE_SD_ARTIFACTS)",
+        "what_it_means": (
+            "Zapnuto = engine načítá zóny z zones.parquet v .backtest_artifacts (stejný pipeline jako Build features ve View), "
+            "ne plný přepočet S/D modulu uvnitř běhu. Runner musí nastavit cestu k artefaktům (env / Docker)."
+        ),
+        "why_it_matters": "Shoda geometrie zón mezi View (H/L+S/D z cache), precompute a backtestem; bez toho UI a run mohou divergovat.",
+        "without_it": "Zóny se odvozují klasickou cestou z modulu v engine — nemusí odpovídat Parquet z buildu.",
+        "booleanWidget": True,
+    },
+    "sd_artifact_only_with_trend": {
+        "title": "Artefakt: jen zóny with_trend",
+        "what_it_means": "Filtr řádků zones.parquet na zóny označené s trendem ve zvoleném TF (předpočet v artefaktu).",
+        "why_it_matters": "Zužuje obchodování; ověř si ve View z cache, že filtrový výraz dává smysl pro tvůj kontext.",
+        "without_it": "Obchodují se všechny řádky zones.parquet (pro dané okno), které strategie jinak připustí.",
+        "booleanWidget": True,
+        "depends_on_param": "use_sd_artifacts",
+        "depends_on_values": "1|true|True",
     },
 }
 
@@ -429,6 +482,15 @@ def _dip_pct_after_departure_supply(zh: float, zl: float, max_high_since_departu
 def _zone_passes_trade_filters(strat: "Strategy", z: dict, d_idx: int) -> bool:
     if not bool(strat.params.allow_zones_with_touch) and z.get("has_touch"):
         return False
+    try:
+        tier = int(getattr(strat.params, "entry_min_touch_tier", 1) or 1)
+    except (TypeError, ValueError):
+        tier = 1
+    if tier >= 2:
+        tch = z.get("touches")
+        tch_n = int(tch) if tch is not None and str(tch).strip() != "" else 0
+        if not (bool(z.get("has_touch2")) or tch_n >= 2):
+            return False
     piv = int(z.get("pivot_idx", z.get("end_idx", d_idx)))
     age = int(d_idx) - piv
     max_age = int(strat.params.max_zone_age_bars)
@@ -567,6 +629,17 @@ def _daily_invalidates(zone: dict, daily_close: float) -> bool:
 
 
 class Strategy(bt.Strategy):
+    @staticmethod
+    def _same_bt_order(a, b) -> bool:
+        """Backtrader u notify_order někdy předá jinou instanci Order než vrácenou z buy/sell — sjednot podle ref."""
+        if a is None or b is None:
+            return False
+        if a is b:
+            return True
+        ar = getattr(a, "ref", None)
+        br = getattr(b, "ref", None)
+        return ar is not None and br is not None and ar == br
+
     params = (
         ("zone_timeframe", "1d"),
         ("zone_timeframes", "1d"),
@@ -579,6 +652,7 @@ class Strategy(bt.Strategy):
         ("target_rr", 1.5),
         ("zone_max_bars", 6000),
         ("retest_entry_max", 1),
+        ("entry_min_touch_tier", 1),
         ("zone_trading_far_atr_mult", 8.0),
         ("zone_trading_far_consecutive_exec_bars", 12),
         ("zone_trading_far_min_track_exec_bars", 36),
@@ -617,6 +691,8 @@ class Strategy(bt.Strategy):
         ("trend_max_score_supply", -25.0),
         ("range_zone_policy", "both"),
         ("module_params", {}),
+        ("use_sd_artifacts", 0),
+        ("sd_artifact_only_with_trend", 0),
     )
 
     def __init__(self):
@@ -630,12 +706,66 @@ class Strategy(bt.Strategy):
         self._pending_orders: list = []
         self._zone_track: dict[str, dict] = {}
         self._trade_meta_queue: deque = deque()
+        # Záloha pro decorate_trade_record — někdy je řazení notify_* takové, že deque už neobsahuje meta.
+        self._last_zone_meta_for_decorate: dict | None = None
         self._last_zone_ohlc: pd.DataFrame = pd.DataFrame()
         self._zone_height_history: list[float] = []
         self._missing_modules_warned: bool = False
         self._exec_tf_mismatch_warned: bool = False
         self._sd_empty_supply_demand_warned: bool = False
         self._sd_zones_mem_cache: dict[tuple[str, str, int, str], list[dict]] = {}
+        self._sd_artifact_df: pd.DataFrame | None = None
+
+    def start(self):
+        """Načte ``zones.parquet`` z env (fáze 4), pokud je zapnutý artefaktový režim."""
+        self._sd_artifact_df = None
+        env_on = str(os.environ.get("USE_SD_ARTIFACTS", "")).strip().lower() in ("1", "true", "yes")
+        try:
+            param_on = bool(int(getattr(self.params, "use_sd_artifacts", 0)))
+        except (TypeError, ValueError):
+            param_on = False
+        if env_on or param_on:
+            zp = str(os.environ.get("SD_ARTIFACT_ZONES_PATH", "")).strip()
+            if not zp:
+                print(
+                    "sd_zone_strategy: use_sd_artifacts bez SD_ARTIFACT_ZONES_PATH — zkontroluj runner/engine.",
+                    flush=True,
+                )
+                return
+            try:
+                self._sd_artifact_df = pd.read_parquet(zp)
+            except Exception as ex:
+                print(f"sd_zone_strategy: nepodařilo se načíst {zp}: {ex}", flush=True)
+                self._sd_artifact_df = None
+
+    def _sd_artifact_active(self) -> bool:
+        return getattr(self, "_sd_artifact_df", None) is not None
+
+    def _merged_zones_bundle(self, exec_df: pd.DataFrame, tfs: list[str]) -> tuple[list, list]:
+        overlap_th = float(self.params.zone_price_overlap_threshold)
+        pref = bool(self.params.prefer_higher_tf)
+        if self._sd_artifact_active():
+            try:
+                only_trend = bool(int(getattr(self.params, "sd_artifact_only_with_trend", 0)))
+            except (TypeError, ValueError):
+                only_trend = False
+            return _merge_zones_from_artifact(
+                exec_df,
+                tfs,
+                self._sd_artifact_df,  # type: ignore[arg-type]
+                pref,
+                overlap_th,
+                only_with_trend=only_trend,
+            )
+        return _build_merged_sd_zones(
+            exec_df,
+            tfs,
+            get_zones,
+            self._sd_module_params_for_tf,
+            pref,
+            overlap_th,
+            **self._sd_zone_feature_cache_kwargs(),
+        )
 
     def _sd_zone_feature_cache_kwargs(self) -> dict:
         """Phase-2 S/D feature cache: RAM + disk under DATA_CACHE_PATH when fingerprint is set."""
@@ -704,7 +834,9 @@ class Strategy(bt.Strategy):
 
     def _maybe_warn_no_supply_demand_zones(self, exec_df: pd.DataFrame) -> None:
         """Jednou za běh: dost historky na coarse TF, ale get_zones nevrátí žádné D/S (častá příčina 0 obchodů)."""
-        if self._sd_empty_supply_demand_warned or get_zones is None:
+        if self._sd_empty_supply_demand_warned or self._sd_artifact_active():
+            return
+        if get_zones is None:
             return
         tfs = _parse_zone_timeframes(self.params)
         coarse = self._coarsest_tf(tfs)
@@ -728,6 +860,18 @@ class Strategy(bt.Strategy):
             flush=True,
         )
 
+    @staticmethod
+    def _iso_for_zone_meta(v) -> str | None:
+        if v is None:
+            return None
+        if hasattr(v, "isoformat"):
+            try:
+                return v.isoformat()
+            except (TypeError, ValueError):
+                return str(v)
+        s = str(v).strip()
+        return s if s else None
+
     def _sd_zone_trade_meta(
         self,
         zk: str,
@@ -747,6 +891,8 @@ class Strategy(bt.Strategy):
         trap_zone: bool = False,
     ) -> dict:
         ic = int(z.get("inducement_count") or 0)
+        zl_f = float(z["value_low"])
+        zh_f = float(z["value_high"])
         return {
             "zoneKey": zk,
             "zoneName": z.get("name"),
@@ -775,6 +921,10 @@ class Strategy(bt.Strategy):
             "zoneHeight": float(zone_height),
             "zoneSizeBucket": int(size_bucket),
             "trapZone": bool(trap_zone),
+            "zoneValueLow": zl_f,
+            "zoneValueHigh": zh_f,
+            "zoneDateStart": self._iso_for_zone_meta(z.get("date_start")),
+            "zoneDateEnd": self._iso_for_zone_meta(z.get("date_end")),
         }
 
     def _sd_module_params_for_tf(self, zone_tf: str) -> dict:
@@ -836,28 +986,33 @@ class Strategy(bt.Strategy):
         return max(timeframes, key=tf_coarseness)
 
     def decorate_trade_record(self, d: dict, trade) -> dict:
+        meta = None
         if self._trade_meta_queue:
             meta = self._trade_meta_queue.popleft()
+            self._last_zone_meta_for_decorate = None
+        elif self._last_zone_meta_for_decorate is not None:
+            meta = self._last_zone_meta_for_decorate
+            self._last_zone_meta_for_decorate = None
+        if meta is not None:
             out = dict(d)
             out["zoneMeta"] = meta
-            el = meta.get("entryLimit")
-            if el is not None:
-                try:
-                    out["entryPrice"] = float(el)
-                except (TypeError, ValueError):
-                    pass
+            # entryPrice / exitPrice musí zůstat z engine (skutečný fill); limit je jen v zoneMeta.entryLimit
             return out
         return d
 
     def notify_order(self, order):
         if order.status in (order.Canceled, order.Margin, order.Rejected):
-            if order == self._stop_order:
+            if self._same_bt_order(order, self._stop_order):
                 self._stop_order = None
-            if order == getattr(self, "_tp_order", None):
+            if self._same_bt_order(order, getattr(self, "_tp_order", None)):
                 self._tp_order = None
-            self._pending_orders = [(o, zk, e, s, t, il, meta) for o, zk, e, s, t, il, meta in self._pending_orders if o is not order]
+            self._pending_orders = [
+                (o, zk, e, s, t, il, meta)
+                for o, zk, e, s, t, il, meta in self._pending_orders
+                if not self._same_bt_order(o, order)
+            ]
             for zk, st in list(self._zone_track.items()):
-                if st.get("order") is order:
+                if self._same_bt_order(st.get("order"), order):
                     st["order"] = None
                     st["state"] = "watch_departure"
                     st["departed"] = False
@@ -868,7 +1023,7 @@ class Strategy(bt.Strategy):
             return
         if order.status != order.Completed:
             return
-        if order == self._stop_order or order == getattr(self, "_tp_order", None):
+        if self._same_bt_order(order, self._stop_order) or self._same_bt_order(order, getattr(self, "_tp_order", None)):
             self._stop_order = None
             self._tp_order = None
             self._reset_trade()
@@ -877,12 +1032,13 @@ class Strategy(bt.Strategy):
         i = None
         for j, row in enumerate(self._pending_orders):
             o = row[0]
-            if o is order:
+            if self._same_bt_order(o, order):
                 i = j
                 break
         if i is None:
             print(
                 "sd_zone_strategy: notify_order Completed bez párování v _pending_orders — "
+                f"ref={getattr(order, 'ref', None)} ex={getattr(order.executed, 'size', None)} "
                 "ignorováno (žádný heuristický fallback podle ceny).",
                 flush=True,
             )
@@ -897,8 +1053,9 @@ class Strategy(bt.Strategy):
         self._entry_zone_key = zone_key
         self._entry_bar = len(self)
         size = abs(order.executed.size)
-        if meta:
+        if meta is not None:
             self._trade_meta_queue.append(meta)
+            self._last_zone_meta_for_decorate = meta
         if is_long:
             self._tp_order = self.sell(size=size, exectype=bt.Order.Limit, price=target)
             self._stop_order = self.sell(size=size, exectype=bt.Order.Stop, price=stop, oco=self._tp_order)
@@ -909,11 +1066,11 @@ class Strategy(bt.Strategy):
             del self._zone_track[zone_key]
 
     def next(self):
-        if get_zones is None:
+        if get_zones is None and not self._sd_artifact_active():
             if not self._missing_modules_warned:
                 self._missing_modules_warned = True
                 print(
-                    "sd_zone_strategy: Chybí get_zones — přidej a potvrď modul S/D zóny."
+                    "sd_zone_strategy: Chybí get_zones — přidej a potvrď modul S/D zóny, nebo zapni use_sd_artifacts + Build."
                 )
             return
 
@@ -947,16 +1104,7 @@ class Strategy(bt.Strategy):
         if zone_ohlc_coarse.empty or len(zone_ohlc_coarse) < _min_coarse:
             return
 
-        overlap_th = float(self.params.zone_price_overlap_threshold)
-        merged_zones, _flat_sd = _build_merged_sd_zones(
-            exec_df,
-            tfs,
-            get_zones,
-            self._sd_module_params_for_tf,
-            bool(self.params.prefer_higher_tf),
-            overlap_th,
-            **self._sd_zone_feature_cache_kwargs(),
-        )
+        merged_zones, _flat_sd = self._merged_zones_bundle(exec_df, tfs)
 
         trend_scores_by_ett: dict[str, list[float] | None] = {}
         trend_params_by_ett: dict[str, dict] = {}
@@ -1289,7 +1437,7 @@ class Strategy(bt.Strategy):
             return
 
     def _recover_stop_target(self) -> bool:
-        if get_zones is None:
+        if get_zones is None and not self._sd_artifact_active():
             return False
         entry = float(self.position.price)
         is_long = self.position.size > 0
@@ -1299,15 +1447,7 @@ class Strategy(bt.Strategy):
         zone_ohlc = resample_to_zone_tf(exec_df, coarse)
         if zone_ohlc.empty or len(zone_ohlc) < min_zone_ohlc_bars(coarse):
             return False
-        _, flat_sd = _build_merged_sd_zones(
-            exec_df,
-            tfs,
-            get_zones,
-            self._sd_module_params_for_tf,
-            bool(self.params.prefer_higher_tf),
-            float(self.params.zone_price_overlap_threshold),
-            **self._sd_zone_feature_cache_kwargs(),
-        )
+        _, flat_sd = self._merged_zones_bundle(exec_df, tfs)
         if not flat_sd:
             return False
         offpct = self._stop_offset_pct_val()

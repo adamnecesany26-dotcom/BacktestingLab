@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — examples/sd_zones.py — modul (kanonická implementace S/D) — celý soubor vložit do Firestore (Moduly → main.py, např. „S/D Zones“).
 """
 Supply/Demand zóny v-1.0 - modul pro detekci S/D zón na základě BOS.
 
@@ -406,10 +407,21 @@ def _append_major_proximity_chop_zones(
             atr_series,
         )
 
+        bos_kind = "major"
         if zname == "Demand":
-            fill = "rgba(34, 197, 94, 0.35)" if has_touch else "rgba(34, 197, 94, 0.25)"
+            if bos_kind == "major":
+                fill = "rgba(59, 130, 246, 0.40)" if has_touch else "rgba(59, 130, 246, 0.28)"
+            elif bos_kind == "internal":
+                fill = "rgba(134, 239, 172, 0.30)" if has_touch else "rgba(134, 239, 172, 0.20)"
+            else:
+                fill = "rgba(34, 197, 94, 0.38)" if has_touch else "rgba(34, 197, 94, 0.25)"
         else:
-            fill = "rgba(239, 68, 68, 0.35)" if has_touch else "rgba(239, 68, 68, 0.25)"
+            if bos_kind == "major":
+                fill = "rgba(168, 85, 247, 0.40)" if has_touch else "rgba(168, 85, 247, 0.28)"
+            elif bos_kind == "internal":
+                fill = "rgba(252, 165, 165, 0.30)" if has_touch else "rgba(252, 165, 165, 0.20)"
+            else:
+                fill = "rgba(239, 68, 68, 0.38)" if has_touch else "rgba(239, 68, 68, 0.25)"
 
         zd: dict[str, Any] = {
             "date_start": _to_date_str(index[leftmost]),
@@ -429,6 +441,7 @@ def _append_major_proximity_chop_zones(
             "inducement_count": inducement_count,
             "inducement_points": inducement_points,
             "zone_origin": "major_chop",
+            "bos_swing_kind": bos_kind,
         }
         if has_touch and touch_bi is not None and touch_mp is not None:
             zd["touch_bar_index"] = int(touch_bi)
@@ -538,12 +551,21 @@ def _params_for_hl_calls(params: dict | None) -> dict:
 VIEW_PARAMS = {
     "timeframe": "1d",
     "data_timeframe": "",
-    "zone_extend_right_bars": 60,
     "base_bar_range_in_zone_min": 0.40,
     "base_body_in_zone_min": 0.60,
-    "zone_overlap_trim_ratio": 0.6,
     "max_pivot_candle_range_atr": 5.0,
+    "sd_zone_max_base_bars": 11,
     "trend_filter_enabled": 0,
+    "bos_include_internal_pivots": 0,
+    "show_sd_zones_from_major_bos": 1,
+    "show_sd_zones_from_swing_bos": 1,
+    "show_sd_zones_from_internal_bos": 0,
+}
+
+# Internal defaults – not exposed in UI but still respected if passed by strategy/engine.
+_VIEW_PARAMS_INTERNAL = {
+    "zone_extend_right_bars": 60,
+    "zone_overlap_trim_ratio": 0.6,
     "trend_window_bars": 5,
     "trend_window_mode": "minmax",
     "trend_min_score_demand": 25.0,
@@ -571,18 +593,13 @@ VIEW_PARAMS = {
     "zone_touch_departure_cooldown_bars": 6,
     "zone_departure_min_atr": 0.25,
     "zone_near_duplicate_keep_newer_enabled": 1,
-    "zone_near_duplicate_max_pivot_gap": 14,
+    "zone_near_duplicate_max_pivot_gap": 20,
     "zone_near_duplicate_min_overlap_ratio": 0.18,
     "zone_near_duplicate_gap_atr": 0.45,
     "range_major_proximity_zones_enabled": 1,
     "range_major_zone_width_atr": 0.85,
     "range_major_require_chop_trend": 1,
     "range_major_impulse_lookahead_bars": 8,
-    "sd_zone_max_base_bars": 11,
-    "bos_include_internal_pivots": 1,
-    "show_sd_zones_from_major_bos": 1,
-    "show_sd_zones_from_swing_bos": 1,
-    "show_sd_zones_from_internal_bos": 0,
     "internal_bos_min_leg_bars": 5,
     "internal_bos_min_impulse_score": 2,
 }
@@ -1069,7 +1086,7 @@ def _dedupe_near_duplicate_sd_zones_newer_wins(
     if not bool(int(p.get("zone_near_duplicate_keep_newer_enabled", 1))):
         return zones
     try:
-        max_pivot_gap = max(1, int(p.get("zone_near_duplicate_max_pivot_gap", 14)))
+        max_pivot_gap = max(1, int(p.get("zone_near_duplicate_max_pivot_gap", 20)))
     except (TypeError, ValueError):
         max_pivot_gap = 14
     try:
@@ -2154,7 +2171,12 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 ohlc, zone_low, zone_high, pivot_idx, rightmost, "Demand",
                 swings, internals, major_swings, atr_series,
             )
-            fill = "rgba(34, 197, 94, 0.35)" if has_touch else "rgba(34, 197, 94, 0.25)"
+            if bos_kind == "major":
+                fill = "rgba(59, 130, 246, 0.40)" if has_touch else "rgba(59, 130, 246, 0.28)"
+            elif bos_kind == "internal":
+                fill = "rgba(134, 239, 172, 0.30)" if has_touch else "rgba(134, 239, 172, 0.20)"
+            else:
+                fill = "rgba(34, 197, 94, 0.38)" if has_touch else "rgba(34, 197, 94, 0.25)"
             zone_dict: dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
@@ -2170,6 +2192,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
                 "bos_swing_kind": bos_kind,
+                "zone_origin": "bos",
                 "inducements": inducements,
                 "inducement_count": inducement_count,
                 "inducement_points": inducement_points,
@@ -2197,7 +2220,12 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 ohlc, zone_low, zone_high, pivot_idx, rightmost, "Supply",
                 swings, internals, major_swings, atr_series,
             )
-            fill = "rgba(239, 68, 68, 0.35)" if has_touch else "rgba(239, 68, 68, 0.25)"
+            if bos_kind == "major":
+                fill = "rgba(168, 85, 247, 0.40)" if has_touch else "rgba(168, 85, 247, 0.28)"
+            elif bos_kind == "internal":
+                fill = "rgba(252, 165, 165, 0.30)" if has_touch else "rgba(252, 165, 165, 0.20)"
+            else:
+                fill = "rgba(239, 68, 68, 0.38)" if has_touch else "rgba(239, 68, 68, 0.25)"
             zone_dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
@@ -2213,6 +2241,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "has_touch": has_touch,
                 "is_major": ev.get("is_major", False),
                 "bos_swing_kind": bos_kind,
+                "zone_origin": "bos",
                 "inducements": inducements,
                 "inducement_count": inducement_count,
                 "inducement_points": inducement_points,

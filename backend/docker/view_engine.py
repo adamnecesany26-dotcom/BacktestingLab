@@ -17,6 +17,26 @@ from typing import Any
 import pandas as pd
 
 
+def _json_dumps_payload(payload: dict[str, Any]) -> str:
+    """std json neumí numpy skaláry / některé typy z pandas — jinak subprocess spadne při print."""
+    try:
+        import numpy as np
+
+        def default(o: Any) -> Any:
+            if isinstance(o, np.generic):
+                return o.item()
+            if hasattr(o, "isoformat"):
+                try:
+                    return o.isoformat()
+                except Exception:
+                    pass
+            return str(o)
+
+        return json.dumps(payload, ensure_ascii=False, default=default)
+    except Exception:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
 def _to_iso(value) -> str:
     if value is None:
         return ""
@@ -211,6 +231,29 @@ def _resample_ohlc_dataframe(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return out
 
 
+_swing_hl_module_cache: Any = None
+
+
+def _get_swing_hl_module_engine() -> Any:
+    """
+    Stejné chování agregace jako H/L precompute (Swing_HL._resample_ohlc), aby live View = cache.
+    """
+    global _swing_hl_module_cache
+    if _swing_hl_module_cache is not None:
+        return _swing_hl_module_cache
+    root = Path(__file__).resolve().parent.parent.parent
+    path = root / "strategies" / "sd_zone_strategy" / "modules" / "Swing_HL.py"
+    if not path.is_file():
+        raise FileNotFoundError(f"Swing_HL.py not found: {path}")
+    spec = importlib.util.spec_from_file_location("swing_hl_view_engine", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("Unable to load Swing_HL for view_engine")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _swing_hl_module_cache = mod
+    return mod
+
+
 def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -> pd.DataFrame:
     key = _normalize_chart_tf_key(chart_timeframe)
     if key is None:
@@ -223,8 +266,10 @@ def _apply_view_chart_timeframe(df: pd.DataFrame, chart_timeframe: str | None) -
         raise ValueError(
             f"chart_timeframe {key} is finer than native data (~{native_min:.1f} min bars); use native or coarser."
         )
-    rule = _CHART_TF_TO_PANDAS[key]
-    return _resample_ohlc_dataframe(df, rule)
+    sh = _get_swing_hl_module_engine()
+    inferred = sh._infer_data_timeframe(df)
+    ctf = sh._canonical_chart_tf(str(chart_timeframe).strip())
+    return sh._resample_ohlc(df, ctf, inferred, source_tf_effective=inferred)
 
 
 _VIEW_OHLC_CACHE_MAX = max(1, int(float(os.environ.get("VIEW_OHLC_CACHE_MAX", "32") or 32)))
@@ -551,7 +596,7 @@ def main() -> None:
     chart_tf = req.get("chart_timeframe")
     try:
         df = _apply_view_chart_timeframe(df_native, chart_tf if isinstance(chart_tf, str) else None)
-    except ValueError as exc:
+    except Exception as exc:
         print(json.dumps({"error": str(exc)}), file=sys.stderr)
         sys.exit(1)
     params = dict(req.get("params") if isinstance(req.get("params"), dict) else {})
@@ -574,7 +619,7 @@ def main() -> None:
         "close": _series_as_float(df, "close", "Close"),
     })
     payload = {"ohlc": ohlc_df.to_dict(orient="records"), "markers": markers, "lines": lines, "zones": zones}
-    print(json.dumps(payload))
+    print(_json_dumps_payload(payload))
 
 
 if __name__ == "__main__":

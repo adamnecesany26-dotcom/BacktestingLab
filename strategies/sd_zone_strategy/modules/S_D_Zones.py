@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — strategies/sd_zone_strategy/modules/S_D_Zones.py — modul (shim) — vložit do Firestore nebo použít examples/sd_zones.py jako plnou kopii do Modulů → main.py.
 """
 S/D zones module — re-exports canonical implementation from examples.sd_zones.
 

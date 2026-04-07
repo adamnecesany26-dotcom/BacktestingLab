@@ -34,6 +34,8 @@ export const SD_ZONE_META_FIELDS: { key: string; description: string }[] = [
 
 /** Užitečná pole obchodu z engine (RunResponse.trades) pro vlastní metriky. */
 export const TRADE_FIELDS_FOR_ANALYTICS: { key: string; description: string }[] = [
+  { key: "initialRiskUsd", description: "Počáteční riziko v měně účtu (volitelně z engine)." },
+  { key: "tradeR", description: "PnL v násobcích počátečního rizika (volitelně z engine)." },
   { key: "pnl", description: "Realizovaný PnL obchodu v měně účtu." },
   { key: "type", description: "buy | sell (směr vstupu)." },
   { key: "entryPrice", description: "Vstupní cena." },

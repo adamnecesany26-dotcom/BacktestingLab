@@ -3,10 +3,16 @@ GET /data - returns available instruments and date ranges.
 Includes broker config (tick, mult, margin) per instrument for futures.
 """
 
-from fastapi import APIRouter
-from pathlib import Path
+from __future__ import annotations
+
 import json
+import logging
+from pathlib import Path
+
 import pandas as pd
+from fastapi import APIRouter, HTTPException
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter()
 _DATA_CACHE: dict[str, object] = {"signature": None, "payload": None}
@@ -181,13 +187,18 @@ def _build_data_signature(data_dir: Path) -> tuple:
     files: list[Path] = []
     mock_dir = data_dir / "mock"
     futures_30m_dir = data_dir / "futures_30m"
-    if mock_dir.exists():
+    if mock_dir.is_dir():
         files.extend(mock_dir.rglob("*.csv"))
-    if futures_30m_dir.exists():
+    if futures_30m_dir.is_dir():
         files.extend(futures_30m_dir.glob("*.txt"))
         files.extend(futures_30m_dir.glob("*.parquet"))
-    files = sorted(files)
-    return tuple((str(f.relative_to(data_dir)), int(f.stat().st_mtime_ns)) for f in files)
+    out: list[tuple[str, int]] = []
+    for f in sorted(files):
+        try:
+            out.append((str(f.relative_to(data_dir)), int(f.stat().st_mtime_ns)))
+        except OSError:
+            continue
+    return tuple(out)
 
 
 @router.get("/data/debug")
@@ -217,6 +228,19 @@ async def get_available_data():
     instrumentType from folder: mock/*.csv → futures, mock/futures/ → futures, mock/stocks/ → stocks, mock/forex/ → forex.
     brokerConfig: { tick_size, tick_value, mult, margin, commission_per_contract } for futures.
     """
+    try:
+        return _get_available_data_impl()
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log.exception("GET /api/data scan failed: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Scan dat selhal: {type(e).__name__}: {e}",
+        ) from e
+
+
+def _get_available_data_impl() -> dict:
     data_dir = _get_data_dir()
     broker_config = _load_broker_config()
     results = []
@@ -224,7 +248,9 @@ async def get_available_data():
 
     mock_dir = data_dir / "mock"
     futures_30m_dir = data_dir / "futures_30m"
-    if not mock_dir.exists() and not futures_30m_dir.exists():
+    mock_ok = mock_dir.is_dir()
+    fut_ok = futures_30m_dir.is_dir()
+    if not mock_ok and not fut_ok:
         return {"instruments": results}
     signature = _build_data_signature(data_dir)
     if _DATA_CACHE.get("signature") == signature and _DATA_CACHE.get("payload") is not None:
@@ -233,7 +259,7 @@ async def get_available_data():
     # Scan subfolders by type: mock/futures/, mock/stocks/, mock/forex/
     for subdir, inst_type in [("futures", "futures"), ("stocks", "stocks"), ("forex", "forex")]:
         sub_path = mock_dir / subdir
-        if sub_path.exists():
+        if mock_ok and sub_path.is_dir():
             for f in sub_path.glob("*.csv"):
                 key = f"{subdir}/{f.name}"
                 if key in seen_files:
@@ -244,15 +270,16 @@ async def get_available_data():
                     results.append(item)
 
     # Root mock/*.csv → futures (backward compatibility)
-    for f in mock_dir.glob("*.csv"):
-        if f.name in seen_files:
-            continue
-        item = _process_market_file_to_instrument(f, "mock/", "futures", "1d", broker_config)
-        if item:
-            seen_files.add(f.name)
-            results.append(item)
+    if mock_ok:
+        for f in mock_dir.glob("*.csv"):
+            if f.name in seen_files:
+                continue
+            item = _process_market_file_to_instrument(f, "mock/", "futures", "1d", broker_config)
+            if item:
+                seen_files.add(f.name)
+                results.append(item)
 
-    if futures_30m_dir.exists():
+    if fut_ok:
         for f in futures_30m_dir.glob("*.txt"):
             key = f"futures_30m/{f.name}"
             if key in seen_files:

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Awaitable, Callable, Union
 
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
+from app.services import artifact_store
 from app.services.data_ohlc import (
     fingerprint_dataset_file,
     polars_scan_ohlc_schema,
@@ -75,6 +76,25 @@ def _resolve_disconnect_grace_seconds() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return RUN_DISCONNECT_GRACE_SEC
+
+
+def _resolve_sse_heartbeat_interval_seconds() -> float:
+    """
+    Send duplicate SSE progress chunks at this interval while the engine runs but emits
+    no events (e.g. one backtrader bar takes minutes). Avoids proxy/browser idle timeouts
+    (~5 min) that surface as "network error" / Failed to fetch on the client.
+    Set RUN_SSE_HEARTBEAT_SEC=0 to disable.
+    """
+    raw = os.environ.get("RUN_SSE_HEARTBEAT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return 25.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 25.0
+    if v <= 0:
+        return 0.0
+    return min(v, 120.0)
 
 
 def _backtest_engine_script() -> Path:
@@ -834,9 +854,10 @@ async def run_strategy_streaming(
         env["PIP_VALUE"] = str(pip_value if pip_value is not None else "")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["RUN_ID"] = str(resolved_run_id)
-        env["STRATEGY_PARAMS"] = json.dumps(
-            _merge_strategy_params(filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value)
+        merged_strategy_params = _merge_strategy_params(
+            filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value
         )
+        env["STRATEGY_PARAMS"] = json.dumps(merged_strategy_params)
         env["APPLIED_MODULES"] = json.dumps(applied_modules_payload)
         env["ANALYSIS_CONFIG"] = json.dumps(analysis_payload)
         env["EXECUTION_MODEL_JSON"] = json.dumps(execution_model or {})
@@ -854,6 +875,38 @@ async def run_strategy_streaming(
         if host_ds_fp:
             print(f"[runner] host_dataset_fingerprint={host_ds_fp} data_file={data_file}", flush=True)
         env["HOST_DATASET_FINGERPRINT"] = host_ds_fp or ""
+
+        try:
+            use_sd_art = bool(int(merged_strategy_params.get("use_sd_artifacts", 0)))
+        except (TypeError, ValueError):
+            use_sd_art = False
+        if use_sd_art:
+            # Jednotný klíč s UI Build / View: artefakty jsou vždy pro celý soubor (years v ID nefigurují).
+            did = artifact_store.compute_dataset_id(
+                str(data_file or ""),
+                str(host_ds_fp or ""),
+                years=None,
+                start_iso=None,
+                end_iso=None,
+            )
+            zpath = artifact_store.artifacts_root(Path(_project_root)) / did / "sd" / "v1" / "zones.parquet"
+            if not zpath.is_file():
+                yield {
+                    "type": "error",
+                    "message": (
+                        "S/D artefakt pro tento backtest chybí — spusť Build features pro stejný data_file (precompute na celý soubor), "
+                        "nebo nastav use_sd_artifacts na 0. Očekávaná cesta: "
+                        + str(zpath.resolve())
+                    ),
+                }
+                return
+            env["USE_SD_ARTIFACTS"] = "1"
+            env["SD_ARTIFACT_ZONES_PATH"] = str(zpath.resolve())
+        else:
+            # Fáze 8 / 8.3: legacy get_zones — nesmí zůstat host/env hodnoty z jiného runu nebo shellu.
+            env["USE_SD_ARTIFACTS"] = "0"
+            env.pop("SD_ARTIFACT_ZONES_PATH", None)
+
         t_before_popen = time.perf_counter()
         runner_host_prepare_ms = int((t_before_popen - prep_started) * 1000)
 
@@ -891,26 +944,46 @@ async def run_strategy_streaming(
             engine_task = asyncio.create_task(
                 asyncio.to_thread(run_engine_in_process, env_str, _inprocess_progress_cb)
             )
-            yield {"type": "progress", "value": 5}
+            hb = _resolve_sse_heartbeat_interval_seconds()
+            last_pct = 5
+            yield {"type": "progress", "value": last_pct}
             try:
                 while not engine_task.done():
                     get_task = asyncio.create_task(progress_queue.get())
-                    done, _pending = await asyncio.wait(
-                        {engine_task, get_task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if get_task in done:
-                        try:
-                            pct = get_task.result()
-                            yield {"type": "progress", "value": int(pct)}
-                        except Exception:
-                            pass
+                    wait_set = {engine_task, get_task}
+                    if hb > 0:
+                        done, _pending = await asyncio.wait(
+                            wait_set,
+                            timeout=hb,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
                     else:
+                        done, _pending = await asyncio.wait(
+                            wait_set,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    if engine_task in done:
                         get_task.cancel()
                         try:
                             await get_task
-                        except asyncio.CancelledError:
+                        except (asyncio.CancelledError, Exception):
                             pass
+                        break
+                    if get_task in done:
+                        try:
+                            pct = get_task.result()
+                            last_pct = int(pct)
+                            yield {"type": "progress", "value": last_pct}
+                        except Exception:
+                            pass
+                        continue
+                    get_task.cancel()
+                    try:
+                        await get_task
+                    except asyncio.CancelledError:
+                        pass
+                    if hb > 0:
+                        yield {"type": "progress", "value": last_pct}
                 while True:
                     try:
                         pct = progress_queue.get_nowait()
@@ -978,7 +1051,11 @@ async def run_strategy_streaming(
         stderr_buffer: list[str] = []
         loop = asyncio.get_event_loop()
         _read_stream_sync(proc, queue, loop, stdout_buffer, stderr_buffer)
-        yield {"type": "progress", "value": 5}
+        hb = _resolve_sse_heartbeat_interval_seconds()
+        last_progress_pct = 5
+        last_sse_yield_at = time.perf_counter()
+        yield {"type": "progress", "value": last_progress_pct}
+        last_sse_yield_at = time.perf_counter()
         wall_timeout = _resolve_run_timeout_seconds(run_timeout_sec)
         idle_timeout = _resolve_stream_idle_timeout_seconds(stream_idle_timeout_sec)
 
@@ -1033,6 +1110,13 @@ async def run_strategy_streaming(
                     stream_stall_message = f"Run stream stalled for {idle_timeout} seconds."
                     proc.kill()
                     break
+                if (
+                    hb > 0
+                    and proc.poll() is None
+                    and (now - last_sse_yield_at) >= hb
+                ):
+                    yield {"type": "progress", "value": last_progress_pct}
+                    last_sse_yield_at = now
                 continue
             last_queue_event_at = time.perf_counter()
             if ev.get("type") == "done":
@@ -1074,6 +1158,12 @@ async def run_strategy_streaming(
                 debug_path.write_text(err_content, encoding="utf-8")
                 print(f"[runner] Strategy saved to {debug_path} for debug", flush=True)
             yield ev
+            last_sse_yield_at = time.perf_counter()
+            if ev.get("type") == "progress":
+                try:
+                    last_progress_pct = int(ev.get("value", last_progress_pct))
+                except (TypeError, ValueError):
+                    pass
             if ev.get("type") in ("result", "error"):
                 proc.kill()
                 break

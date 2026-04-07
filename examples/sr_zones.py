@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — examples/sr_zones.py — modul (S/R zóny) — celý soubor vložit do Firestore (Moduly → main.py).
 """
 Support/Resistance zóny v-1.2 – pouze major Swing HL.
 

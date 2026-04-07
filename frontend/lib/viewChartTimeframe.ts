@@ -110,3 +110,21 @@ export function buildViewChartTimeframeOptions(nativeTf: string | undefined | nu
   }
   return out;
 }
+
+/**
+ * View toolbar: od hrubších svíček k jemnějším (1M měsíc → … → původní rozlišení souboru).
+ * Nelze agregovat jemněji než nativní data — nejmenší krok je vždy „Původní“.
+ */
+export function buildViewChartTimeframeOptionsCoarseFirst(
+  nativeTf: string | undefined | null
+): { value: string; label: string }[] {
+  const nativeMin = instrumentTimeframeToMinutes(nativeTf);
+  const nativeLabel = (nativeTf ?? "data").trim() || "data";
+  /** Jen hrubší než nativní — nejmenší krok je vždy „Původní“, bez duplicitního 30m. */
+  const coarseFirst = VIEW_CHART_TF_LADDER.filter((r) => r.minutes > nativeMin).sort(
+    (a, b) => b.minutes - a.minutes
+  );
+  const out = coarseFirst.map((r) => ({ value: r.id, label: r.label }));
+  out.push({ value: "native", label: `Původní (${nativeLabel})` });
+  return out;
+}

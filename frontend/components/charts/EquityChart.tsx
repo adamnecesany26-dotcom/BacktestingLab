@@ -65,12 +65,23 @@ export function EquityChart({
   dates,
   equityCurve,
   maxPoints,
+  yAxisTitle = "Equity",
+  seriesHoverLabel = "Equity",
+  lineColor = "#10b981",
+  fillRgba = "rgba(16, 185, 129, 0.35)",
+  footerHint,
 }: {
   equity?: number[];
   height?: number;
   dates?: string[];
   equityCurve?: { date: string; value: number }[];
   maxPoints?: number;
+  yAxisTitle?: string;
+  seriesHoverLabel?: string;
+  lineColor?: string;
+  fillRgba?: string;
+  /** null = skrýt spodní nápovědu; undefined = výchozí text o ose Y */
+  footerHint?: string | null;
 }) {
   const pointCap = maxPoints ?? Number.POSITIVE_INFINITY;
   const [Plot, setPlot] = useState<ComponentType<any> | null>(null);
@@ -143,7 +154,7 @@ export function EquityChart({
         automargin: true,
       },
       yaxis: {
-        title: { text: "Equity", font: { size: 11, color: "#71717a" } },
+        title: { text: yAxisTitle, font: { size: 11, color: "#71717a" } },
         gridcolor: "#27272a",
         tickformat: ",.2f",
         fixedrange: false,
@@ -191,11 +202,13 @@ export function EquityChart({
   return (
     <div className="w-full h-full flex flex-col min-h-0 gap-2">
       <div className="shrink-0">
-        {downsampleNote ? (
+        {footerHint === null ? null : footerHint != null && footerHint !== "" ? (
+          <p className="text-xs text-zinc-500">{footerHint}</p>
+        ) : downsampleNote ? (
           <p className="text-xs text-zinc-500">{downsampleNote}</p>
         ) : (
           <p className="text-xs text-zinc-500">
-            Zobrazeno všech {rawCount} bodů. Osa Y je zúžena kolem min/max equity, ne od nuly.
+            Zobrazeno všech {rawCount} bodů. Osa Y je zúžena kolem min/max série, ne od nuly.
           </p>
         )}
       </div>

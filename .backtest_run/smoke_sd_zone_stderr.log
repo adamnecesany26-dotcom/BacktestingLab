@@ -1,0 +1,35 @@
+[engine] Booting � loading backtrader / pandas (first container start may be slow)...
+[engine] Libraries loaded.
+[engine] strategy_dir=C:\Users\adamn\Desktop\Backtesting_app\strategies\sd_zone_strategy sys.path[0]=C:\Users\adamn\Desktop\Backtesting_app\strategies\sd_zone_strategy modules_exists=True
+[engine] modules/readme.py
+[engine] modules/Swing_HL.py
+[engine] modules/S_D_Zones.py
+[engine] modules/__init__.py
+[engine] modules/__pycache__
+[engine] Loading strategy...
+[engine] Loading data...
+[engine] Running backtest (2891 bars)...
+PROGRESS:5
+PROGRESS:0
+PROGRESS:5
+PROGRESS:10
+PROGRESS:15
+PROGRESS:20
+PROGRESS:25
+PROGRESS:30
+PROGRESS:35
+PROGRESS:40
+PROGRESS:45
+PROGRESS:50
+PROGRESS:55
+PROGRESS:60
+PROGRESS:65
+PROGRESS:70
+PROGRESS:75
+PROGRESS:80
+PROGRESS:85
+PROGRESS:90
+PROGRESS:95
+PROGRESS:100
+C:\Users\adamn\Desktop\Backtesting_app\backend\docker\engine.py:3907: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  "generatedAt": dt.datetime.utcnow().isoformat() + "Z",

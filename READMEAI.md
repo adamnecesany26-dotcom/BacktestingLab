@@ -10,6 +10,7 @@
 | `README.md` | Full technical + API + project structure. |
 | `READMEAI.md` | This file — AI/dev contracts and change locations. |
 | `SCRIPTS.md` | Run commands (uvicorn, npm, pytest). |
+| `docs/BACKTEST_PIPELINE_REFACTOR.md` | Artifact pipeline: `.backtest_artifacts/`, precompute, View `use_artifacts`, `use_sd_artifacts`, Appendix C = implementation audit. |
 | `audit/` | **Code audit / review outputs** — when performing any audit or systematic code review, **write and save artifacts here** (see `audit/README.md`). Do not confuse with **`.audit/`** (append-only `events.jsonl`). |
 
 When adding UX, update **READMEADAM.md**, **`frontend/data/guideContent.ts`**, and **`frontend/components/backtestFieldMeta.ts`** together; bump **README.md** sections if behavior/API changes.
@@ -35,7 +36,7 @@ When adding UX, update **READMEADAM.md**, **`frontend/data/guideContent.ts`**, a
 
 - **Backtesting platform** – users write Python strategies (Backtrader), run backtests via a **host Python subprocess** or optional **in-process** call into the same `engine.py` logic (`RUN_INPROCESS_ENGINE=1`, see `engine_inprocess.py`). View results (equity, trades, metrics, module outputs). **Trusted single-user** local use; no container sandbox.
 - **Strategies, Indicators, Modules** – stored in Firebase Firestore. Strategies can import indicators and modules.
-- **View mode** – preview module/indicator output (markers, lines, zones) on a chart without running backtest.
+- **View mode** – preview structure on OHLC: either **live** `view_engine.py` (`detect`/`get_line`/`get_zones`) or **`use_artifacts`** reading Parquet from `.backtest_artifacts/` (no server-side module recompute). **Build features** fills cache via `POST /api/artifacts/build`.
 - **Run history** – each successful Run is auto-saved to Firestore under the strategy.
 - **Governance layer** – experiment lifecycle (`draft/review/approved/promoted`), reviewer sign-off, compare workspace.
 
@@ -48,7 +49,10 @@ When adding UX, update **READMEADAM.md**, **`frontend/data/guideContent.ts`**, a
 | Backend run endpoint | `backend/app/api/run.py` |
 | Engine orchestration (subprocess + optional in-process) | `backend/app/services/runner.py`, `backend/app/services/engine_inprocess.py` |
 | Strategy execution | `backend/docker/engine.py` (`execute_backtest_from_environ`, CLI `main`) |
-| View (markers/lines from module) | `backend/app/api/view.py`, `frontend/components/StrategyViewChart.tsx` |
+| View (live or artifacts) | `backend/app/api/view.py`, `backend/app/services/view_artifacts.py`, `frontend/components/StrategyViewChart.tsx` |
+| Artifact store / precompute | `backend/app/services/artifact_store.py`, `hl_precompute.py`, `sd_precompute.py`, `hl_artifact_spec.py`, `sd_artifact_spec.py` |
+| Build + status API | `backend/app/api/artifacts.py`, `artifact_api_service.py` |
+| SD zones from Parquet in backtest | `runner.py` (env), `strategies/sd_zone_strategy/main.py`, `sd_zone_merge.py` |
 | Firestore CRUD | `frontend/lib/firestore.ts` |
 | Shared types | `shared/types/index.ts` |
 
@@ -133,7 +137,8 @@ Backtesting_app/
 │   │   ├── FieldHelpPopover.tsx
 │   │   └── ...
 │   └── lib/
-│       ├── api.ts                # runBacktestStreaming, getViewData, getAvailableData
+│       ├── api.ts                # runBacktestStreaming, getViewData, getArtifactStatus, buildArtifacts, getAvailableData
+│       ├── tradeMetrics.ts, viewArtifactAdapter.ts  # Results R-multiple; View response → ModuleOutput
 │       ├── firestore.ts          # CRUD + soft-delete + run governance update
 │       ├── firebase.ts
 │       ├── strategyParams.ts     # parseStrategyParams, parseViewParams
@@ -196,11 +201,20 @@ Backtesting_app/
 
 **Flow: View mode**
 1. User toggles View → `setViewMode(true)`
-2. `StrategyViewChart` receives `initialItemId`, `initialItemType` (module/indicator/strategy)
-3. Fetches code via `getFileContent(type, id, "main.py")`
-4. `getViewData(dataFile, years, code, params)` → POST /api/view
-5. Backend: loads OHLC, execs module code, calls `detect`/`get_line`/`get_zones`, returns markers/lines/zones
+2. `StrategyViewChart` loads OHLC + layers: either **artifacts** (`getViewData(..., options: { useArtifacts: true })`) or **live** module (`module_code` from Firestore + `getViewData`).
+3. **Artifacts path:** `view.py` → `view_artifacts.py` reads `.backtest_artifacts/{dataset_id}/` Parquet; no `view_engine` module execution.
+4. **Live path:** `view_engine.py` subprocess runs `detect` / `get_line` / `get_zones` on resampled OHLC.
+5. Optional: `getArtifactStatus` / `buildArtifacts` for UI cache row.
 6. Chart renders OHLC + markers + lines + zones
+
+**Flow: Artifact build (UI)**
+1. User clicks **Build features** in View (or equivalent) → `buildArtifacts(dataFile, { years, zone_timeframes?, ... })`
+2. Backend runs H/L then S/D precompute under project `.backtest_artifacts/` (locks per dataset).
+
+**Flow: Backtest with `use_sd_artifacts`**
+1. Strategy `PARAMS` includes `use_sd_artifacts: 1` → `runner.py` resolves `dataset_id`, requires `sd/v1/zones.parquet`, sets `USE_SD_ARTIFACTS` + `SD_ARTIFACT_ZONES_PATH` on engine env.
+2. `sd_zone_strategy` `start()` loads Parquet; `_merged_zones_bundle` uses `_merge_zones_from_artifact` instead of live `get_zones`.
+3. `use_sd_artifacts: 0` → runner forces `USE_SD_ARTIFACTS=0` and drops `SD_ARTIFACT_ZONES_PATH` (no leaking host env into legacy runs).
 
 **Flow: Module outputs in Results**
 1. Run request includes `applied_modules: [{ id, name, params }]`

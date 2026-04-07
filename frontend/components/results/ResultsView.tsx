@@ -25,7 +25,13 @@ import {
   type DetailedViewMode,
 } from "@/lib/detailedTradesWindow";
 import { getChartTfSelectOptions, resampleOhlcForChartChoice } from "@/lib/chartOhlcResample";
+import { getViewData } from "@/lib/api";
+import { viewDataResponseToModuleOutput } from "@/lib/viewArtifactAdapter";
+import { effectiveViewDataTimeframe } from "@/lib/viewChartTimeframe";
+import { buildCumulativeREquityCurve, summarizeTradeRMultiples } from "@/lib/tradeMetrics";
 import type { SavedBacktestRun } from "@/lib/firestore";
+import { FieldHelpPopover } from "@/components/FieldHelpPopover";
+import { backtestFieldHelp } from "@/components/backtestFieldMeta";
 
 type TabId = "equity" | "highlight" | "detailed" | "analytics" | "runHistory";
 
@@ -70,6 +76,11 @@ export function ResultsView({
   const [tradesPerView, setTradesPerView] = useState(15);
   const [monthsPerView, setMonthsPerView] = useState(3);
   const [chartTf, setChartTf] = useState<string>("source");
+  const [useArtifactLayersDetailed, setUseArtifactLayersDetailed] = useState(false);
+  const [artifactDetailedOut, setArtifactDetailedOut] = useState<ModuleOutput | null>(null);
+  const [artifactDetailedLoading, setArtifactDetailedLoading] = useState(false);
+  const [artifactDetailedError, setArtifactDetailedError] = useState<string | null>(null);
+  const [artifactDetailedBanner, setArtifactDetailedBanner] = useState<string | null>(null);
   /** Index do `batchRuns` pro Equity / Detailed / Highlight / analytiku obchodů; poslední run = výchozí */
   const [batchViewIdx, setBatchViewIdx] = useState(0);
   const [runNote, setRunNote] = useState("");
@@ -161,6 +172,74 @@ export function ResultsView({
     if (!detailedWindow?.windowOhlc.length) return mergedOutput;
     return filterModuleOutputToOhlcWindow(mergedOutput, detailedWindow.windowOhlc);
   }, [mergedOutput, detailedWindow]);
+
+  const detailedChartOutputEffective = useMemo(() => {
+    if (useArtifactLayersDetailed && artifactDetailedOut) return artifactDetailedOut;
+    return detailedChartOutput;
+  }, [useArtifactLayersDetailed, artifactDetailedOut, detailedChartOutput]);
+
+  const rEquityCurve = useMemo(() => buildCumulativeREquityCurve(viewResults?.trades ?? []), [viewResults?.trades]);
+
+  const rSummary = useMemo(() => summarizeTradeRMultiples(viewResults?.trades ?? []), [viewResults?.trades]);
+
+  const manifestForView = viewResults?.manifest && typeof viewResults.manifest === "object"
+    ? (viewResults.manifest as Record<string, unknown>)
+    : null;
+
+  useEffect(() => {
+    if (!useArtifactLayersDetailed || activeTab !== "detailed") {
+      setArtifactDetailedOut(null);
+      setArtifactDetailedError(null);
+      setArtifactDetailedBanner(null);
+      setArtifactDetailedLoading(false);
+      return;
+    }
+    const dataFile = String(manifestForView?.dataFile ?? "").trim();
+    const wo = detailedWindow?.windowOhlc;
+    if (!dataFile || !wo?.length) {
+      setArtifactDetailedOut(null);
+      setArtifactDetailedError(!dataFile ? "V manifestu chybí dataFile — nelze načíst artefakty." : null);
+      setArtifactDetailedLoading(false);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setArtifactDetailedLoading(true);
+      setArtifactDetailedError(null);
+      setArtifactDetailedBanner(null);
+      try {
+        const years = Math.max(0, Math.floor(Number(manifestForView?.years ?? 0)));
+        const nativeTf = String(manifestForView?.timeframe ?? "");
+        const chartParam = chartTf === "source" ? "native" : chartTf;
+        const chartTimeframeApi =
+          chartTf === "source" ? null : effectiveViewDataTimeframe(chartParam, nativeTf);
+        const win = { startIso: wo[0]!.date, endIso: wo[wo.length - 1]!.date };
+        const res = await getViewData(dataFile, years, null, null, null, chartTimeframeApi, win, {
+          useArtifacts: true,
+          artifactIncludeSd: true,
+        });
+        if (cancelled) return;
+        const mod = viewDataResponseToModuleOutput(res);
+        setArtifactDetailedOut(filterModuleOutputToOhlcWindow(mod, wo));
+        setArtifactDetailedBanner(res.artifact_banner ?? null);
+      } catch (e) {
+        if (cancelled) return;
+        setArtifactDetailedOut(null);
+        setArtifactDetailedError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setArtifactDetailedLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    useArtifactLayersDetailed,
+    activeTab,
+    manifestForView,
+    chartTf,
+    detailedWindow,
+  ]);
 
   const handleReproBundle = useCallback(async () => {
     if (!results) return;
@@ -568,24 +647,58 @@ export function ResultsView({
         }`}
       >
         {activeTab === "equity" && (
-          <div className="space-y-2 py-2">
-            <EquityChart
-              equityCurve={viewResults.equityCurve}
-              equity={viewResults.equityCurve ? undefined : viewResults.equity}
-              height={340}
-              dates={
-                !viewResults.equityCurve?.length && viewResults.ohlc?.length
-                  ? (() => {
-                      const first = viewResults.ohlc![0]?.date;
-                      if (!first) return undefined;
-                      const d = new Date(first);
-                      d.setDate(d.getDate() - 1);
-                      const dayBefore = d.toISOString();
-                      return [dayBefore, ...viewResults.ohlc!.map((o) => o.date)];
-                    })()
-                  : undefined
-              }
-            />
+          <div className="space-y-4 py-2">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 px-1 mb-1 inline-flex items-center gap-1">
+                Equity — účet
+                <FieldHelpPopover help={backtestFieldHelp.resultsEquityUsd} />
+              </div>
+              <EquityChart
+                equityCurve={viewResults.equityCurve}
+                equity={viewResults.equityCurve ? undefined : viewResults.equity}
+                height={320}
+                dates={
+                  !viewResults.equityCurve?.length && viewResults.ohlc?.length
+                    ? (() => {
+                        const first = viewResults.ohlc![0]?.date;
+                        if (!first) return undefined;
+                        const d = new Date(first);
+                        d.setDate(d.getDate() - 1);
+                        const dayBefore = d.toISOString();
+                        return [dayBefore, ...viewResults.ohlc!.map((o) => o.date)];
+                      })()
+                    : undefined
+                }
+              />
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 px-1 mb-1 inline-flex items-center gap-1">
+                Kumulativní R (uzavřené obchody)
+                <FieldHelpPopover help={backtestFieldHelp.resultsEquityR} />
+              </div>
+              {rEquityCurve.length >= 1 ? (
+                <EquityChart
+                  equityCurve={rEquityCurve}
+                  height={280}
+                  yAxisTitle="Součet R"
+                  seriesHoverLabel="Kumulativní R"
+                  lineColor="#f59e0b"
+                  fillRgba="rgba(245, 158, 11, 0.28)"
+                  footerHint={
+                    rSummary != null
+                      ? `Obchodů s odhadnutým R: ${rSummary.count} z ${viewResults.trades?.length ?? 0} (ze zoneMeta: stop, vstup, velikost).`
+                      : null
+                  }
+                />
+              ) : (
+                <div className="h-[200px] rounded-lg bg-zinc-900 flex flex-col items-center justify-center text-zinc-500 text-sm px-4 text-center gap-1">
+                  <span>Křivka R není k dispozici.</span>
+                  <span className="text-xs text-zinc-600">
+                    Potřeba jsou uzavřené obchody s PnL a v zoneMeta platný stopPrice od strategie.
+                  </span>
+                </div>
+              )}
+            </div>
             {(() => {
               const eq = viewResults.equityCurve ?? (viewResults.equity ?? []).map((v, i) => ({ date: String(i), value: v }));
               if (!eq || eq.length < 2) return null;
@@ -653,7 +766,7 @@ export function ResultsView({
                     value={chartTf}
                     onChange={(e) => setChartTf(e.target.value)}
                     className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200"
-                    title="Agregace svíček z dat runu (hrubší TF = méně barů). Zóny z modulu zůstávají; touch markery jen u zdrojového TF."
+                    title="Agregace svíček z dat runu. Pro přesnou osu použij „Zdroj“. Žlutě obrys = zóna z zoneMeta u daného obchodu; ostatní obdélníky = všechny zóny z modulu v okně."
                   >
                     {chartTfOptions.map((o) => (
                       <option key={o.value} value={o.value}>
@@ -705,11 +818,37 @@ export function ResultsView({
                     </button>
                   </div>
                 </div>
+                <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={useArtifactLayersDetailed}
+                    onChange={(e) => setUseArtifactLayersDetailed(e.target.checked)}
+                    className="rounded border-zinc-600 bg-zinc-800"
+                  />
+                  <span className="inline-flex items-center gap-1 flex-wrap">
+                    <span>
+                      Vrstvy z cache (stejný formát jako View /{" "}
+                      <code className="text-zinc-500">.backtest_artifacts</code>)
+                    </span>
+                    <span className="inline-flex" onMouseDown={(e) => e.preventDefault()}>
+                      <FieldHelpPopover help={backtestFieldHelp.resultsDetailedArtifactLayers} />
+                    </span>
+                  </span>
+                </label>
+                {artifactDetailedLoading ? (
+                  <p className="text-xs text-amber-200/90">Načítám artefakty pro výřez…</p>
+                ) : null}
+                {artifactDetailedError ? (
+                  <p className="text-xs text-rose-400">{artifactDetailedError}</p>
+                ) : null}
+                {useArtifactLayersDetailed && artifactDetailedBanner ? (
+                  <p className="text-xs text-zinc-500">{artifactDetailedBanner}</p>
+                ) : null}
                 <p className="text-xs text-zinc-500">{detailedWindow.summary}</p>
                 <ModuleOutputChart
                   ohlc={chartOhlc.length ? chartOhlc : detailedWindow.windowOhlc}
                   moduleName="Detailed"
-                  output={detailedChartOutput}
+                  output={detailedChartOutputEffective}
                   trades={detailedWindow.visibleTrades}
                   height={520}
                   orderLevelsMode

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — strategies/rsi_gbp/main.py — strategie — celý soubor vložit do Firestore (Strategie → main.py).
 """
 Breakout swing strategie (trend + komprese + kvalita svíčky).
 

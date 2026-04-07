@@ -87,35 +87,37 @@ def _ohlc_4h_simple(n: int = 80) -> pd.DataFrame:
     )
 
 
-def test_major_sources_4h_includes_1w_and_1d(sh):
+def test_major_sources_4h_includes_m_w_d(sh):
     ohlc = _ohlc_4h_simple()
-    assert sh._major_tf_sources_for_chart("4h", ohlc) == ("1w", "1d")
+    assert sh._major_tf_sources_for_chart("4h", ohlc) == ("1M", "1w", "1d")
 
 
-def test_major_sources_30m_includes_1w_and_1d(sh):
+def test_major_sources_30m_includes_m_w_d(sh):
     idx = pd.date_range("2020-01-01", periods=200, freq="30min", tz="UTC")
     ohlc = pd.DataFrame(
         {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
         index=idx,
     )
-    assert sh._major_tf_sources_for_chart("30m", ohlc) == ("1w", "1d")
+    assert sh._major_tf_sources_for_chart("30m", ohlc) == ("1M", "1w", "1d")
 
 
-def test_major_sources_1d_only_weekly(sh):
+def test_major_sources_1d_month_and_week(sh):
     idx = pd.date_range("2020-01-01", periods=80, freq="1D", tz="UTC")
     ohlc = pd.DataFrame(
         {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.002},
         index=idx,
     )
-    assert sh._major_tf_sources_for_chart("1d", ohlc) == ("1w",)
+    assert sh._major_tf_sources_for_chart("1d", ohlc) == ("1M", "1w")
 
 
-def test_major_sources_4h_data_even_if_hierarchy_string_1d(sh):
-    """Stejné jako ve View: timeframe v params často „1d“, ale OHLC je 4h → i tak 1W+1D."""
+def test_major_sources_after_hierarchy_4h_ohlc_not_stale_1d(sh):
+    """Po _chart_tf_for_hierarchy: reálné 4h svíčky → chart 4h, majory z 1M+1w+1d."""
     ohlc = _ohlc_4h_simple(100)
-    assert sh._major_tf_sources_for_chart("1d", ohlc) == ("1w", "1d")
-    tf_r, src = sh._major_sources_and_resample_tf("1d", ohlc)
-    assert src == ("1w", "1d")
+    chart_tf = sh._chart_tf_for_hierarchy(ohlc, "1d", "", None)
+    assert chart_tf == "4h"
+    assert sh._major_tf_sources_for_chart(chart_tf, ohlc) == ("1M", "1w", "1d")
+    tf_r, src = sh._major_sources_and_resample_tf(chart_tf, ohlc)
+    assert src == ("1M", "1w", "1d")
     assert tf_r == "4h"
 
 
@@ -172,11 +174,12 @@ def _ohlc_4h_series_with_skewed_median_gaps(n: int = 150) -> pd.DataFrame:
 
 
 def test_view_chart_tf_1d_on_4h_ohlc_reconciles_to_spacing(sh):
-    """Špatný _view_chart_tf=1d při skutečných 4h svíčkách → hierarchie 4h, major z 1W+1D."""
+    """Špatný _view_chart_tf=1d při skutečných 4h svíčkách → hierarchie 4h, major z 1M+1w+1d."""
     ohlc = _ohlc_4h_series_with_skewed_median_gaps(150)
     assert sh._infer_data_timeframe(ohlc) == "4h"
     assert sh._chart_tf_for_hierarchy(ohlc, "1d", "", "1d") == "4h"
     assert sh._major_tf_sources_for_chart(sh._chart_tf_for_hierarchy(ohlc, "1d", "", "1d"), ohlc) == (
+        "1M",
         "1w",
         "1d",
     )
@@ -212,14 +215,14 @@ def test_data_timeframe_reconciles_when_finer_than_infer(sh):
 
 
 def test_hierarchy_prefers_data_timeframe_before_infer(sh):
-    """Bez _view_chart_tf: data_timeframe 4h nebo odhad z mezer — graf 4h, Major z 1W+1D."""
+    """Bez _view_chart_tf: data_timeframe 4h nebo odhad z mezer — graf 4h, Major z 1M+1w+1d."""
     ohlc = _ohlc_4h_series_with_skewed_median_gaps(150)
     assert sh._infer_data_timeframe(ohlc) == "4h"
     assert sh._chart_tf_for_hierarchy(ohlc, "1w", "4h", None) == "4h"
     assert sh._major_tf_sources_for_chart(
         sh._chart_tf_for_hierarchy(ohlc, "1w", "4h", None),
         ohlc,
-    ) == ("1w", "1d")
+    ) == ("1M", "1w", "1d")
 
 
 def test_infer_uses_intraweek_median_not_weekend_skew(sh):
@@ -249,7 +252,7 @@ def test_hierarchy_infer_when_data_tf_missing(sh):
 
 
 def test_hierarchy_ignores_stale_coarser_data_tf(sh):
-    """data_timeframe 1d při inferovaných 4h datech se ignoruje; TF grafu zůstane 4h (Major 1W+1D)."""
+    """data_timeframe 1d při inferovaných 4h datech se ignoruje; TF grafu zůstane 4h (Major z 1D)."""
     rng = np.random.default_rng(201)
     idx = pd.date_range("2020-01-01", periods=400, freq="4h", tz="UTC")
     close = 100.0 + np.cumsum(rng.normal(0, 0.5, size=len(idx)))
@@ -579,9 +582,9 @@ def _major_swings_one_tf_only(sh, ohlc, tf_resample, major_tf: str, params: dict
     return out
 
 
-def test_demo_data_4h_majors_equal_decomposed_1w_plus_1d(sh):
+def test_demo_data_4h_majors_equal_decomposed_1m_1w_1d(sh):
     """
-    Na demo 30m → 4h: get_major_swings musí odpovět sloučení (1W swingy + 1D swingy) → map na 4h → dedupe.
+    Na demo 30m → 4h: get_major_swings odpovídá sloučení 1M + 1w + 1d swingů → map na 4h → dedupe.
     Simuluje View: stale timeframe=1d, _view_chart_tf=4h.
     """
     native = _demo_ohlc_30m(4500)
@@ -595,7 +598,7 @@ def test_demo_data_4h_majors_equal_decomposed_1w_plus_1d(sh):
         "swing_sparsity": sh.VIEW_PARAMS.get("swing_sparsity", 1.12),
     }
     merged, sources, tf_res = _mirror_pre_dedupe_major_swings(sh, four_h, params)
-    assert sources == ("1w", "1d")
+    assert sources == ("1M", "1w", "1d")
     assert len(merged) >= 4
     expected = sh._dedupe_merged_major_swings(merged)
     actual = sh.get_major_swings(four_h, params)
@@ -615,7 +618,7 @@ def test_demo_data_4h_each_1d_reference_has_matching_major(sh):
     }
     tf = sh._chart_tf_for_hierarchy(four_h, "1d", None, "4h")
     tf_res, sources = sh._major_sources_and_resample_tf(tf, four_h)
-    assert sources == ("1w", "1d")
+    assert sources == ("1M", "1w", "1d")
 
     daily_rows = _major_swings_one_tf_only(sh, four_h, tf_res, "1d", params)
     weekly_rows = _major_swings_one_tf_only(sh, four_h, tf_res, "1w", params)
@@ -637,8 +640,8 @@ def test_demo_data_4h_each_1d_reference_has_matching_major(sh):
         )
 
 
-def test_demo_data_1h_majors_equal_decomposed_1w_plus_1d(sh):
-    """Totéž pro jemnější graf (1h) — 1W+1D zdroje zůstávají."""
+def test_demo_data_1h_majors_equal_decomposed_1m_1w_1d(sh):
+    """Totéž pro jemnější graf (1h) — zdroje 1M+1w+1d."""
     native = _demo_ohlc_30m(6000)
     one_h = sh._resample_ohlc(native, "1h", sh._infer_data_timeframe(native))
     assert len(one_h) > 400
@@ -650,7 +653,7 @@ def test_demo_data_1h_majors_equal_decomposed_1w_plus_1d(sh):
         "swing_sparsity": 1.12,
     }
     merged, sources, _ = _mirror_pre_dedupe_major_swings(sh, one_h, params)
-    assert sources == ("1w", "1d")
+    assert sources == ("1M", "1w", "1d")
     assert len(merged) >= 4
     expected = sh._dedupe_merged_major_swings(merged)
     actual = sh.get_major_swings(one_h, params)

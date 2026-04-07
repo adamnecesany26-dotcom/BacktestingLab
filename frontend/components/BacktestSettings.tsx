@@ -11,6 +11,7 @@ import {
 } from "@/lib/strategyParams";
 import { FieldHelpPopover } from "@/components/FieldHelpPopover";
 import { backtestFieldHelp, getParamFallbackHelp, type BacktestFieldHelp } from "@/components/backtestFieldMeta";
+import { MIN_BACKTEST_YEARS, QUICK_RANGE_MONTHS_YEARS } from "@/lib/dataRange";
 
 export type CommissionMode = "percentage" | "per_contract";
 
@@ -393,7 +394,7 @@ export function BacktestSettings({
       .map((i) => i.yearsAvailable);
     return ys.length > 0 ? Math.min(...ys) : (selectedInstrument?.yearsAvailable ?? 5);
   }, [instruments, selectedInstrumentFiles, selectedInstrument?.yearsAvailable]);
-  const minYears = 1;
+  const minYears = MIN_BACKTEST_YEARS;
   const selectedSet = useMemo(
     () => new Set(selectedInstrumentFiles),
     [selectedInstrumentFiles],
@@ -792,16 +793,40 @@ export function BacktestSettings({
           )}
         </div>
         <div>
-          <SettingsFieldLabel label={`Delka (roky, min ${minYears} - max ${maxYears})`} fieldId="years" />
+          <SettingsFieldLabel
+            label={`Historie (roky jako číslo; minimum ${minYears.toFixed(3)} ≈ 1 měsíc, max ${maxYears})`}
+            fieldId="years"
+          />
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {(
+              [
+                [1, "1 měsíc"],
+                [3, "3 měsíce"],
+                [6, "6 měsíců"],
+              ] as const
+            ).map(([m, label]) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => onYearsChange(QUICK_RANGE_MONTHS_YEARS[m])}
+                className="px-2.5 py-1 rounded text-xs font-medium bg-zinc-800 border border-zinc-600 text-zinc-200 hover:bg-zinc-700 hover:border-zinc-500"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <input
             type="number"
             min={minYears}
             max={maxYears}
-            step={0.5}
+            step={1 / 12}
             value={years}
             onChange={(e) => onYearsChange(parseFloat(e.target.value) || minYears)}
             className={inputClass}
           />
+          <p className="mt-1 text-xs text-zinc-500">
+            Kratší okno = rychlejší backtest (engine bere posledních N·365,25 dní).
+          </p>
         </div>
       </SettingsSection>
 

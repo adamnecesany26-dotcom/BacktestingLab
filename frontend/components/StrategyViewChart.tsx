@@ -1,9 +1,14 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, useMemo } from "react";
+import { flushSync } from "react-dom";
 import {
+  buildArtifactsStreaming,
+  getArtifactStatus,
   getViewData,
   isViewRegimeHistogramLine,
+  type ArtifactStatusResponse,
+  type ArtifactBuildStreamEvent,
   type ViewInducement,
   type ViewLine,
   type ViewLineSeries,
@@ -21,15 +26,34 @@ import type { DataInstrument } from "@shared/types";
 import type { FirestoreItem } from "@/lib/firestore";
 import type { OhlcBar } from "@shared/types";
 import {
-  buildViewChartTimeframeOptions,
+  buildViewChartTimeframeOptionsCoarseFirst,
   effectiveViewDataTimeframe,
   shuffleWindowBarCount,
 } from "@/lib/viewChartTimeframe";
+import { remapViewMarkersBarIndexForWindow } from "@/lib/viewDemoObdobiSlice";
 import {
   HL_TREND_STATE_COLORS,
   lineDataHasTrendState,
   groupIndexedTrendSegments,
 } from "@/lib/viewChartLines";
+import { FieldHelpPopover } from "@/components/FieldHelpPopover";
+import { backtestFieldHelp } from "@/components/backtestFieldMeta";
+
+/** Musí odpovídat backend ``PRECOMPUTE_TF_LADDER`` (pořadí od hrubého k jemnému; bez 30m). */
+const ARTIFACT_PRECOMPUTE_TF_OPTIONS = ["1M", "1w", "1d", "4h", "1h"] as const;
+
+/** Sladěno s ``buildArtifactsStreaming`` / proxy (48 h) — časový dolní odhad průběhu. */
+const ARTIFACT_BUILD_CLIENT_MAX_SEC = 48 * 3600;
+
+function formatArtifactBuildElapsed(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
 
 type ViewMarker = { date: string; type: string; value: number; bar_index?: number };
 
@@ -155,7 +179,8 @@ function applyViewDemoObdobiSlice(
     return ds >= startDate && ds <= endDate;
   };
 
-  const markers = fullMarkers.filter((m) => inRange(m.date));
+  const markersInWindow = fullMarkers.filter((m) => inRange(m.date));
+  const markers = remapViewMarkersBarIndexForWindow(markersInWindow, startIdx, windowOhlc.length);
   const lines = fullLines
     .map((line) => {
       if (isViewRegimeHistogramLine(line)) {
@@ -334,20 +359,35 @@ const DEFAULT_VISIBILITY: Record<VisibilityKey, boolean> = {
   lines: true,
 };
 
-const TIMEFRAMES = [
-  { label: "1M", years: 0.083 },
-  { label: "3M", years: 0.25 },
-  { label: "6M", years: 0.5 },
-  { label: "1Y", years: 1 },
-  { label: "2Y", years: 2 },
-  { label: "3Y", years: 3 },
-  { label: "4Y", years: 4 },
-  { label: "5Y", years: 5 },
+/** Období zobrazení na grafu: Max → nejužší okno (řazeno od celé řady dolů k 1 měsíci). */
+const VIEW_DISPLAY_PERIODS = [
   { label: "Max", years: 0 },
+  { label: "5Y", years: 5 },
+  { label: "4Y", years: 4 },
+  { label: "3Y", years: 3 },
+  { label: "2Y", years: 2 },
+  { label: "1Y", years: 1 },
+  { label: "6M", years: 0.5 },
+  { label: "3M", years: 0.25 },
+  { label: "1M", years: 0.083 },
 ] as const;
 
-/** Kanonický View demo dataset — jediný zdroj dat v této záložce. */
-const VIEW_DEMO_FILE_FALLBACK = "futures_30m/nq_view_demo_2025.parquet";
+function artifactOverallBadgeClass(overall: string | undefined): string {
+  switch (overall) {
+    case "fresh":
+      return "bg-emerald-950/60 text-emerald-200/95 border-emerald-700/45";
+    case "missing_hl":
+    case "missing_sd":
+      return "bg-amber-950/50 text-amber-100/90 border-amber-600/40";
+    case "stale_data":
+    case "stale_code":
+      return "bg-orange-950/55 text-orange-100/90 border-orange-600/40";
+    case "error":
+      return "bg-rose-950/50 text-rose-100/90 border-rose-600/40";
+    default:
+      return "bg-zinc-800/80 text-zinc-400 border-zinc-600/50";
+  }
+}
 
 function isViewDemoDataFile(file: string): boolean {
   const f = (file || "").toLowerCase().replace(/\\/g, "/");
@@ -361,7 +401,7 @@ interface StrategyViewChartProps {
   modules: FirestoreItem[];
   indicators: FirestoreItem[];
   strategies: FirestoreItem[];
-  /** Ignorováno — View používá výhradně demo parquet (viz VIEW_DEMO_FILE_FALLBACK). */
+  /** Výchozí data_file po mountu, pokud je v katalogu instrumentů. */
   defaultDataFile?: string;
   initialItemId?: string;
   initialItemType?: ViewItemType;
@@ -375,7 +415,7 @@ export function StrategyViewChart({
   modules,
   indicators,
   strategies,
-  defaultDataFile: _defaultDataFileIgnored,
+  defaultDataFile,
   initialItemId,
   initialItemType,
   height = 960,
@@ -386,20 +426,18 @@ export function StrategyViewChart({
   const [markers, setMarkers] = useState<ViewMarker[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [dataFile, setDataFile] = useState(VIEW_DEMO_FILE_FALLBACK);
-
-  const demoInstruments = useMemo(
-    () =>
-      instruments.filter((i) => i.viewDemo === true || isViewDemoDataFile(i.file)),
-    [instruments]
-  );
+  const [dataFile, setDataFile] = useState("");
 
   useEffect(() => {
-    if (demoInstruments.length === 0) return;
-    setDataFile((prev) =>
-      demoInstruments.some((i) => i.file === prev) ? prev : demoInstruments[0].file
-    );
-  }, [demoInstruments]);
+    if (instruments.length === 0) return;
+    setDataFile((prev) => {
+      if (prev && instruments.some((i) => i.file === prev)) return prev;
+      if (defaultDataFile && instruments.some((i) => i.file === defaultDataFile)) {
+        return defaultDataFile;
+      }
+      return instruments[0].file;
+    });
+  }, [instruments, defaultDataFile]);
   const [years, setYears] = useState(0.5);
   /** Candle bar size for chart + module OHLC: native = instrument resolution; else server-side resample */
   const [chartTimeframe, setChartTimeframe] = useState<string>("native");
@@ -442,6 +480,24 @@ export function StrategyViewChart({
   const [visibilityPanelOpen, setVisibilityPanelOpen] = useState(false);
   const [valuesModalOpen, setValuesModalOpen] = useState(false);
   const [visibility, setVisibility] = useState<Record<VisibilityKey, boolean>>(() => ({ ...DEFAULT_VISIBILITY }));
+  /** Fáze 5: načíst H/L + S/D z backendu .backtest_artifacts místo view_engine. */
+  const [useArtifactLayer, setUseArtifactLayer] = useState(false);
+  const [artifactBanner, setArtifactBanner] = useState<string | null>(null);
+  /** Fáze 6: stav cache + build */
+  const [artifactStatus, setArtifactStatus] = useState<ArtifactStatusResponse | null>(null);
+  const [artifactStatusLoading, setArtifactStatusLoading] = useState(false);
+  const [artifactBuilding, setArtifactBuilding] = useState(false);
+  const [artifactBuildError, setArtifactBuildError] = useState<string | null>(null);
+  const [artifactBuildProgressPct, setArtifactBuildProgressPct] = useState(0);
+  const [artifactBuildPhaseLabel, setArtifactBuildPhaseLabel] = useState("");
+  /** Nutné kvůli odvozenému uběhu času i při throttlingu záložky (interval + Date.now). */
+  const [artifactBuildUiPulse, setArtifactBuildUiPulse] = useState(0);
+  const artifactBuildWallT0Ref = useRef<number>(0);
+  /** Čas posledního serverového `pct` — mezi milníky jemně přidáme creep (jeden TF může trvat dlouho). */
+  const artifactBuildLastServerPctAtRef = useRef<number>(0);
+  const [artifactBuildTimeframes, setArtifactBuildTimeframes] = useState<string[]>(() => [
+    ...ARTIFACT_PRECOMPUTE_TF_OPTIONS,
+  ]);
   const viewParamsRef = useRef<StrategyParams>({});
   /** Zvyšuje se při každém novém fetchi; starší async odpověď nesmí přepsat stav (Strict Mode / rychlé přepnutí modulu). */
   const viewRequestGenRef = useRef(0);
@@ -452,7 +508,7 @@ export function StrategyViewChart({
   }, [viewParamsValues]);
 
   const selectedInstrument = useMemo((): DataInstrument | undefined => {
-    const found = demoInstruments.find((i) => i.file === dataFile);
+    const found = instruments.find((i) => i.file === dataFile);
     if (found) return found;
     if (isViewDemoDataFile(dataFile)) {
       return {
@@ -468,11 +524,72 @@ export function StrategyViewChart({
       };
     }
     return undefined;
-  }, [demoInstruments, dataFile]);
+  }, [instruments, dataFile]);
+
+  useEffect(() => {
+    if (!selectedInstrument) return;
+    const cap = selectedInstrument.yearsAvailable;
+    setYears((y) => {
+      if (y <= 0) return y;
+      if (cap > 0 && y > cap) return cap;
+      return y;
+    });
+  }, [selectedInstrument?.file, selectedInstrument?.yearsAvailable]);
+
   const chartTfOptions = useMemo(
-    () => buildViewChartTimeframeOptions(selectedInstrument?.timeframe),
+    () => buildViewChartTimeframeOptionsCoarseFirst(selectedInstrument?.timeframe),
     [selectedInstrument?.timeframe]
   );
+
+  const needsDemoStyleClientSlice = useMemo(() => {
+    return (
+      selectedInstrument?.viewDemo === true ||
+      (dataFile.length > 0 && isViewDemoDataFile(dataFile))
+    );
+  }, [selectedInstrument?.viewDemo, dataFile]);
+
+  const viewDataSourceHint = useMemo(() => {
+    if (useArtifactLayer) {
+      return "Zdroj vrstev: předpočtené artefakty (H/L + S/D z .backtest_artifacts, pokud jsou k dispozici a fresh). OHLC a tělo požadavku stále připraví API; při chybějících nebo zastaralých vrstvách může server část dopočítat.";
+    }
+    return "Zdroj: živý výpočet na serveru — modul nad načtenými daty bez vrstev z Parquet cache (pokud nejsou zapnuté artefakty).";
+  }, [useArtifactLayer]);
+
+  const toggleArtifactBuildTf = useCallback((tf: string) => {
+    setArtifactBuildTimeframes((prev: string[]) => {
+      const nextHas = new Set(prev);
+      if (nextHas.has(tf)) nextHas.delete(tf);
+      else nextHas.add(tf);
+      if (nextHas.size === 0) return prev;
+      return ARTIFACT_PRECOMPUTE_TF_OPTIONS.filter((o) => nextHas.has(o));
+    });
+  }, []);
+
+  const selectAllArtifactBuildTfs = useCallback(() => {
+    setArtifactBuildTimeframes([...ARTIFACT_PRECOMPUTE_TF_OPTIONS]);
+  }, []);
+
+  const refreshArtifactStatus = useCallback(async () => {
+    if (!dataFile) return;
+    setArtifactStatusLoading(true);
+    try {
+      const st = await getArtifactStatus(dataFile, 0, null);
+      setArtifactStatus(st);
+    } catch (e) {
+      setArtifactStatus({
+        ok: false,
+        error: e instanceof Error ? e.message : String(e),
+        overall: "error",
+        overall_label: "Error",
+      });
+    } finally {
+      setArtifactStatusLoading(false);
+    }
+  }, [dataFile]);
+
+  useEffect(() => {
+    void refreshArtifactStatus();
+  }, [refreshArtifactStatus]);
 
   useEffect(() => {
     if (!chartTfOptions.some((o) => o.value === chartTimeframe)) {
@@ -491,6 +608,10 @@ export function StrategyViewChart({
     const gen = ++viewRequestGenRef.current;
     setLoading(true);
     setError(null);
+    if (!dataFile) {
+      setLoading(false);
+      return;
+    }
     try {
       let code: string | null = null;
       let paramsToSend: StrategyParams | null = null;
@@ -553,22 +674,25 @@ export function StrategyViewChart({
       const depNames = code ? parseViewDependencies(code) : [];
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
-      const viewDemo = selectedInstrument?.viewDemo === true;
-      const effectiveYears = viewDemo ? 0 : years;
+      const effectiveYears = needsDemoStyleClientSlice ? 0 : years;
       const res = await getViewData(
         dataFile,
         effectiveYears,
         code,
         paramsToSend,
         moduleDeps,
-        chartTimeframe
+        chartTimeframe,
+        null,
+        useArtifactLayer ? { useArtifacts: true } : undefined
       );
       if (gen !== viewRequestGenRef.current) return;
+      setArtifactBanner(useArtifactLayer ? (res.artifact_banner ?? null) : null);
       let nextOhlc = res.ohlc;
       let nextMarkers = res.markers ?? [];
       let nextLines = res.lines ?? [];
       let nextZones = res.zones ?? [];
-      if (viewDemo && years > 0) {
+      if (needsDemoStyleClientSlice && years > 0) {
+        const fromApiCount = nextMarkers.length;
         const sliced = applyViewDemoObdobiSlice(
           nextOhlc,
           nextMarkers,
@@ -582,6 +706,14 @@ export function StrategyViewChart({
         nextMarkers = sliced.markers;
         nextLines = sliced.lines;
         nextZones = sliced.zones;
+        if (process.env.NODE_ENV === "development") {
+          console.debug("[view] markers tail slice", {
+            useArtifacts: useArtifactLayer,
+            fromApi: fromApiCount,
+            afterSlice: nextMarkers.length,
+            ohlcBars: nextOhlc.length,
+          });
+        }
       }
       setOhlc(nextOhlc);
       setMarkers(nextMarkers);
@@ -609,12 +741,95 @@ export function StrategyViewChart({
     selectedInstrument,
     modules,
     strategyZoneSyncCode,
+    useArtifactLayer,
+    needsDemoStyleClientSlice,
+  ]);
+
+  useEffect(() => {
+    if (!artifactBuilding) return;
+    const id = window.setInterval(() => setArtifactBuildUiPulse((x) => x + 1), 400);
+    return () => window.clearInterval(id);
+  }, [artifactBuilding]);
+
+  const artifactBuildElapsedSec = artifactBuilding
+    ? Math.max(0, Math.floor((Date.now() - artifactBuildWallT0Ref.current) / 1000))
+    : 0;
+
+  const artifactBuildDisplayPct = useMemo(() => {
+    if (!artifactBuilding) return 0;
+    const sinceSec = Math.max(0, (Date.now() - artifactBuildLastServerPctAtRef.current) / 1000);
+    // +1 % cca každých 75 s od posledního serverového milníku, max. +8 % (vnitř jednoho TF / tiché fáze).
+    const creep = Math.min(8, sinceSec / 75);
+    const blended = artifactBuildProgressPct + creep;
+    const timeSynth = Math.min(
+      94,
+      1 + (artifactBuildElapsedSec / ARTIFACT_BUILD_CLIENT_MAX_SEC) * 93
+    );
+    // Starý max(server, timeSynth) při dlouhém běhu a serveru na 8 % dával jen 8 % po hodiny (48h okno).
+    return Math.round(Math.min(94, Math.max(blended, timeSynth)) * 10) / 10;
+  }, [artifactBuilding, artifactBuildElapsedSec, artifactBuildProgressPct, artifactBuildUiPulse]);
+
+  const handleBuildArtifacts = useCallback(async () => {
+    if (!dataFile) return;
+    artifactBuildWallT0Ref.current = Date.now();
+    artifactBuildLastServerPctAtRef.current = Date.now();
+    setArtifactBuilding(true);
+    setArtifactBuildError(null);
+    setArtifactBuildProgressPct(1);
+    setArtifactBuildPhaseLabel("Navazuji spojení…");
+    try {
+      await buildArtifactsStreaming(
+        dataFile,
+        {
+          years: 0,
+          precomputeTimeframes:
+            artifactBuildTimeframes.length > 0 &&
+            artifactBuildTimeframes.length < ARTIFACT_PRECOMPUTE_TF_OPTIONS.length
+              ? artifactBuildTimeframes
+              : undefined,
+        },
+        (ev: ArtifactBuildStreamEvent) => {
+          if (ev.type !== "phase") return;
+          flushSync(() => {
+            // Pulz nesmí přepsat konkrétní fázi (např. „H/L · 30m (6/6) — výpočet…“).
+            if (ev.phase !== "pulse") {
+              if (ev.message) setArtifactBuildPhaseLabel(ev.message);
+              else if (ev.phase) setArtifactBuildPhaseLabel(ev.phase);
+            }
+            if (typeof ev.pct === "number") {
+              artifactBuildLastServerPctAtRef.current = Date.now();
+              setArtifactBuildProgressPct(ev.pct);
+            }
+          });
+        }
+      );
+      await refreshArtifactStatus();
+      if (useArtifactLayer) {
+        await fetchData();
+      }
+    } catch (e) {
+      setArtifactBuildError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setArtifactBuilding(false);
+      setArtifactBuildProgressPct(0);
+      setArtifactBuildPhaseLabel("");
+    }
+  }, [
+    dataFile,
+    artifactBuildTimeframes,
+    refreshArtifactStatus,
+    useArtifactLayer,
+    fetchData,
   ]);
 
   const handleShuffle = useCallback(async () => {
     const gen = ++viewRequestGenRef.current;
     setLoading(true);
     setError(null);
+    if (!dataFile) {
+      setLoading(false);
+      return;
+    }
     try {
       let code: string | null = null;
       let paramsToSend: StrategyParams | null = null;
@@ -674,12 +889,23 @@ export function StrategyViewChart({
       // Na shuffle načti širší řez než jen „Období“ — jinak je fullLen ≈ šířka okna a posun je ~0–1 bar.
       // U 6M view načteme např. ~2× období (strop yearsAvailable / 12 let), pak náhodně vybereme okno šířky 6M.
       const capAvail = selectedInstrument?.yearsAvailable ?? 12;
-      const shuffleLoadYears =
-        years > 0
+      const shuffleLoadYears = needsDemoStyleClientSlice
+        ? 0
+        : years > 0
           ? Math.min(capAvail, 12, Math.max(years * 2.5, years + 0.75))
           : Math.min(capAvail, 10);
-      const res = await getViewData(dataFile, shuffleLoadYears, code, paramsToSend, moduleDeps, chartTimeframe);
+      const res = await getViewData(
+        dataFile,
+        shuffleLoadYears,
+        code,
+        paramsToSend,
+        moduleDeps,
+        chartTimeframe,
+        null,
+        useArtifactLayer ? { useArtifacts: true } : undefined
+      );
       if (gen !== viewRequestGenRef.current) return;
+      setArtifactBanner(useArtifactLayer ? (res.artifact_banner ?? null) : null);
       const fullOhlc = res.ohlc;
       const fullMarkers = res.markers ?? [];
       const fullLines = res.lines ?? [];
@@ -771,15 +997,11 @@ export function StrategyViewChart({
 
       setOhlc(windowOhlc);
       setMarkers(
-        fullMarkers.filter((m) => inRange(m.date)).map((m) => {
-          const copy: ViewMarker = { ...m };
-          if (typeof copy.bar_index === "number" && Number.isFinite(copy.bar_index)) {
-            const ri = Math.round(copy.bar_index - startIdx);
-            if (ri >= 0 && ri < windowOhlc.length) copy.bar_index = ri;
-            else delete copy.bar_index;
-          }
-          return copy;
-        })
+        remapViewMarkersBarIndexForWindow(
+          fullMarkers.filter((m) => inRange(m.date)),
+          startIdx,
+          windowOhlc.length
+        )
       );
       setLines(
         fullLines
@@ -834,6 +1056,8 @@ export function StrategyViewChart({
     selectedInstrument,
     modules,
     strategyZoneSyncCode,
+    useArtifactLayer,
+    needsDemoStyleClientSlice,
   ]);
 
   useEffect(() => {
@@ -1476,28 +1700,32 @@ export function StrategyViewChart({
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex flex-wrap gap-3 pb-3 shrink-0">
-        <div>
-          <label className="text-xs text-zinc-500 block mb-1">Data (View demo)</label>
-          <div
-            className={`${inputClass} cursor-default bg-zinc-800/90 text-zinc-300`}
-            title="Záložka View používá výhradně kanonický demo soubor NQ 2025 (30m). Výběr instrumentu není k dispozici."
+      <div className="flex flex-wrap items-end gap-3 pb-3 shrink-0 border-b border-zinc-800/60">
+        <div className="min-w-[14rem] flex-1">
+          <label className="text-xs text-zinc-500 block mb-1">Instrument</label>
+          <select
+            value={dataFile}
+            onChange={(e) => setDataFile(e.target.value)}
+            className={`${inputClass} w-full max-w-xl`}
+            disabled={instruments.length === 0}
+            title="Build features i běh modulu používají tento data_file. Pro shodu s backtestem zvol stejný soubor jako v Basic."
           >
-            {selectedInstrument
-              ? `${selectedInstrument.instrument} — ${selectedInstrument.displayName ?? "View demo (2025)"} (${selectedInstrument.timeframe})`
-              : "NQ — View demo (2025) (30m)"}
-          </div>
-          {instruments.length > 0 && demoInstruments.length === 0 && (
-            <p className="text-xs text-amber-400/90 mt-1 max-w-md">
-              Backend nevrátil záznam pro demo parquet — zkontrolujte soubor{" "}
-              <code className="text-zinc-400">{VIEW_DEMO_FILE_FALLBACK}</code> a skript build_nq_view_demo_2025.
+            {instruments.map((i) => (
+              <option key={i.file} value={i.file}>
+                {i.instrument} — {i.displayName} ({i.timeframe})
+              </option>
+            ))}
+          </select>
+          {instruments.length === 0 ? (
+            <p className="text-xs text-amber-400/90 mt-1 max-w-xl">
+              Katalog je prázdný — zkontrolujte backend a složku <code className="text-zinc-400">data/</code>.
             </p>
-          )}
+          ) : null}
         </div>
         <div>
           <label
             className="text-xs text-zinc-500 block mb-1"
-            title="Agregace OHLC na serveru (pandas resample) před vykreslením i před voláním detect/get_line/get_zones. Nelze zjemnit pod rozlišení souboru."
+            title="Agregace OHLC na serveru. Pořadí od hrubších svíček k původnímu rozlišení souboru."
           >
             Timeframe svíček
           </label>
@@ -1516,24 +1744,24 @@ export function StrategyViewChart({
         <div>
           <label
             className="text-xs text-zinc-500 block mb-1"
-            title="U View demo modul stále počítá na celé dostupné historii (API years=0). Tento výběr jen upravuje okno zobrazení na grafu (poslední N svíček). „Max“ = celá načtená řada."
+            title="Max = celá řada v souboru. Kratší = poslední roky/měsíce (server); u krátkého demo souboru může následovat ještě klientský ořez okna."
           >
-            Období
+            Období zobrazení
           </label>
           <select
             value={years}
             onChange={(e) => setYears(parseFloat(e.target.value))}
             className={inputClass}
           >
-            {TIMEFRAMES.map((tf) => (
+            {VIEW_DISPLAY_PERIODS.map((tf) => (
               <option key={tf.label} value={tf.years}>
                 {tf.label}
               </option>
             ))}
           </select>
         </div>
-        <div>
-          <label className="text-xs text-zinc-500 block mb-1">Modul / Indikátor / Strategie</label>
+        <div className="min-w-[12rem]">
+          <label className="text-xs text-zinc-500 block mb-1">Modul / indikátor / strategie</label>
           <select
             value={selectedItemId ? `${selectedItemType}:${selectedItemId}` : ""}
             onChange={(e) => {
@@ -1546,7 +1774,7 @@ export function StrategyViewChart({
               setSelectedItemType(type as ViewItemType);
               setSelectedItemId(id);
             }}
-            className={inputClass}
+            className={`${inputClass} w-full max-w-sm`}
           >
             <option value="">— Žádný —</option>
             {strategies.map((s) => (
@@ -1566,21 +1794,35 @@ export function StrategyViewChart({
             ))}
           </select>
         </div>
-        <div className="flex items-end gap-2">
+        <div className="flex items-center gap-1 pb-0.5">
+          <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none max-w-[13rem] leading-snug">
+            <input
+              type="checkbox"
+              className="rounded border-zinc-600 shrink-0"
+              checked={useArtifactLayer}
+              onChange={(e) => setUseArtifactLayer(e.target.checked)}
+            />
+            H/L + S/D z&nbsp;cache
+          </label>
+          <FieldHelpPopover help={backtestFieldHelp.artifactViewHlSdCache} />
+        </div>
+        <div className="flex items-end gap-2 flex-wrap">
           <button
             onClick={fetchData}
-            disabled={loading}
+            disabled={loading || !dataFile}
             className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
           >
             {loading ? "Načítám..." : "Obnovit"}
           </button>
           <button
             onClick={handleShuffle}
-            disabled={loading}
+            disabled={loading || years <= 0}
             title={
-              selectedInstrument?.viewDemo
-                ? "Náhodný výřez uvnitř celé demo řady 2025. Modul běží vždy na celém demo souboru."
-                : "Modul se počítá na delší historii než „Období“, výstup se ořeže do náhodného okna — prázdné okno (bez markerů/zón v řezu) je běžné. Aplikace opakuje náhodný posun až ~15×, dokud v okně něco je, nebo použije poslední pokus."
+              years <= 0
+                ? "Shuffle je vypnutý při období Max — zvolte kratší okno."
+                : needsDemoStyleClientSlice
+                  ? "Náhodný výřez stejné šířky jako období uvnitř načtené řady (demo: celý soubor na serveru, pak výřez)."
+                  : "Širší načtení, výpočet modulu na delší historii, pak náhodné okno šířky zvoleného období (~15 pokusů s obsahem)."
             }
             className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
           >
@@ -1645,6 +1887,151 @@ export function StrategyViewChart({
           </button>
         </div>
       </div>
+
+      <div className="flex flex-col gap-2 py-2 px-2 shrink-0 rounded-md border border-zinc-800/60 bg-zinc-900/35 mb-2">
+        <p className="text-xs text-zinc-400 leading-relaxed border-l-2 border-violet-600/45 pl-2">
+          <span className="text-zinc-300 font-medium">Zdroj vrstev: </span>
+          {viewDataSourceHint}
+          {useArtifactLayer && artifactBanner ? (
+            <span className="text-amber-200/85"> — {artifactBanner}</span>
+          ) : null}
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs text-zinc-500 shrink-0 inline-flex items-center gap-1">
+            Artefakty (dataset)
+            <FieldHelpPopover help={backtestFieldHelp.artifactViewDatasetStatus} />
+          </span>
+          <span
+            className={`text-xs px-2 py-0.5 rounded border shrink-0 ${artifactOverallBadgeClass(artifactStatus?.overall)}`}
+            title={
+              [artifactStatus?.hl?.detail, artifactStatus?.sd?.detail].filter(Boolean).join(" · ") ||
+              undefined
+            }
+          >
+            {artifactStatusLoading
+              ? "Načítám stav…"
+              : artifactBuilding
+                ? "Building…"
+                : artifactStatus?.overall_label ?? artifactStatus?.overall ?? "—"}
+          </span>
+          {artifactStatus?.dataset_id ? (
+            <code
+              className="text-[10px] text-zinc-500 font-mono truncate max-w-[12rem]"
+              title={artifactStatus.dataset_id}
+            >
+              {artifactStatus.dataset_id.slice(0, 14)}…
+            </code>
+          ) : null}
+          <span className="inline-flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => void handleBuildArtifacts()}
+              disabled={artifactBuilding || artifactStatusLoading || !dataFile}
+              title="Precompute H/L + S/D na celý data_file pro zvolené TF; ukládá se do .backtest_artifacts. Období ve View jen zobrazení."
+              className="px-3 py-1.5 rounded bg-violet-700 hover:bg-violet-600 text-xs font-medium disabled:opacity-50"
+            >
+              {artifactBuilding ? "Build…" : "Build features"}
+            </button>
+            <FieldHelpPopover help={backtestFieldHelp.artifactViewBuildFeatures} />
+          </span>
+          <button
+            type="button"
+            onClick={() => void refreshArtifactStatus()}
+            disabled={artifactStatusLoading || artifactBuilding}
+            className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-400 disabled:opacity-50 shrink-0"
+          >
+            Obnovit stav
+          </button>
+          {artifactBuildError ? (
+            <span className="text-xs text-rose-400 shrink-0 max-w-md truncate" title={artifactBuildError}>
+              {artifactBuildError}
+            </span>
+          ) : null}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 border-t border-zinc-800/50 pt-2 mt-0.5">
+          <span className="text-[10px] text-zinc-500 shrink-0">TF precomputu (H/L + S/D):</span>
+          <button
+            type="button"
+            className="text-[10px] text-violet-400 hover:text-violet-300 disabled:opacity-50"
+            onClick={selectAllArtifactBuildTfs}
+            disabled={artifactBuilding || artifactStatusLoading}
+          >
+            Vše
+          </button>
+          {ARTIFACT_PRECOMPUTE_TF_OPTIONS.map((tf) => (
+            <label
+              key={tf}
+              className="inline-flex items-center gap-1 text-[10px] text-zinc-400 cursor-pointer select-none"
+            >
+              <input
+                type="checkbox"
+                className="rounded border-zinc-600 bg-zinc-900"
+                checked={artifactBuildTimeframes.includes(tf)}
+                onChange={() => toggleArtifactBuildTf(tf)}
+                disabled={artifactBuilding || artifactStatusLoading}
+              />
+              {tf}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {artifactBuilding ? (
+        <div className="fixed inset-0 bg-black/55 backdrop-blur-[2px] flex items-center justify-center z-[60] p-4">
+          <div
+            className="bg-zinc-900 border border-violet-800/45 rounded-xl shadow-2xl p-6 w-full max-w-md"
+            role="dialog"
+            aria-busy="true"
+            aria-live="polite"
+            aria-label="Probíhá build artefaktů"
+          >
+            <h3 className="text-sm font-semibold text-zinc-100 mb-1">Build artefaktů</h3>
+            <p className="text-[11px] text-zinc-500 font-mono mb-3 truncate" title={dataFile || ""}>
+              {dataFile || "—"}
+            </p>
+            <div className="flex items-end justify-between gap-3 mb-4">
+              <div
+                className="text-5xl font-bold tabular-nums leading-none tracking-tight text-violet-300"
+                title="Kombinace milníků ze serveru a časového odhadu (během H/L často dlouho žádná nová %) — viz popis níže."
+              >
+                {Math.min(100, Math.round(artifactBuildDisplayPct))}
+                <span className="text-2xl font-semibold text-violet-400/90 align-top ml-0.5">%</span>
+              </div>
+              <div className="text-right text-[11px] text-zinc-500 tabular-nums pb-1">
+                <div className="text-zinc-400">Uběhlo</div>
+                <div className="text-sm text-zinc-300 font-mono">
+                  {formatArtifactBuildElapsed(artifactBuildElapsedSec)}
+                </div>
+              </div>
+            </div>
+            <div className="h-3 rounded-full bg-zinc-800 overflow-hidden mb-1 ring-1 ring-zinc-700/80">
+              <div
+                className="h-full bg-gradient-to-r from-violet-700 via-fuchsia-600 to-violet-500 transition-[width] duration-300 ease-out"
+                style={{
+                  width: `${Math.min(100, Math.max(1, artifactBuildDisplayPct))}%`,
+                }}
+              />
+            </div>
+            <div className="flex justify-between text-[10px] text-zinc-500 tabular-nums mb-3">
+              <span>Milník ze serveru: {Math.round(artifactBuildProgressPct)}%</span>
+              <span>Časový odhad (48 h): → 94%</span>
+            </div>
+            <p className="text-sm text-violet-200/90 min-h-[2.75rem] leading-snug border-t border-zinc-800/80 pt-3">
+              {artifactBuildPhaseLabel || "Navazuji stream…"}
+            </p>
+            <p className="text-[10px] text-zinc-500 leading-snug mt-2">
+              Server hlásí každý timeframe H/L a S/D (start + hotovo). 30m se v artefaktech nepočítá
+              (žebříček do 1h); u 1h na velkém intraday souboru může krok trvat dlouho — očekávané. Velké číslo nahoře doplňuje drobný časový
+              creep oproti „Milník ze serveru“. Zápis: <span className="font-mono text-zinc-400">.backtest_artifacts/</span>
+              {" "}
+              (kořen projektu, v <span className="font-mono text-zinc-400">.gitignore</span>) — podsložka pod{" "}
+              <span className="font-mono text-zinc-400">dataset_id</span>, soubory{" "}
+              <span className="font-mono text-zinc-400">hl/v1/*.parquet</span>,{" "}
+              <span className="font-mono text-zinc-400">sd/v1/zones.parquet</span>. Kontrolní pulz každých ~12 s.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       {valuesModalOpen && (
         <div
@@ -2017,6 +2404,12 @@ export function StrategyViewChart({
             )}
           </div>
         </>
+      )}
+
+      {artifactBanner && (
+        <div className="mb-3 px-3 py-2 rounded border border-amber-500/35 bg-amber-950/50 text-amber-100/90 text-sm shrink-0">
+          {artifactBanner}
+        </div>
       )}
 
       {error && (

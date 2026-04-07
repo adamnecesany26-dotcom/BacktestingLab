@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — examples/premium_discount.py — indikátor/modul (Premium–Mid–Discount) — celý soubor vložit do Firestore (Moduly nebo Indikátory → main.py).
 """
 Premium / Mid / Discount indikátor – range mezi Major Swing Low a Major Swing High.
 

@@ -1,0 +1,2 @@
+# Precomputed H/L + S/D artifacts (Parquet/JSON; can be large)
+.backtest_artifacts/

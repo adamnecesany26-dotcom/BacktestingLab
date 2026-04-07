@@ -9,7 +9,7 @@ import re
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import run, data, chart, view
+from app.api import run, data, chart, view, artifacts
 from app.security import require_api_access
 
 app = FastAPI(
@@ -76,3 +76,4 @@ app.include_router(run.router, prefix="/api", tags=["run"], dependencies=[Depend
 app.include_router(data.router, prefix="/api", tags=["data"], dependencies=[Depends(require_api_access)])
 app.include_router(chart.router, prefix="/api", tags=["chart"], dependencies=[Depends(require_api_access)])
 app.include_router(view.router, prefix="/api", tags=["view"], dependencies=[Depends(require_api_access)])
+app.include_router(artifacts.router, prefix="/api", tags=["artifacts"], dependencies=[Depends(require_api_access)])

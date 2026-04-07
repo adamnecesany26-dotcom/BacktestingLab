@@ -241,6 +241,13 @@ Detailní vysvětlení je v **`VIEW_PARAMS_META`** v `sd_zones.py`.
 
 ---
 
+## 10. Precompute a stejná zrna jako ve View
+
+- Pro **stejné** S/D zóny jako při kreslení z **cache** ve View musí být zóny vypočteny přes pipeline **S/D precompute** (`python -m app.services.sd_precompute`, vyžaduje existující H/L manifest pod stejným `dataset_id`). Interně se volá tato logika `get_zones` na připraveném OHLC — viz **[docs/BACKTEST_PIPELINE_REFACTOR.md](../../docs/BACKTEST_PIPELINE_REFACTOR.md)**.
+- V aplikaci: **Build features** u View nahradí ruční CLI.
+
+---
+
 ## Platforma Backtesting App
 
-Modul je určen pro **[Backtesting_app](../../README.md)**. Přehled UI: **[READMEADAM.md](../../READMEADAM.md)**; spuštění lokálně: **[SCRIPTS.md](../../SCRIPTS.md)**; kontrakty API: **[READMEAI.md](../../READMEAI.md)**.
+Modul je určen pro **[Backtesting_app](../../README.md)**. Přehled UI: **[READMEADAM.md](../../READMEADAM.md)**; spuštění lokálně: **[SCRIPTS.md](../../SCRIPTS.md)**; kontrakty API: **[READMEAI.md](../../READMEAI.md)**; artefakty: **[docs/BACKTEST_PIPELINE_REFACTOR.md](../../docs/BACKTEST_PIPELINE_REFACTOR.md)**.

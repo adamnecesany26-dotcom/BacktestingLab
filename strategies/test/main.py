@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — strategies/test/main.py — strategie — celý soubor vložit do Firestore (Strategie → main.py).
 """
 Test strategie – EMA křížení (rychlá / pomalá), long i short.
 

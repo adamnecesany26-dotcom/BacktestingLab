@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# FIRESTORE_SYNC — strategies/sd_zone_strategy/modules/Swing_HL.py — modul — celý soubor vložit do Firestore (Moduly → main.py, např. „Swing HL“).
 """
 Swing High / Low Detector - samostatny modul pro detekci swing bodu, BOS a CHoCH.
 
@@ -65,38 +66,34 @@ def _major_sources_and_resample_tf(chart_tf: str, ohlc: pd.DataFrame) -> tuple[s
     """
     (source_tf_effective, zdroje pro detekci majorů).
 
-    Kritické: rozhodnutí „pouze 1W“ vs „1W+1D“ musí vycházet z **nejemnejšího** z
-    deklarovaného TF hierarchie a **skutečného kroku OHLC**. Jinak výchozí params
-    timeframe=1d + graf 4h dá `_major_tf_sources_for_chart("1d")` → jen 1W a denní
-    swingy na 4h se nikdy neoznačí jako major.
+    - **1M**: žádní majory. **1w**: z **1M**. **1d**: z **1M + 1w**.
+    - **Jemněji než 1d** (4h, 1h, 30m, …): majory z **1M + 1w + 1d** (všechny vyšší TF,
+      aby weekly/monthly úrovně na intraday grafu nechyběly).
+
+    ``tf_res`` pořád vychází z grafového TF vs. inferovaného kroku OHLC (resampling svíček).
     """
     th = _canonical_chart_tf(chart_tf)
-    if th not in TF_FINE_TO_COARSE or th in ("1w", "1M"):
+    if th not in TF_FINE_TO_COARSE or th == "1M":
         return th, ()
+    if th == "1w":
+        return th, ("1M",)
 
     if ohlc is None or len(ohlc) < 2:
-        if th == "1d":
-            return th, ("1w",)
-        return th, ("1w", "1d")
-
-    sp = _infer_data_timeframe(ohlc)
-    tm = TF_FINE_TO_COARSE.get(th, 0)
-    sm = TF_FINE_TO_COARSE.get(sp, 0) if sp else 0
-    _1d_m = TF_FINE_TO_COARSE["1d"]
-
-    if tm > 0 and sm > 0:
-        tf_res = sp if sm < tm else th
-        eff_min = min(tm, sm)
-    elif sm > 0:
-        tf_res = sp
-        eff_min = sm
-    else:
         tf_res = th
-        eff_min = tm
+    else:
+        sp = _infer_data_timeframe(ohlc)
+        tm = TF_FINE_TO_COARSE.get(th, 0)
+        sm = TF_FINE_TO_COARSE.get(sp, 0) if sp else 0
+        if tm > 0 and sm > 0:
+            tf_res = sp if sm < tm else th
+        elif sm > 0:
+            tf_res = sp
+        else:
+            tf_res = th
 
-    if eff_min <= 0 or eff_min >= _1d_m:
-        return tf_res, ("1w",)
-    return tf_res, ("1w", "1d")
+    if th == "1d":
+        return tf_res, ("1M", "1w")
+    return tf_res, ("1M", "1w", "1d")
 
 
 def _major_tf_sources_for_chart(chart_tf: str, ohlc: pd.DataFrame | None = None) -> tuple[str, ...]:
@@ -107,11 +104,13 @@ def _major_tf_sources_for_chart(chart_tf: str, ohlc: pd.DataFrame | None = None)
     if ohlc is not None and len(ohlc) >= 2:
         return _major_sources_and_resample_tf(chart_tf, ohlc)[1]
     tf = _canonical_chart_tf(chart_tf)
-    if tf not in TF_FINE_TO_COARSE or tf in ("1w", "1M"):
+    if tf not in TF_FINE_TO_COARSE or tf == "1M":
         return ()
+    if tf == "1w":
+        return ("1M",)
     if tf == "1d":
-        return ("1w",)
-    return ("1w", "1d")
+        return ("1M", "1w")
+    return ("1M", "1w", "1d")
 
 # Internal: ("resample", child_tf) z nativních dat (_view_ohlc_native), jinak pivot/synthetic fallback;
 # ("synthetic",) = jemné pivoty na chart OHLC; u 30m navíc 30m_internal mikro-swiny.
@@ -119,7 +118,7 @@ TF_INTERNAL_SPEC: dict[str, tuple] = {
     "1m": ("synthetic",),
     "5m": ("synthetic",),
     "15m": ("resample", "5m"),
-    "30m": ("synthetic",),
+    "30m": ("resample", "15m"),
     "1h": ("resample", "30m"),
     "4h": ("resample", "1h"),
     "1d": ("resample", "4h"),
@@ -154,30 +153,30 @@ TF_CONFIG = {
 VIEW_PARAMS = {
     "timeframe": "1d",
     "data_timeframe": "",
-    # atr_period / min_bars_between_swings / window_bars — z TF_CONFIG podle TF grafu (4h ≠ 1d preset).
+    "sensitivity": 1.0,
     "atr_multiplier": 1.65,
+    "include_internals": False,
+    "acceptance_bars": 1,
     "max_bars": 180,
+    "bos_include_internal_pivots": 0,
+}
+
+# Internal defaults – not exposed in UI but still respected if passed by strategy/other module.
+_VIEW_PARAMS_INTERNAL = {
     "max_candidate_bars": 0,
     "allow_unconfirmed_last_swing": True,
     "min_pullback_atr_ratio": 0.42,
-    "sensitivity": 1.0,
     "swing_sparsity": 1.12,
-    "include_internals": False,
-    "acceptance_bars": 1,
-    # BOS: ve „chmýří“ těsných high/low ponechat jen nejextrémnější pivot (viz _collapse_bos_pivot_clusters).
     "bos_pivot_cluster_max_bars": 6,
     "bos_pivot_cluster_atr_mult": 0.35,
-    # Po spojení streamů swing/major/internal: v jednom range sloučit BOS stejného směru
-    # na jednu událost (nejvyšší high / nejnižší low v pásmu ATR × mult, swing_index do max_bar okna).
     "bos_range_merge_atr_mult": 2.5,
-    "bos_range_merge_max_swing_bars": 25,
+    "bos_range_merge_max_swing_bars": 20,
     "ema_fast": 9,
     "ema_medium": 21,
     "ema_slow": 50,
     "trend_line_ema_period": 150,
     "structure_lookback_swings": 4,
     "trend_score_smooth_period": 8,
-    # Mezi dvěma swing high bez low v mezeře vložit low na nejnižší low v mezeře (symetricky high mezi LL).
     "force_extremes_between_same_swings": True,
 }
 
@@ -285,6 +284,9 @@ def _chart_tf_for_hierarchy(
     2) data_timeframe z requestu, pokud není v rozporu s odhadnutým krokem z OHLC:
        pokud je data_tf hrubší než inference (např. deklarace 1d při skutečných 4h baru), ignorovat — typicky
        zastaralý stav z UI / zone sync.
+       Pokud je data_tf **jemnější** než inference (soubor 30m, graf přepočítán na 4h), **také** ignorovat —
+       jinak by skončila hierarchie na „30m“ nad 4h svíčkami a major zdroje (1M/1w/1d) a mapování majorů
+       neseděly s grafem (uživatel nevidí 1d jako major na 4h).
     3) Inference z mediánu mezer < 48 h mezi bary (kvůli víkendům / mezerám).
     4) timeframe_param + jemnější krok OHLC (_refine_chart_tf_with_bar_spacing).
     """
@@ -305,7 +307,12 @@ def _chart_tf_for_hierarchy(
         if inferred and inferred in TF_FINE_TO_COARSE:
             if TF_FINE_TO_COARSE[data_c] > TF_FINE_TO_COARSE[inferred]:
                 stale_coarser = True
-        if not stale_coarser:
+        # Grafové OHLC je hrubší než nativní data_tf (agregace ve View) → TF struktury = podle řady v df.
+        chart_coarser_than_native_meta = False
+        if inferred and inferred in TF_FINE_TO_COARSE and data_c in TF_FINE_TO_COARSE:
+            if TF_FINE_TO_COARSE[data_c] < TF_FINE_TO_COARSE[inferred]:
+                chart_coarser_than_native_meta = True
+        if not stale_coarser and not chart_coarser_than_native_meta:
             return _refine_chart_tf_with_bar_spacing(data_c, ohlc)
 
     if inferred:
@@ -976,7 +983,12 @@ def get_swings(
 
     wf_min = TF_FINE_TO_COARSE.get(work_tf, 1440)
     if max_bars > 0 and wf_min >= 60:
-        _rolling_min_len = max(12000, int(max_bars * 30))
+        # Denní svíce: typicky 2–5k barů na ~15 let — obecný práh 12k rolling nikdy nezapne a jeden
+        # průchod _get_swings_core na celé řadě degraduje; intradenně necháme vyšší práh.
+        if work_tf == "1d":
+            _rolling_min_len = max(400, int(max_bars * 3))
+        else:
+            _rolling_min_len = max(12000, int(max_bars * 30))
     elif max_bars > 0:
         _rolling_min_len = max(15000, int(max_bars * 2))
     else:
@@ -1072,7 +1084,7 @@ def get_swings(
 
 
 def _dedupe_merged_major_swings(majors: list[dict]) -> list[dict]:
-    """Sloučí téměř totožné major markery ze zdrojů 1W+1D (stejný typ, blízký index)."""
+    """Sloučí téměř totožné major markery ze zdrojů 1M+1w (+ u intraday i 1d), stejný typ, blízký index."""
     if len(majors) < 2:
         return sorted(majors, key=lambda x: int(x["index"]))
     tol = MAJOR_SWING_INDEX_TOLERANCE
@@ -1105,8 +1117,8 @@ def _dedupe_merged_major_swings(majors: list[dict]) -> list[dict]:
 
 def get_major_swings(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     """
-    Major Swing H/L – u 1D jen z 1W; u 4h a jemněji z 1W i 1D (swing body obou TF),
-    namapované na indexy vstupního (chart) OHLC.
+    Major Swing H/L — na **1d** grafu z **1M + 1w**; na **1w** z **1M**; na TF jemnějších než 1d
+    výhradně z **1d** (denní swingy namapované na indexy vstupního OHLC).
     Vrací [{"type":"major_high"|"major_low","price","index","timestamp"}, ...].
     """
     params = dict(params or {})
@@ -1137,7 +1149,7 @@ def get_major_swings(ohlc: pd.DataFrame, params: dict | None = None) -> list[dic
         if major_tf not in TF_CONFIG:
             continue
         resampled = _resample_ohlc(ohlc, major_tf, dt_arg, source_tf_effective=tf_resample)
-        min_resampled = 6 if major_tf == "1w" else 10
+        min_resampled = 6 if major_tf in ("1w", "1M") else 10
         if resampled is ohlc or resampled is None or len(resampled) < min_resampled:
             continue
 
@@ -1308,13 +1320,14 @@ def _internals_from_hierarchy(
     inferred_native = _infer_data_timeframe(native)
     nmin = TF_FINE_TO_COARSE.get(inferred_native or "", 999999)
     cmin = TF_FINE_TO_COARSE.get(child_tf, 0)
-    if nmin > cmin:
+    if nmin < cmin:
         src_nat = _canonical_chart_tf(inferred_native) if inferred_native else None
         sn = src_nat if src_nat in TF_FINE_TO_COARSE else None
         child_ohlc = _resample_ohlc(native, child_tf, inferred_native, source_tf_effective=sn)
     elif nmin == cmin:
         child_ohlc = native
     else:
+        # native is COARSER than child TF - cannot resample down, fall back
         if ctf == "30m":
             return _internals_micro_swings_30m(swings, chart_ohlc, major_swings, tuning)
         return _internals_synthetic_pivots(swings, chart_ohlc, major_swings, pivot_source_ohlc)
@@ -1786,9 +1799,7 @@ def get_bos(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     p_fetch["omit_swings_overlapping_major"] = False
     # Stejné H/L chování jako detect() — výchozí True ve get_swings by ořízlo swingy oproti grafu.
     p_fetch["require_hl_alternation"] = False
-    # Pro BOS vždy jeden průchod přes celou řadu — při max_bars>0 a dlouhém intradenním feedu by jinak aktivovalo
-    # rolling okno a chyběly by swingy v části řady (BOS mizí ke konci grafu).
-    p_fetch["max_bars"] = 0
+    # Stejné max_bars / rolling jako get_swings (VIEW / precompute); max_bars=0 v params vynutilí jeden průchod.
     swing_res = get_swings(ohlc, p_fetch)
     swings = swing_res.get("swings", []) if isinstance(swing_res, dict) else (swing_res or [])
     internals = swing_res.get("internals", []) if isinstance(swing_res, dict) else []
@@ -1809,7 +1820,7 @@ def get_bos(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     results = _find_bos_from_swings(ohlc, swings_bos, params or {}, bos_swing_kind="swing")
     results_major = _find_bos_from_swings(ohlc, major_bos, params or {}, bos_swing_kind="major")
     results_internal: list[dict] = []
-    if bool(int(params.get("bos_include_internal_pivots", 1))):
+    if bool(int(p.get("bos_include_internal_pivots", 1))):
         results_internal = _find_bos_from_swings(ohlc, internals_bos, params or {}, bos_swing_kind="internal")
     results = sorted(results + results_major + results_internal, key=lambda x: x["bos_index"])
     results = _merge_bos_events_in_consolidation_ranges(results, ohlc, p)

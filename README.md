@@ -12,6 +12,7 @@ Webová aplikace pro testování obchodních strategií na historických datech.
 | **SCRIPTS.md** | Příkazy: backend, frontend, troubleshooting při spuštění. |
 | **audit/** | Uložené audity (risk, quant, UX, výkon, …) — **index:** **audit/README.md**. |
 | **docs/QUANT_AUDIT.md** | Hlubší technický audit dat, exekuce a engine (doplňuje README). |
+| **docs/BACKTEST_PIPELINE_REFACTOR.md** | Plán a stav pipeline: **`.backtest_artifacts/`**, H/L + S/D precompute, View z cache, `use_sd_artifacts`, rollout (Příloha C = audit fází). |
 
 **Účel tohoto souboru:** technická dokumentace pro hodnocení workflow, deployment a code review. Popisy polí v UI drží **`frontend/components/backtestFieldMeta.ts`** a průvodce **`frontend/data/guideContent.ts`** + **`/guide`** — při změně funkcí je aktualizuj společně s **READMEADAM.md**.
 
@@ -58,6 +59,9 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 13. **View mode** – graf bez backtestu; View params drawer pro `VIEW_PARAMS`.
 14. **Uložit / Uloženo** – stav tlačítka podle změn v editoru.
 15. **Guide** – plovoucí **?** → `/guide` (obsah `guideContent.ts`); u polí **?** → `backtestFieldMeta.ts`.
+16. **Precompute artefaktů (H/L + S/D)** – CLI `python -m app.services.hl_precompute` / `python -m app.services.sd_precompute` ukládá Parquet + manifesty pod **`.backtest_artifacts/{dataset_id}/`**. Složka je v **`.gitignore`**. Stejný `dataset_id` používá View, build v UI a runner při `use_sd_artifacts=1`.
+17. **View z cache** – v `StrategyViewChart` lze zapnout **H/L + S/D z cache** (`POST /api/view` s `use_artifacts: true`); bez přepočtu modulů na serveru. Řádek **Cache (dataset)** + **Build features** volá `POST /api/artifacts/build` a `POST /api/artifacts/status`.
+18. **Backtest se S/D Parquet** – parametr strategie `use_sd_artifacts`: runner ověří `sd/v1/zones.parquet`, nastaví `USE_SD_ARTIFACTS` + `SD_ARTIFACT_ZONES_PATH`. Při `0` sanitizuje env (legacy větev `get_zones`). Detaily: `docs/BACKTEST_PIPELINE_REFACTOR.md`.
 
 ### 1.2 Architektura (vysokoúrovňově)
 
@@ -79,9 +83,10 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 │  BACKEND (FastAPI, Python)                                                   │
 │  - GET /api/data: seznam instrumentů (mock/*, futures_30m/*.txt)               │
 │  - POST /api/run?stream=1: spuštění backtestu (SSE: log, progress, result)    │
-│  - POST /api/view: OHLC + markery/čáry z modulu, View params                  │
+│  - POST /api/view: OHLC + markery/čáry/zóny (live modul nebo use_artifacts z cache) │
+│  - POST /api/artifacts/status, POST /api/artifacts/build: stav a synchronní build H/L→S/D │
 │  - POST /api/chart: generace PNG grafu (mplfinance)                          │
-│  - services/runner.py: subprocess nebo volitelně in-process engine, stream výstupu │
+│  - services/runner.py: subprocess nebo volitelně in-process engine; USE_SD_ARTIFACTS dle PARAMS │
 └─────────────────────────────────────────────────────────────────────────────┘
                                         │
                                         │ subprocess (stejný Python / venv)
@@ -90,9 +95,17 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 │  BACKTEST ENGINE (backend/docker/engine.py na hostu)                         │
 │  - načte strategii, data, spustí Backtrader                                  │
 │  - Cesty: STRATEGY_PATH, DATA_PATH, DATA_CACHE_PATH (absolutní na disku)      │
+│  - Volitelně: načtení sd/v1/zones.parquet (use_sd_artifacts) — viz env v runneru │
 │  - Výstup: JSON na stdout, PROGRESS:X na stderr                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 1.2a Artefakty a dataset_id (shrnutí)
+
+- **Úložiště:** `{repo}/.backtest_artifacts/{dataset_id}/hl/v1/…`, `…/sd/v1/zones.parquet` — výpočet `dataset_id` v [`artifact_store.py`](backend/app/services/artifact_store.py) (stejná logika pro precompute, view a run).
+- **Precompute:** [`hl_precompute.py`](backend/app/services/hl_precompute.py), [`sd_precompute.py`](backend/app/services/sd_precompute.py); spec Major TF: [`hl_artifact_spec.py`](backend/app/services/hl_artifact_spec.py).
+- **View:** [`view_artifacts.py`](backend/app/services/view_artifacts.py) čte Parquet a skládá odpověď pro graf.
+- **Úplný stav vs plán:** Příloha C v `docs/BACKTEST_PIPELINE_REFACTOR.md` (100 % cílového „event engine“ zatím ne).
 
 ### 1.3 Provoz na hostu (single-user)
 
@@ -152,7 +165,7 @@ Backtesting_app/
 │   │   ├── charts/
 │   │   │   ├── ModuleOutputChart.tsx # Detailed + výsledky: OHLC Plotly + zóny/čáry + obchody
 │   │   │   ├── DetailedChart.tsx   # (další candlestick / legacy cesty)
-│   │   │   ├── EquityChart.tsx     # Lightweight Charts, downsample equity
+│   │   │   ├── EquityChart.tsx     # Plotly equity (+ kumulativní R v ResultsView)
 │   │   │   ├── TradesChart.tsx
 │   │   │   └── TradeHighlightChart.tsx # Okno entry–exit pro jeden obchod
 │   │   ├── StrategyViewChart.tsx # View mode – Plotly candlestick + H/L markery, View params drawer (ikona vedle Obnovit)
@@ -179,10 +192,12 @@ Backtesting_app/
 │   │   ├── api/
 │   │   │   ├── run.py           # POST /api/run (streaming / non-streaming)
 │   │   │   ├── data.py          # GET /api/data, GET /api/data/debug
-│   │   │   ├── view.py          # POST /api/view (OHLC + markery/čáry z modulu, View params)
+│   │   │   ├── view.py          # POST /api/view (modul nebo use_artifacts)
+│   │   │   ├── artifacts.py     # POST /api/artifacts/status, /api/artifacts/build
 │   │   │   └── chart.py         # POST /api/chart (PNG)
 │   │   ├── services/
-│   │   │   ├── runner.py        # Subprocess engine, streamování + manifest metadata
+│   │   │   ├── runner.py        # Engine + manifest; env artefaktů vs legacy (viz PARAMS use_sd_artifacts)
+│   │   │   ├── artifact_store.py, hl_precompute.py, sd_precompute.py, view_artifacts.py, artifact_api_service.py
 │   │   │   ├── audit.py         # Append-only audit logger
 │   │   │   └── chart.py         # mplfinance generace grafu
 │   │   └── models/
@@ -212,7 +227,9 @@ Backtesting_app/
 ├── examples/                    # Příklady modulů/indikátorů ke kopírování
 ├── audit/                       # Auditní reporty (lidské) — seznam v audit/README.md
 ├── docs/
-│   └── QUANT_AUDIT.md           # Technický quant audit (data, exekuce, metriky)
+│   ├── QUANT_AUDIT.md           # Technický quant audit (data, exekuce, metriky)
+│   └── BACKTEST_PIPELINE_REFACTOR.md  # Artefakty, precompute, View cache, rollout
+├── .backtest_artifacts/         # Runtime cache (gitignored) — H/L + S/D Parquet
 └── SCRIPTS.md                   # Příkazy, skripty, troubleshooting
 ```
 
@@ -243,7 +260,7 @@ Backtesting_app/
 | 11 | (Volitelně) Upraví **Strategy Parameters** | `parseStrategyParams(main.py)` → dynamické inputy v Parameter Panel |
 | 12 | Nastaví **Délku** (roky) | `years` state |
 | 13 | Klikne **Run** | `handleRun()` – viz níže |
-| 14 | (Volitelně) Klikne **View** | Přepne na View chart – svíčkový graf s mock daty, výběr modulu/indikátoru pro vizualizaci H/L bodů; ikona params vedle Obnovit otevře drawer s parametry |
+| 14 | (Volitelně) Klikne **View** | OHLC graf; live modul nebo **H/L + S/D z cache**; Build features + stav cache; drawer `VIEW_PARAMS` u Obnovit |
 | 15 | (Volitelně) Uloží soubor | Tlačítko „Uložit“ se změní na „Uloženo“ (disabled); po změně kódu zpět na „Uložit“ |
 
 ### 3.3 Run backtest – detailní tok
@@ -311,7 +328,8 @@ Backtesting_app/
 
 1. Vytvoří `.backtest_run/` v project root
 2. `_prepare_strategy_files()`: zapíše soubory do `.backtest_run/`, vytvoří `indicators/__init__.py`, `modules/__init__.py` pokud potřeba
-3. Spustí **subprocess** `python backend/docker/engine.py` *nebo* při `RUN_INPROCESS_ENGINE=1` zavolá `execute_backtest_from_environ()` v tom samém procesu (`engine_inprocess.py`). Env obsahuje mimo jiné `STRATEGY_PATH`, `DATA_PATH`, `DATA_CACHE_PATH`, `HOST_DATASET_FINGERPRINT`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `INITIAL_CAPITAL`, `STRATEGY_PARAMS`, `RUN_SEED`, `CODE_DIGEST`, `ACTOR_ID`, `PYTHONPATH` = kořen repa **+** `backend` (import `app.services.*`, `examples.*`, …).
+3. Spustí **subprocess** `python backend/docker/engine.py` *nebo* při `RUN_INPROCESS_ENGINE=1` zavolá `execute_backtest_from_environ()` v tom samém procesu (`engine_inprocess.py`). Env obsahuje mimo jiné `STRATEGY_PATH`, `DATA_PATH`, `DATA_CACHE_PATH`, `HOST_DATASET_FINGERPRINT`, `INSTRUMENT`, `TIMEFRAME`, `YEARS`, `DATA_FILE`, `INITIAL_CAPITAL`, `STRATEGY_PARAMS`, `RUN_SEED`, `CODE_DIGEST`, `ACTOR_ID`, `PYTHONPATH` = kořen repa **+** `backend` (import `app.services.*`, `examples.*`, …).  
+   Pokud `use_sd_artifacts=1` ve `STRATEGY_PARAMS`: ověří se existence `zones.parquet` pro vypočtené `dataset_id`; nastaví se `USE_SD_ARTIFACTS=1` a `SD_ARTIFACT_ZONES_PATH`. Jinak `USE_SD_ARTIFACTS=0` a `SD_ARTIFACT_ZONES_PATH` se z env **odebere** (aby host `.env` nekřížil legacy run).
 4. Čte stdout/stderr v odděleném vlákně
 5. Parsuje JSON z stdout → `{"equity": [...], "metrics": {...}, "trades": [...], "ohlc": [...]}` → event `result`
 6. Pokud `applied_modules` v requestu: `engine.py` dopočítá `moduleOutputs` (detect/get_line/get_zones) a vrátí je v JSON výsledku
@@ -456,7 +474,7 @@ Backtesting_app/
 |---------|---------|-------|
 | **Equity** | `1` | `EquityChart` – křivka equity v čase + underwater chart |
 | **Highlight** | `2` | `TradeHighlight` – jeden obchod (entry–exit) + seznam obchodů |
-| **Detailed** | `3` | OHLC + markery/zóny + obchody (výřez času, agregace TF, RRR styl) |
+| **Detailed** | `3` | OHLC + markery/zóny + obchody; volitelně **vrstvy z `.backtest_artifacts`** (stejný `/api/view` jako Strategy View) |
 | **Analytics** | `4` | Manifest strip (zkrácený); S/D analytika; param test v `<details>`; validace, MC, DD, PnL dist, Bootstrap CI, Edge decomposition, Prop red flags, readiness/overfitting v „Obecná analytika" |
 | **Run history** | `5` | `RunHistory` – uložené runy, compare, lifecycle, grafy metrik, sloupec readiness |
 
@@ -541,13 +559,18 @@ Backtesting_app/
 
 ### 5.1 Co je View mode
 
-**View** je záložka vedle Results, kde vidíš svíčkový graf s OHLC daty a volitelně **markery** (body) nebo **čáry** (indikátory) z tvého kódu – bez spuštění backtestu. Slouží k rychlé vizualizaci toho, jak modul/indikátor/strategie funguje na datech.
+**View** je záložka vedle Results, kde vidíš svíčkový graf s OHLC daty a vrstvy struktury (swingy, zóny, trend) — **bez plného backtestu**.
+
+**Dva režimy vrstev (H/L + S/D):**
+
+1. **Live modul** — `POST /api/view` spustí `view_engine.py`, zavolá `detect` / `get_line` / `get_zones` nad (případně resamplovaným) DataFrame.
+2. **Z cache (`use_artifacts`)** — server přečte Parquet z **`.backtest_artifacts/`** (`view_artifacts.py`); žádný přepočet Python modulu na serveru. Vyžaduje předchozí **Build features** (H/L → S/D) nebo CLI precompute.
 
 **Typický workflow:**
-1. Vytvoříš indikátor (např. EMA) nebo modul (např. swing H/L)
-2. Přepneš na záložku **View**
-3. Vybereš instrument, období a modul/indikátor/strategii
-4. Graf se zobrazí s čárami nebo markery z tvého kódu
+1. Vytvoříš indikátor nebo modul (případně strategii s `detect`)
+2. Přepneš na záložku **View**, vybereš instrument a roky
+3. Buď zapneš **H/L + S/D z cache** + případně **Build features**, nebo necháš live modul a upravíš `VIEW_PARAMS` (drawer u Obnovit)
+4. Graf zobrazí OHLC + markery/čáry/zóny dle režimu
 
 ### 5.2 Rozhraní pro View (detect, get_line, get_zones)
 
@@ -791,23 +814,34 @@ Spustí backtest.
 
 ### POST /api/view
 
-OHLC data + volitelné markery a čáry z modulu/indikátoru/strategie pro View chart.
+OHLC + markery / čáry / zóny pro View chart.
 
-**Body:** `{ data_file, years, module_code?, params?, module_dependencies?, chart_timeframe? }` — `chart_timeframe`: `null`/`native` = zdrojová jemnost; jinak agregace svíček (`1m`…`1Mo`) před modulem i grafem (pouze hrubší než nativní bary).
+**Body (zjednodušeně):** `data_file`, `years`, volitelně `module_code`, `params`, `module_dependencies`, `chart_timeframe`, `start_iso` / `end_iso`, `use_artifacts`, `artifact_include_sd`, `artifact_dataset_id`.
 
-**Response:** `{ ohlc: [...], markers: [...], lines: [{ name, data: [...] }, ...] }`
+- **`chart_timeframe`:** `null`/`native` = zdrojová jemnost; jinak agregace (`1m`…`1Mo`).
+- **`use_artifacts: true`:** vrstvy z **`.backtest_artifacts/`** (bez přepočtu modulu). Odpověď může obsahovat `zones`, `artifact_status`, `artifact_banner`, `dataset_id`.
 
-**Rozhraní (modul, indikátor i strategie):**
+**Response:** `{ ohlc, markers, lines, zones?, artifact_status?, artifact_banner?, dataset_id? }`
+
+**Live modul (bez `use_artifacts`):** rozhraní `detect` / `get_line` / `get_zones`:
 - `detect(ohlc, params=None)` → markery: `[{"date", "type": "high"|"low"|"signal", "value"}, ...]`
 - `get_line(ohlc, params=None)` → čáry: `[{"date", "value"}, ...]` nebo `{"EMA20": [...], "EMA50": [...]}`
 
-**View execution:** Pokud je v requestu `module_code`, backend spouští `view_engine.py` jako host subprocess (stejný Python jako backend).
+**View execution:** Pokud je v requestu `module_code` a nepoužívá se `use_artifacts`, backend spouští `view_engine.py` jako host subprocess (stejný Python jako backend).
 
 **View params:** Pokud modul definuje `VIEW_PARAMS = {...}`, frontend posílá `params` v requestu; backend předává `params` do `detect`/`get_line` (pokud funkce druhý argument přijímá).
 
 **Barva čar:** `get_line` může vracet `{"název": {"data": [...], "color": "#hex"}}` – frontend použije barvu v grafu.
 
-Viz `examples/view_interface.md`, `examples/hl_module_template.py`, `examples/ema_indicator_view.py`, `examples/ema_indicator_mock.py`.
+Viz `examples/view_interface.md`, `examples/hl_module_template.py`, `examples/ema_indicator_view.py`, `examples/ema_indicator_mock.py`. Plán artefaktů: **`docs/BACKTEST_PIPELINE_REFACTOR.md`**.
+
+### POST /api/artifacts/status
+
+Stav H/L a S/D vrstev pro `data_file` + `years` (stejný klíč jako View / precompute). Odpověď: např. `dataset_id`, `hl`, `sd`, `overall` / `overall_label` pro badge ve UI.
+
+### POST /api/artifacts/build
+
+Synchronní build: H/L precompute (pokud potřeba), poté S/D precompute. Tělo obsahuje `data_file`, `years`, volitelně `zone_timeframes` (sladění se strategií). Může trvat minuty — UI zobrazí průběh / chybu.
 
 ### POST /api/chart
 

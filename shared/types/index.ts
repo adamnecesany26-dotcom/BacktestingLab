@@ -113,6 +113,10 @@ export interface Trade {
   exitReason?: string;
   /** Volitelná metadata ze strategie (např. S/D zóna) */
   zoneMeta?: Record<string, unknown>;
+  /** Počáteční riziko obchodu v měně účtu (pokud engine doplní). */
+  initialRiskUsd?: number;
+  /** Realizovaný PnL v násobcích počátečního rizika (pokud engine doplní). */
+  tradeR?: number;
 }
 
 /** Equity point with date */

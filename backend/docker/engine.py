@@ -2547,6 +2547,10 @@ def _module_zone_dict_for_chart(item: dict) -> dict | None:
         zone["inducement_count"] = int(item["inducement_count"])
     if "inducement_points" in item:
         zone["inducement_points"] = int(item["inducement_points"])
+    if "bos_swing_kind" in item:
+        zone["bos_swing_kind"] = str(item["bos_swing_kind"])
+    if "zone_origin" in item:
+        zone["zone_origin"] = str(item["zone_origin"])
     ptf = item.get("_primary_tf") or item.get("_source_tf")
     if ptf:
         zone["primaryTf"] = str(ptf)

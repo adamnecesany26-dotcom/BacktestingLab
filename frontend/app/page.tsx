@@ -7,7 +7,7 @@ import { StrategyEditor } from "@/components/editor/StrategyEditor";
 import { CreateModal } from "@/components/CreateModal";
 import { AddFileModal } from "@/components/AddFileModal";
 import { BacktestSettings, MAX_INSTRUMENTS_BATCH } from "@/components/BacktestSettings";
-import type { CommissionMode, EdgeFindingSettings } from "@/components/BacktestSettings";
+import type { EdgeFindingSettings } from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
 import { LogPanel } from "@/components/LogPanel";
@@ -32,6 +32,7 @@ import {
 } from "@/lib/firestore";
 import { ensureAnonymousSession } from "@/lib/firebase";
 import { runBacktestStreaming, getAvailableData } from "@/lib/api";
+import { MIN_BACKTEST_YEARS } from "@/lib/dataRange";
 import {
   parseStrategyParams,
   parseStrategyParamBundle,
@@ -43,6 +44,11 @@ import {
   type StrategyParams,
   type StrategyParamsMeta,
 } from "@/lib/strategyParams";
+import {
+  strategyParamTouchedFromBaseline,
+  buildBacktestSavePayload,
+} from "@/lib/backtestPageUtils";
+import { useBacktestExecutionParams } from "@/hooks/useBacktestExecutionParams";
 import {
   filterInstrumentsByType,
   type RunRequest,
@@ -62,31 +68,6 @@ const DEFAULT_EXPANDED_SIDEBAR: Record<ItemType, boolean> = {
   indicators: false,
   modules: false,
 };
-
-/**
- * Mirrors backend OHLC export indexing (docker/engine.py): uniform subsample when
- * fullBarCount > ohlcLength, else one row per bar.
- */
-function ohlcExportBarIndices(fullBarCount: number, ohlcLength: number): number[] {
-  if (fullBarCount <= 0 || ohlcLength <= 0) return [];
-  if (fullBarCount <= ohlcLength) {
-    return Array.from({ length: fullBarCount }, (_, i) => i);
-  }
-  const step = fullBarCount / ohlcLength;
-  const indices = Array.from({ length: ohlcLength }, (_, i) => Math.floor(i * step));
-  if (indices[ohlcLength - 1] !== fullBarCount - 1) {
-    indices[ohlcLength - 1] = fullBarCount - 1;
-  }
-  return indices;
-}
-
-/** True if panel value differs from PARAMS snapshot taken when strategy was opened (string compare). */
-function strategyParamTouchedFromBaseline(
-  current: StrategyParams[keyof StrategyParams] | undefined,
-  baseline: StrategyParams[keyof StrategyParams] | undefined,
-): boolean {
-  return String(current ?? "") !== String(baseline ?? "");
-}
 
 export default function Home() {
   const runLockRef = useRef(false);
@@ -126,35 +107,7 @@ export default function Home() {
   /** PARAM_MODULE_CHAIN z uloženého main.py (když v editoru není otevřený main.py). */
   const [savedMainParamModuleChain, setSavedMainParamModuleChain] = useState<string[]>([]);
   const [years, setYears] = useState(1);
-  const [backtestParams, setBacktestParams] = useState<{
-    initialCapital: number;
-    slippagePerc: number;
-    commissionPerc: number;
-    commissionMode: CommissionMode;
-    commissionPerContract: number;
-    instrumentType: InstrumentType;
-    tickSize?: number;
-    valuePerTick?: number;
-    shareSize?: number;
-    lotSize?: number;
-    pipSize?: number;
-    pipValue?: number;
-    runTimeoutSec: number;
-  }>({
-    initialCapital: 100000,
-    slippagePerc: 0.001,
-    commissionPerc: 0.0,
-    commissionMode: "percentage",
-    commissionPerContract: 2.25,
-    instrumentType: "futures",
-    tickSize: 0.25,
-    valuePerTick: 5,
-    shareSize: 100,
-    lotSize: 1,
-    pipSize: 0.0001,
-    pipValue: 10,
-    runTimeoutSec: 3600,
-  });
+  const [backtestParams, setBacktestParams] = useBacktestExecutionParams();
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
   const [strategyParamMeta, setStrategyParamMeta] = useState<StrategyParamsMeta>({});
@@ -1075,7 +1028,7 @@ export default function Home() {
         );
       }
       if (strategyContext) {
-        const payload = buildSavePayload(data, runRequest);
+        const payload = buildBacktestSavePayload(data, runRequest);
         try {
           await saveBacktestResult(strategyContext.id, strategyContext.name, payload);
           const history = await listBacktestResults(strategyContext.id);
@@ -1113,49 +1066,7 @@ export default function Home() {
     abortController?.abort();
   };
 
-  function buildSavePayload(data: RunResponse, request?: RunRequest) {
-    let equityCurve = data.equityCurve;
-    if (!equityCurve?.length && data.equity?.length && data.ohlc?.length) {
-      const first = data.ohlc[0]?.date;
-      const d = first ? new Date(first) : null;
-      if (d) d.setDate(d.getDate() - 1);
-      const dayBefore = d?.toISOString() ?? "0";
-      const eq = data.equity!;
-      const fullBarCount = Math.max(0, eq.length - 1);
-      const barIdx = ohlcExportBarIndices(fullBarCount, data.ohlc.length);
-      equityCurve = [
-        { date: dayBefore, value: eq[0] ?? 0 },
-        ...data.ohlc.map((o, k) => ({
-          date: o.date,
-          value: eq[(barIdx[k] ?? k) + 1] ?? 0,
-        })),
-      ];
-    } else if (!equityCurve?.length && data.equity?.length) {
-      equityCurve = data.equity.map((v, i) => ({ date: String(i), value: v }));
-    }
-    return {
-      runId: data.runId ?? null,
-      manifest: {
-        ...(data.manifest ?? {}),
-        request: request ?? null,
-      },
-      equityCurve: equityCurve ?? [],
-      metrics: data.metrics,
-      trades: data.trades,
-      validation: data.validation ?? null,
-      robustness: data.robustness ?? null,
-      monteCarlo: data.monteCarlo ?? null,
-      regimeAnalysis: data.regimeAnalysis ?? null,
-      portfolio: data.portfolio ?? null,
-      executionSummary: data.executionSummary ?? null,
-      qualityGate: data.qualityGate ?? null,
-      experiment: data.experiment ?? null,
-      batchSummary: data.batchSummary ?? null,
-      methodologyNotes: (data.manifest?.methodology as Record<string, string> | undefined) ?? null,
-    };
-  }
-
-  const getExportPayload = () => (results ? buildSavePayload(results) : null);
+  const getExportPayload = () => (results ? buildBacktestSavePayload(results) : null);
 
   const handleExport = () => {
     const payload = getExportPayload();
@@ -1284,6 +1195,7 @@ export default function Home() {
               modules={modulesForViewChart}
               indicators={indicators}
               strategies={strategiesForView}
+              defaultDataFile={selectedInstrument?.file}
               strategyZoneSyncCode={openItem?.type === "strategies" ? fileContent : null}
               initialItemId={
                 selectedFile?.startsWith("module:")
@@ -1423,7 +1335,11 @@ export default function Home() {
                 onToggleInstrumentFile={toggleInstrumentFile}
                 onSelectAllInstrumentsInList={selectAllInstrumentFiles}
                 years={years}
-                onYearsChange={(y) => setYears(Math.max(1, Math.min(y, minYearsAcrossSelected)))}
+                onYearsChange={(y) =>
+                  setYears(
+                    Math.max(MIN_BACKTEST_YEARS, Math.min(y, minYearsAcrossSelected))
+                  )
+                }
                 params={backtestParams}
                 onParamsChange={(p) => setBacktestParams((prev) => ({ ...prev, ...p }))}
                 indicators={indicators}

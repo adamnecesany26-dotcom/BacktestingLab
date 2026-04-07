@@ -7,6 +7,19 @@ function parseBarMs(s: string | undefined): number {
   return Date.parse(s);
 }
 
+/** Stejné parsování času jako u řady OHLC — vyhnout se posunu oproti `toISOString()` u naivních řetězců. */
+function formatMsAlignedToOhlc(ms: number, windowOhlc: OhlcBar[]): string {
+  const sample = windowOhlc.find((b) => b.date && b.date.length >= 10)?.date ?? "";
+  const hasExplicitTz =
+    /Z$/i.test(sample) || /[+-]\d{2}:\d{2}$/.test(sample) || /[+-]\d{4}$/.test(sample);
+  if (hasExplicitTz || !sample) {
+    return new Date(ms).toISOString();
+  }
+  const d = new Date(ms);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 /** OHLC výřez + viditelné obchody pro Detailed záložku (výkon). */
 export function computeDetailedChartWindow(
   ohlc: OhlcBar[],
@@ -194,10 +207,12 @@ export function filterModuleOutputToOhlcWindow(
     if (zHi < loMs || zLo > hiMs) continue;
     const newLo = Math.max(zLo, loMs);
     const newHi = Math.min(zHi, hiMs);
+    const startStr = newLo === zLo ? z.date_start : formatMsAlignedToOhlc(newLo, windowOhlc);
+    const endStr = newHi === zHi ? z.date_end : formatMsAlignedToOhlc(newHi, windowOhlc);
     zones.push({
       ...z,
-      date_start: new Date(newLo).toISOString(),
-      date_end: new Date(newHi).toISOString(),
+      date_start: startStr,
+      date_end: endStr,
     });
   }
 
