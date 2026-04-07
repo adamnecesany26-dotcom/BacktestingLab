@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import tempfile
 
+import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -46,18 +47,48 @@ def _to_iso(value) -> str:
         return str(value)
 
 
+def _sanitize_for_json(obj: Any) -> Any:
+    """
+    stdlib json.dumps (FastAPI JSONResponse) neakceptuje NaN/Inf.
+    Rekurzivně nahradí je None; numpy skaláry převede přes .item().
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, np.generic):
+        try:
+            return _sanitize_for_json(obj.item())
+        except (ValueError, TypeError, AttributeError):
+            return None
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
+
+
 def _view_line_point(p: Any) -> dict | None:
     """Bod čáry: date, value; volitelně state, score (trend Swing HL)."""
     if not isinstance(p, dict) or "date" not in p:
         return None
-    pt: dict[str, Any] = {"date": _to_iso(p.get("date", "")), "value": float(p.get("value", 0))}
+    try:
+        v0 = float(p.get("value", 0))
+    except (TypeError, ValueError):
+        v0 = None
+    else:
+        if math.isnan(v0) or math.isinf(v0):
+            v0 = None
+    pt: dict[str, Any] = {"date": _to_iso(p.get("date", "")), "value": v0}
     st = p.get("state")
     if st is not None:
         pt["state"] = str(st)
     sc = p.get("score")
     if sc is not None:
         try:
-            pt["score"] = float(sc)
+            scf = float(sc)
+            if not math.isnan(scf) and not math.isinf(scf):
+                pt["score"] = scf
         except (TypeError, ValueError):
             pass
     return pt
@@ -135,10 +166,39 @@ def _slice_ohlc_by_iso(df: pd.DataFrame, start_iso: str | None, end_iso: str | N
     if df.empty:
         return df
     out = df
+
+    def _parse_bound(raw: str) -> pd.Timestamp:
+        # Make comparisons robust across tz-aware inputs ("...Z") and tz-naive indices.
+        # Policy: compare in tz-naive space if index is tz-naive; otherwise compare in index tz.
+        ts = pd.Timestamp(str(raw).strip())
+        if isinstance(out.index, pd.DatetimeIndex) and out.index.tz is None:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert(None)
+        else:
+            # Index is tz-aware: ensure bound is tz-aware in the same tz.
+            try:
+                tz = out.index.tz  # type: ignore[attr-defined]
+            except Exception:
+                tz = None
+            if tz is not None:
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(tz)
+                else:
+                    ts = ts.tz_convert(tz)
+        return ts
+
     if start_iso and str(start_iso).strip():
-        out = out[out.index >= pd.Timestamp(str(start_iso).strip())]
+        try:
+            s0 = _parse_bound(start_iso)
+        except (ValueError, TypeError, OverflowError) as e:
+            raise ValueError(f"Invalid start_iso: {start_iso!r} ({e})") from e
+        out = out[out.index >= s0]
     if end_iso and str(end_iso).strip():
-        out = out[out.index <= pd.Timestamp(str(end_iso).strip())]
+        try:
+            s1 = _parse_bound(end_iso)
+        except (ValueError, TypeError, OverflowError) as e:
+            raise ValueError(f"Invalid end_iso: {end_iso!r} ({e})") from e
+        out = out[out.index <= s1]
     return out
 
 
@@ -921,14 +981,8 @@ async def get_view_data(req: ViewRequest, request: Request):
             "close": _series_as_float(df_chart, "close", "Close"),
         })
         ohlc = ohlc_df.to_dict(orient="records")
-        markers_out: list = []
-        for m in markers:
-            if isinstance(m, dict):
-                mm = dict(m)
-                mm.pop("bar_index", None)
-                markers_out.append(mm)
-            else:
-                markers_out.append(m)
+        # bar_index musí zůstat v odpovědi — bez něj klient mapuje jen podle `date` a při špatném
+        # nebo sdíleném ISO z artefaktu spadnou stovky swingů na jeden X (vertikální „sloup“).
         append_audit_event(
             action="view.artifacts",
             actor_id=actor_id,
@@ -940,18 +994,18 @@ async def get_view_data(req: ViewRequest, request: Request):
                 "chart_timeframe": req.chart_timeframe,
                 "artifact_status": art["artifact_status"],
                 "dataset_id": art.get("dataset_id"),
-                "markers_count": len(markers_out),
+                "markers_count": len(markers),
             },
         )
-        return {
+        return _sanitize_for_json({
             "ohlc": ohlc,
-            "markers": markers_out,
+            "markers": markers,
             "lines": lines,
             "zones": zones,
             "artifact_status": art["artifact_status"],
             "artifact_banner": art["artifact_banner"],
             "dataset_id": art["dataset_id"],
-        }
+        })
 
     if req.module_code and req.module_code.strip():
         try:
@@ -978,7 +1032,9 @@ async def get_view_data(req: ViewRequest, request: Request):
                     "chart_timeframe": req.chart_timeframe,
                 },
             )
-            return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
+            return _sanitize_for_json(
+                {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
+            )
         except Exception as e:
             err_short = str(e).strip()[:480]
             append_audit_event(
@@ -1015,4 +1071,4 @@ async def get_view_data(req: ViewRequest, request: Request):
     })
     ohlc = ohlc_df.to_dict(orient="records")
 
-    return {"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones}
+    return _sanitize_for_json({"ohlc": ohlc, "markers": markers, "lines": lines, "zones": zones})

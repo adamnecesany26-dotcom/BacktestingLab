@@ -336,22 +336,20 @@ def _hl_row_bar_index(
 ) -> int | None:
     """
     Swing/BOS/trend řádek → index baru na aktuálním df_chart.
-    Pořadí: čas (snap) → lokální bar_index → syrový čas přiložený do [min,max] grafu.
+    Pořadí: **platný bar_index (po offsetu)** → čas ze souboru → syrový čas oříznutý do [min,max].
+
+    Dříve měl čas přednost — špatně parsované / nesouvisející `iso_time` z Parquetu pak uměly
+    `searchsorted` shodit tisíce řádků na jeden bar (stejné datum na grafu i v „Values“).
     """
-    ts_use = _artifact_ts_usable_on_chart(chart_index, iso_cell)
-    if ts_use is not None:
-        return _ts_to_chart_bar_index(chart_index, ts_use)
     bi_cand = _safe_bar_index_for_chart(bi_adj, chart_len) if bi_adj is not None else None
     if bi_cand is not None:
         return bi_cand
-    ts_raw = _coerce_ts_for_chart_index(chart_index, iso_cell)
-    if ts_raw is not None and chart_len > 0 and chart_index is not None and not chart_index.empty:
-        try:
-            t0, t1 = chart_index.min(), chart_index.max()
-            tclip = max(t0, min(t1, ts_raw))
-            return _ts_to_chart_bar_index(chart_index, tclip)
-        except Exception:
-            return None
+    ts_use = _artifact_ts_usable_on_chart(chart_index, iso_cell)
+    if ts_use is not None:
+        return _ts_to_chart_bar_index(chart_index, ts_use)
+    # Dříve zde běžel fallback: tclip = clamp(ts_raw, t0, t1) → searchsorted. Časy z artefaktu
+    # **před** začátkem viditelného okna pak vždy skončily na t0 → jeden bar (první svíčka),
+    # stejné datum u stovek markerů ve Values i na grafu.
     return None
 
 
@@ -407,12 +405,56 @@ def _normalize_hl_marker_type(raw: str, role: str) -> str:
     return t
 
 
+def _ohlc_high_low_at_i(df: pd.DataFrame, i: int) -> tuple[float | None, float | None]:
+    """Vrátí (high, low) i-tého řádku ``df_chart`` jako finitní floaty nebo (None, None)."""
+    if df is None or i < 0 or i >= len(df):
+        return None, None
+    try:
+        row = df.iloc[i]
+    except Exception:
+        return None, None
+    hi: float | None = None
+    lo: float | None = None
+    for hk in ("high", "High"):
+        if hk in row.index:
+            hi = _float_or_none(row[hk])
+            break
+    for lk in ("low", "Low"):
+        if lk in row.index:
+            lo = _float_or_none(row[lk])
+            break
+    return hi, lo
+
+
+def _sync_hl_marker_price_to_ohlc_bar(
+    ohlc_df: pd.DataFrame | None,
+    bi: int,
+    marker_type: str,
+    price: float,
+) -> float:
+    """
+    Cena z Parquet může být z jiného měřítka / starší série než aktuální ``df_chart`` v View
+    (uživatel viděl swingy „u levé osy“ ve špatné výšce při správném X). Pro H/L rodiny
+    vezmeme extrém přímo z načteného OHLC na namapovaném baru.
+    """
+    if ohlc_df is None:
+        return price
+    hi, lo = _ohlc_high_low_at_i(ohlc_df, bi)
+    t = str(marker_type).lower()
+    if t in ("high", "major_high", "internal_high") and hi is not None:
+        return hi
+    if t in ("low", "major_low", "internal_low") and lo is not None:
+        return lo
+    return price
+
+
 def _markers_from_hl_parquet(
     df: pd.DataFrame,
     chart_index: pd.DatetimeIndex,
     role: str,
     *,
     bar_index_offset: int = 0,
+    ohlc_df: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
     df = _normalize_hl_parquet_df(df)
     if df is None or df.empty or chart_index.empty:
@@ -441,6 +483,7 @@ def _markers_from_hl_parquet(
         price = _float_or_none(_row_price_like(rs))
         if price is None:
             continue
+        price = _sync_hl_marker_price_to_ohlc_bar(ohlc_df, bi_final, t, price)
         mk = {"date": _to_iso(chart_index[bi_final]), "type": t, "value": price, "bar_index": bi_final}
         out.append(mk)
     return out
@@ -677,6 +720,22 @@ def build_view_from_artifacts(
     lines: list[dict[str, Any]] = []
 
     if tf_key:
+        if want_tf and tf_key != want_tf:
+            # Make TF fallback explicit (common confusion on intraday: native 30m requested but ladder built only to 1h).
+            warn_tf = (
+                f"H/L artefakty: pro graf ({want_tf}) není k dispozici přesný TF v cache; "
+                f"zobrazuji nejbližší dostupný ({tf_key})."
+            )
+            banner = f"{banner}; {warn_tf}" if banner else warn_tf
+        # If precompute produced quality diagnostics, surface warnings for the selected TF.
+        try:
+            q = (hl_manifest.get("quality") or {}).get(tf_key) or {}
+            warns = q.get("warnings") if isinstance(q, dict) else None
+            if isinstance(warns, list) and len(warns) > 0:
+                qmsg = f"H/L quality ({tf_key}): " + "; ".join(str(w) for w in warns[:4])
+                banner = f"{banner}; {qmsg}" if banner else qmsg
+        except Exception:
+            pass
         arts = (hl_manifest.get("artifacts") or {}).get(tf_key) or {}
         bar_count_raw = arts.get("bar_count")
         artifact_bar_count: int | None
@@ -693,7 +752,11 @@ def build_view_from_artifacts(
             if p.is_file():
                 sw_df = _normalize_hl_parquet_df(pd.read_parquet(p))
                 sw_marks = _markers_from_hl_parquet(
-                    sw_df, chart_index, "swing", bar_index_offset=bi_off
+                    sw_df,
+                    chart_index,
+                    "swing",
+                    bar_index_offset=bi_off,
+                    ohlc_df=df_chart,
                 )
                 if (
                     sw_df is not None
@@ -713,7 +776,11 @@ def build_view_from_artifacts(
             if p.is_file():
                 markers.extend(
                     _markers_from_hl_parquet(
-                        pd.read_parquet(p), chart_index, "internal", bar_index_offset=bi_off
+                        pd.read_parquet(p),
+                        chart_index,
+                        "internal",
+                        bar_index_offset=bi_off,
+                        ohlc_df=df_chart,
                     )
                 )
         maj_name = arts.get("majors")
@@ -722,7 +789,11 @@ def build_view_from_artifacts(
             if p.is_file():
                 markers.extend(
                     _markers_from_hl_parquet(
-                        pd.read_parquet(p), chart_index, "major", bar_index_offset=bi_off
+                        pd.read_parquet(p),
+                        chart_index,
+                        "major",
+                        bar_index_offset=bi_off,
+                        ohlc_df=df_chart,
                     )
                 )
         bos_name = arts.get("bos")

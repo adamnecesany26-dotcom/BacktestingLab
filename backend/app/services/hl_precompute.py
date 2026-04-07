@@ -118,6 +118,7 @@ def run_hl_precompute(
     use_lock: bool = True,
     on_tf_start: Callable[[int, int, str], None] | None = None,
     on_tf_complete: Callable[[int, int, str], None] | None = None,
+    on_tf_step: Callable[[int, int, str, str], None] | None = None,
 ) -> dict[str, Any]:
     """
     Spustí H/L precompute pro jeden dataset; zapíše ``hl/v1/*`` a vrátí metadata včetně ``dataset_id``.
@@ -128,6 +129,9 @@ def run_hl_precompute(
 
     ``on_tf_complete(idx0, n_total, tf_label)`` — po zápisu Parquet pro TF
     (``n_total==0`` → jedno ``on_tf_complete(0,0,\"\")``).
+
+    ``on_tf_step(idx0, n_total, tf_label, step)`` — hrubé milníky uvnitř TF
+    (např. swings/bos/trend/write) pro lepší UI průběh.
     """
     resolved = resolve_safe_data_path(data_dir, data_file)
     if resolved is None:
@@ -142,7 +146,23 @@ def run_hl_precompute(
 
     artifact_store.ensure_dir(lock_path.parent)
     if use_lock and not artifact_store.acquire_lock(lock_path):
-        raise RuntimeError(f"H/L precompute already running or stale lock: {lock_path}")
+        # Provide actionable info: pid/age if present.
+        pid, created_at = artifact_store._read_lock_file(lock_path)  # type: ignore[attr-defined]
+        age_s = None
+        try:
+            import time as _time
+
+            if created_at is not None:
+                age_s = max(0.0, float(_time.time() - float(created_at)))
+        except Exception:
+            age_s = None
+        extra = []
+        if pid is not None:
+            extra.append(f"pid={pid}")
+        if age_s is not None:
+            extra.append(f"age_sec={int(age_s)}")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        raise RuntimeError(f"H/L precompute lock present: {lock_path}{suffix}")
 
     try:
         artifact_store.ensure_dir(hl_dir)
@@ -180,6 +200,7 @@ def run_hl_precompute(
 
         artifacts: dict[str, Any] = {}
         skipped: list[dict[str, str]] = []
+        quality: dict[str, Any] = {}
 
         work_items: list[dict[str, Any]] = []
         for raw_tf in tf_run:
@@ -230,6 +251,8 @@ def run_hl_precompute(
             if on_tf_start is not None:
                 on_tf_start(idx, n_work, str(ctf))
 
+            if on_tf_step is not None:
+                on_tf_step(idx, n_work, str(ctf), "swings")
             swing_res = sh.get_swings(df_chart, p)
             if not isinstance(swing_res, dict):
                 swing_res = {"swings": swing_res or [], "internals": [], "major_swings": []}
@@ -238,11 +261,17 @@ def run_hl_precompute(
             internals = swing_res.get("internals") or []
             majors = swing_res.get("major_swings") or []
 
+            if on_tf_step is not None:
+                on_tf_step(idx, n_work, str(ctf), "bos")
             bos = sh.get_bos(df_chart, p)
+            if on_tf_step is not None:
+                on_tf_step(idx, n_work, str(ctf), "trend")
             line = sh.get_line(df_chart, p)
 
             rel: dict[str, str] = {}
 
+            if on_tf_step is not None:
+                on_tf_step(idx, n_work, str(ctf), "write")
             s_df = pd.DataFrame(_swing_rows(swings, df_chart.index))
             path_sw = hl_dir / f"{tf_key}_swings.parquet"
             s_df.to_parquet(path_sw, index=False)
@@ -289,12 +318,45 @@ def run_hl_precompute(
             rel["trend"] = path_tr.name
             rel["bar_count"] = int(len(df_chart))
 
+            # --- Quality diagnostics (sanity gates) ---
+            bar_count = int(len(df_chart))
+            swing_count = int(len(s_df))
+            internal_count = int(len(i_df))
+            major_count = int(len(m_df))
+            bos_count = int(len(b_df))
+            warn: list[str] = []
+            # Heuristic: on long series, a swing detector returning single digits is almost certainly misconfigured.
+            # Keep this conservative to avoid noisy warnings on very short series.
+            min_swings = int(min(200, max(5, bar_count // 120))) if bar_count >= 60 else 0
+            if min_swings > 0 and swing_count < min_swings:
+                warn.append(
+                    f"too_few_swings: swings={swing_count}, bars={bar_count}, expected>={min_swings}"
+                )
+            # Majors should exist for TFs that define major sources (roughly: 1d and finer) when series is non-trivial.
+            if ctf in ("1d", "4h", "1h", "30m", "15m", "5m", "1m") and bar_count >= 200 and major_count == 0:
+                warn.append(f"missing_majors: majors=0 on {ctf} (bars={bar_count})")
+            if bar_count >= 300 and internal_count == 0:
+                warn.append(f"missing_internals: internals=0 (bars={bar_count})")
+            if bar_count >= 300 and bos_count == 0:
+                warn.append(f"missing_bos: bos=0 (bars={bar_count})")
+
+            quality[tf_key] = {
+                "chart_tf": str(ctf),
+                "bar_count": bar_count,
+                "swing_count": swing_count,
+                "internal_count": internal_count,
+                "major_count": major_count,
+                "bos_count": bos_count,
+                "warnings": warn,
+            }
+
             artifacts[tf_key] = rel
             if on_tf_complete is not None:
                 on_tf_complete(idx, n_work, str(ctf))
 
         manifest["artifacts"] = artifacts
         manifest["skipped_timeframes"] = skipped
+        manifest["quality"] = quality
         manifest["native_inferred_tf"] = inferred_native
         manifest["created_at_utc"] = datetime.now(timezone.utc).isoformat()
 

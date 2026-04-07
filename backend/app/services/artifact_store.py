@@ -194,6 +194,33 @@ def _pid_exists(pid: int) -> bool:
     return True
 
 
+def _lock_ttl_seconds() -> float:
+    """
+    Max age of a lock file before we consider it stale.
+    Default is conservative: builds can run for many hours (UI allows up to 48h).
+    """
+    raw = os.environ.get("ARTIFACT_LOCK_TTL_SEC")
+    if raw is None or str(raw).strip() == "":
+        return float(72 * 3600)  # 72h
+    try:
+        v = float(raw)
+    except ValueError:
+        return float(72 * 3600)
+    return float(max(300.0, v))
+
+
+def _read_lock_file(lock_path: Path) -> tuple[int | None, float | None]:
+    """Return (pid, created_at_epoch_seconds)."""
+    try:
+        raw = lock_path.read_text(encoding="utf-8", errors="replace")
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        pid = int(lines[0]) if len(lines) >= 1 else None
+        ts = float(lines[1]) if len(lines) >= 2 else None
+        return pid, ts
+    except Exception:
+        return None, None
+
+
 def _clear_legacy_lock_dir(lock_path: Path) -> None:
     """Starý formát: prázdný adresář *.lock — po pádu procesu zůstal a blokoval další build."""
     try:
@@ -228,15 +255,23 @@ def acquire_lock(lock_path: Path) -> bool:
     if _try_create():
         return True
 
-    try:
-        raw = lock_path.read_text(encoding="utf-8", errors="replace")
-        first = raw.strip().splitlines()[0] if raw.strip() else ""
-        pid = int(first)
-        if not _pid_exists(pid):
+    pid, created_at = _read_lock_file(lock_path)
+    ttl = _lock_ttl_seconds()
+    now = time.time()
+    age = (now - float(created_at)) if created_at is not None else None
+    # If the lock is very old, prefer reclaiming it even if PID-check is unreliable on this OS.
+    if age is not None and age > ttl:
+        try:
             lock_path.unlink(missing_ok=True)
-            return _try_create()
-    except (OSError, ValueError, IndexError):
-        pass
+        except OSError:
+            pass
+        return _try_create()
+    if pid is not None and not _pid_exists(pid):
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return _try_create()
 
     return False
 

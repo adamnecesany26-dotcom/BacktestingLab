@@ -42,6 +42,10 @@ Následující acceptance_bars svíček nesmí uzavřít zpět pod/přes level.
 Algoritmus swingu: candidate -> replacement -> confirmation (ATR) -> locked.
 """
 
+import math
+from collections import deque
+
+import numpy as np
 import pandas as pd
 from typing import Any
 
@@ -870,12 +874,17 @@ def _map_major_swing_to_original(
     if len(h_vals) == 0 or len(l_vals) == 0:
         return min(start_pos, len(original_ohlc) - 1), float(swing.get("price", 0))
 
-    if swing.get("type") == "high":
-        pos_in_slice = int(h_vals.argmax())
-        price = float(h_vals[pos_in_slice])
-    else:
-        pos_in_slice = int(l_vals.argmin())
-        price = float(l_vals[pos_in_slice])
+    try:
+        if swing.get("type") == "high":
+            pos_in_slice = int(np.nanargmax(h_vals))
+            price = float(h_vals[pos_in_slice])
+        else:
+            pos_in_slice = int(np.nanargmin(l_vals))
+            price = float(l_vals[pos_in_slice])
+    except (ValueError, TypeError):
+        return min(start_pos, len(original_ohlc) - 1), float(swing.get("price", 0))
+    if not math.isfinite(price):
+        return min(start_pos, len(original_ohlc) - 1), float(swing.get("price", 0))
     pos = start_pos + pos_in_slice
     pos = min(max(0, pos), len(original_ohlc) - 1)
     return pos, price
@@ -926,6 +935,7 @@ def get_swings(
         data_tf = None
     include_internals = params.pop("include_internals", False)
     omit_swings_overlapping_major = bool(params.pop("omit_swings_overlapping_major", True))
+    is_view_mode = vct is not None
 
     original_ohlc = ohlc
     tf = _chart_tf_for_hierarchy(original_ohlc, tf, data_tf, vct)
@@ -1012,21 +1022,52 @@ def get_swings(
 
     major_swings = get_major_swings(original_ohlc, maj_params)
 
+    def _postprocess_swings(swings_in: list[dict], core_params: dict) -> list[dict]:
+        swings_pp = _map_swings_to_original(swings_in)
+        atr_series = _compute_atr(work_ohlc, atr_period)
+        swings_pp = _deduplicate_swings(swings_pp, original_ohlc, atr_series)
+        mb_sp = max(int(core_params.get("min_bars_between_swings", 4)), 2)
+        swings_pp = _enforce_same_type_min_spacing(swings_pp, mb_sp)
+        if bool(core_params.get("force_extremes_between_same_swings", True)):
+            swings_pp = _inject_forced_extremes_between_same_swings(swings_pp, original_ohlc, major_swings)
+        if require_hl_alternation:
+            swings_pp = _enforce_strict_hl_alternation(swings_pp)
+        else:
+            swings_pp = sorted(swings_pp, key=lambda s: (int(s["index"]), 0 if s.get("type") == "high" else 1))
+        if omit_swings_overlapping_major:
+            swings_pp = [s for s in swings_pp if not _swing_overlaps_major(s, major_swings)]
+        return swings_pp
+
     if max_bars <= 0 or len(work_ohlc) <= max_bars or not use_rolling_windows:
         swings, _ = _get_swings_core(work_ohlc, swing_core_params)
-        swings = _map_swings_to_original(swings)
-        atr_series = _compute_atr(work_ohlc, atr_period)
-        swings = _deduplicate_swings(swings, original_ohlc, atr_series)
-        mb_sp = max(int(swing_core_params.get("min_bars_between_swings", 4)), 2)
-        swings = _enforce_same_type_min_spacing(swings, mb_sp)
-        if bool(swing_core_params.get("force_extremes_between_same_swings", True)):
-            swings = _inject_forced_extremes_between_same_swings(swings, original_ohlc, major_swings)
-        if require_hl_alternation:
-            swings = _enforce_strict_hl_alternation(swings)
-        else:
-            swings = sorted(swings, key=lambda s: (int(s["index"]), 0 if s.get("type") == "high" else 1))
-        if omit_swings_overlapping_major:
-            swings = [s for s in swings if not _swing_overlaps_major(s, major_swings)]
+        swings = _postprocess_swings(swings, swing_core_params)
+
+        # View-only auto relax: if swing density is clearly degenerate on a non-trivial series,
+        # try once with less strict thresholds.
+        if is_view_mode and len(work_ohlc) >= 200:
+            min_swings = int(min(240, max(8, len(work_ohlc) // 120)))
+            if len(swings) < min_swings:
+                relaxed = dict(swing_core_params)
+                try:
+                    relaxed["atr_multiplier"] = max(0.9, float(relaxed.get("atr_multiplier", 1.6)) * 0.82)
+                except (TypeError, ValueError):
+                    relaxed["atr_multiplier"] = 1.25
+                try:
+                    relaxed["min_pullback_atr_ratio"] = max(
+                        0.25, float(relaxed.get("min_pullback_atr_ratio", 0.5)) * 0.85
+                    )
+                except (TypeError, ValueError):
+                    relaxed["min_pullback_atr_ratio"] = 0.35
+                try:
+                    relaxed["min_bars_between_swings"] = max(
+                        2, int(round(int(relaxed.get("min_bars_between_swings", 4)) * 0.7))
+                    )
+                except (TypeError, ValueError):
+                    relaxed["min_bars_between_swings"] = 3
+                swings2, _ = _get_swings_core(work_ohlc, relaxed)
+                swings2 = _postprocess_swings(swings2, relaxed)
+                if len(swings2) > len(swings) + 2:
+                    swings = swings2
         if include_internals:
             pivot_src = work_ohlc if work_ohlc is not original_ohlc else None
             internals = _internals_from_hierarchy(
@@ -1989,6 +2030,127 @@ def _score_structure(swings: list[dict], bar_idx: int, atr: pd.Series, n: int, p
     return 0.0
 
 
+def _structure_score_series(
+    swings: list[dict] | None,
+    atr: pd.Series,
+    n: int,
+    params: dict,
+) -> list[float]:
+    """
+    Lineární verze structure skóre pro trend.
+
+    Původní `_score_structure` pro každý bar filtruje `swings_up_to` a přepočítává labely → O(n²) na dlouhých řadách.
+    Tady si držíme pointer do swingů (seřazené podle indexu) a okno posledních `lookback` labelů.
+
+    Skórování je stejné:
+    - bull_pair = HH -> HL
+    - bear_pair = LL -> LH
+    """
+    if not swings or n <= 1:
+        return [0.0] * max(0, int(n))
+    lookback = max(1, int(params.get("structure_lookback_swings", 4)))
+    eq_ratio = float(params.get("structure_eq_ratio", 0.35) or 0.35)
+
+    # Seřadit a normalizovat indexy; get_swings typicky už vrací ordered, ale nespoléhejme na to.
+    ordered = sorted(
+        (s for s in swings if isinstance(s, dict) and "index" in s and "type" in s and "price" in s),
+        key=lambda s: int(s.get("index", 0)),
+    )
+    if len(ordered) < 2:
+        return [0.0] * max(0, int(n))
+
+    # Předpočítat label pro každý swing pouze vůči poslednímu stejného typu (high/low).
+    lab_by_swing: list[tuple[int, str]] = []
+    last_high: float | None = None
+    last_low: float | None = None
+    for s in ordered:
+        try:
+            si = int(s.get("index", 0))
+        except (TypeError, ValueError):
+            continue
+        if si < 0:
+            continue
+        typ = str(s.get("type", "") or "")
+        try:
+            price = float(s.get("price", 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(price):
+            continue
+
+        # eq threshold bere ATR na indexu swingu (stejně jako původní kód: atr_val z bar_idx, použité pro labely).
+        ii = min(max(0, si), max(0, int(n) - 1))
+        try:
+            atr_val = max(float(atr.iloc[ii]), ATR_FLOOR)
+        except Exception:
+            atr_val = ATR_FLOOR
+        eq = max(atr_val * eq_ratio, ATR_FLOOR)
+
+        label: str
+        if typ == "high":
+            if last_high is None:
+                label = "HH"
+            else:
+                d = price - last_high
+                if d > eq:
+                    label = "HH"
+                elif d < -eq:
+                    label = "LH"
+                else:
+                    label = "EQH"
+            last_high = price
+        else:
+            if last_low is None:
+                label = "HL"
+            else:
+                d = last_low - price
+                if d > eq:
+                    label = "LL"
+                elif d < -eq:
+                    label = "HL"
+                else:
+                    label = "EQL"
+            last_low = price
+
+        lab_by_swing.append((si, label))
+
+    if len(lab_by_swing) < 2:
+        return [0.0] * max(0, int(n))
+
+    # Průchod bary: přidávat labely, které už nastaly.
+    out: list[float] = [0.0] * int(n)
+    q: deque[str] = deque(maxlen=lookback)
+    ptr = 0
+    for i in range(int(n)):
+        while ptr < len(lab_by_swing) and lab_by_swing[ptr][0] <= i:
+            q.append(lab_by_swing[ptr][1])
+            ptr += 1
+        if len(q) < 2:
+            out[i] = 0.0
+            continue
+        # Spočítat HH->HL a LL->LH v rámci posledního lookback okna.
+        labels = list(q)
+        bull_pairs = 0
+        bear_pairs = 0
+        for j in range(len(labels) - 1):
+            a, b = labels[j], labels[j + 1]
+            if a == "HH" and b == "HL":
+                bull_pairs += 1
+            elif a == "LL" and b == "LH":
+                bear_pairs += 1
+        if bull_pairs >= 2:
+            out[i] = 20.0
+        elif bull_pairs >= 1:
+            out[i] = 10.0
+        elif bear_pairs >= 2:
+            out[i] = -20.0
+        elif bear_pairs >= 1:
+            out[i] = -10.0
+        else:
+            out[i] = 0.0
+    return out
+
+
 def _score_to_state(score: float) -> str:
     """Mapuje score (-100..+100) na stav pro barvu."""
     if score >= 60:
@@ -2024,6 +2186,9 @@ def _compute_trend_scores(ohlc: pd.DataFrame, params: dict) -> list[tuple[int, f
     result = get_swings(ohlc, params)
     swings = result["swings"] if isinstance(result, dict) else result
 
+    # Structure score v čase O(n) (bez opakovaného filtrování celé historie swingů).
+    st_series = _structure_score_series(swings, atr, n, params) if swings else [0.0] * int(n)
+
     out: list[tuple[int, float, str]] = []
     for i in range(n):
         c = float(close.iloc[i])
@@ -2033,10 +2198,10 @@ def _compute_trend_scores(ohlc: pd.DataFrame, params: dict) -> list[tuple[int, f
             float(ema_med.iloc[i]),
             float(ema_slow.iloc[i]),
         )
-        s = _score_slope(ema_med, i, slope_lookback)
-        p = _score_position(c, float(ema_med.iloc[i]), atr_val)
-        st = _score_structure(swings, i, atr, n, params) if swings else 0.0
-        score = max(-100.0, min(100.0, a + s + p + st))
+        sl = _score_slope(ema_med, i, slope_lookback)
+        pos = _score_position(c, float(ema_med.iloc[i]), atr_val)
+        st = float(st_series[i]) if i < len(st_series) else 0.0
+        score = max(-100.0, min(100.0, a + sl + pos + st))
         out.append((i, score, None))
 
     scores = pd.Series([x[1] for x in out])
@@ -2175,4 +2340,16 @@ def detect(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         if "index" in s:
             row["bar_index"] = int(s["index"])
         results.append(row)
-    return results
+
+    out: list[dict[str, Any]] = []
+    for row in results:
+        try:
+            v = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(v):
+            continue
+        row = dict(row)
+        row["value"] = v
+        out.append(row)
+    return out

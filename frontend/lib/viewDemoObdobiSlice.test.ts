@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { remapViewMarkersBarIndexForWindow } from "./viewDemoObdobiSlice";
+import {
+  coerceViewMarkerBarIndex,
+  remapViewMarkersBarIndexForWindow,
+} from "./viewDemoObdobiSlice";
 
 describe("remapViewMarkersBarIndexForWindow", () => {
   it("maps global bar_index to tail window coordinates", () => {
@@ -33,5 +36,25 @@ describe("remapViewMarkersBarIndexForWindow", () => {
       10
     );
     expect(out[0].bar_index).toBeUndefined();
+  });
+
+  it("accepts string bar_index from JSON", () => {
+    expect(coerceViewMarkerBarIndex("25")).toBe(25);
+    expect(coerceViewMarkerBarIndex(undefined)).toBeNull();
+  });
+
+  it("syncs date from window OHLC when bar_index is remapped", () => {
+    const windowOhlc = Array.from({ length: 10 }, (_, i) => ({
+      date: `2024-06-${String(21 + i).padStart(2, "0")}T00:00:00`,
+    }));
+    const fullLen = 30;
+    const windowLen = 10;
+    const startIdx = fullLen - windowLen;
+    const markers = [
+      { date: "wrong-date", type: "high" as const, value: 1, bar_index: 25 },
+    ];
+    const out = remapViewMarkersBarIndexForWindow(markers, startIdx, windowLen, windowOhlc);
+    expect(out[0].bar_index).toBe(5);
+    expect(out[0].date).toBe(windowOhlc[5].date);
   });
 });

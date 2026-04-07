@@ -213,7 +213,34 @@ def run_artifact_build(
                 {
                     "type": "phase",
                     "phase": "hl",
-                    "message": f"H/L · {label} ({idx + 1}/{n}) — výpočet swingů/BOS…",
+                    "message": f"H/L · {label} ({idx + 1}/{n}) — start",
+                    "pct": round(pct, 1),
+                },
+            )
+
+        def _on_hl_tf_step(idx: int, n: int, label: str, step: str) -> None:
+            if n <= 0:
+                return
+            span = _ARTIFACT_BUILD_HL_PCT_HI - _ARTIFACT_BUILD_HL_PCT_LO
+            phase_frac = {
+                "swings": 0.20,
+                "bos": 0.55,
+                "trend": 0.75,
+                "write": 0.92,
+            }.get(str(step), 0.35)
+            pct = _ARTIFACT_BUILD_HL_PCT_LO + ((idx + phase_frac) / n) * span
+            label_step = {
+                "swings": "swingy (majors/internals)",
+                "bos": "BOS/CHoCH",
+                "trend": "trend",
+                "write": "zápis Parquet",
+            }.get(str(step), str(step))
+            _emit_progress(
+                progress,
+                {
+                    "type": "phase",
+                    "phase": "hl",
+                    "message": f"H/L · {label} ({idx + 1}/{n}) — {label_step}…",
                     "pct": round(pct, 1),
                 },
             )
@@ -254,6 +281,7 @@ def run_artifact_build(
             use_lock=True,
             on_tf_start=_on_hl_tf_start,
             on_tf_complete=_on_hl_tf,
+            on_tf_step=_on_hl_tf_step,
         )
         out["dataset_id"] = (out["hl"] or {}).get("dataset_id")
 

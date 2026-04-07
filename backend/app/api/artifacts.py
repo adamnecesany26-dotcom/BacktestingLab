@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import queue as sync_queue
+import os
 import threading
 import time
 from typing import Any
@@ -21,6 +22,21 @@ from app.services.artifact_api_service import artifact_status_payload, run_artif
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
+
+
+def _resolve_artifact_build_stream_idle_timeout_sec() -> int:
+    """
+    Max seconds without any *real* progress event (not pulse) while build thread is alive.
+    If exceeded, SSE returns an error so UI doesn't look "stuck forever".
+    """
+    raw = os.environ.get("ARTIFACT_BUILD_STREAM_IDLE_TIMEOUT_SEC")
+    if raw is None or str(raw).strip() == "":
+        return 1800  # 30 min default
+    try:
+        v = int(float(raw))
+    except ValueError:
+        return 1800
+    return max(0, v)
 
 
 class ArtifactCommon(BaseModel):
@@ -142,14 +158,50 @@ async def post_artifact_build(
             # Každých ~12 s pošleme pulz, aby UI i spojení žily.
             last_chunk_at = time.monotonic()
             pulse_sec = 12.0
+            idle_timeout_sec = _resolve_artifact_build_stream_idle_timeout_sec()
+            last_real_ev_at = time.monotonic()
+            last_real_phase: str | None = None
+            last_real_msg: str | None = None
             while True:
                 item_dict = await asyncio.to_thread(_get_ev, 1.0)
                 if item_dict is not None:
                     yield f"data: {json.dumps(item_dict)}\n\n"
                     last_chunk_at = time.monotonic()
+                    last_real_ev_at = last_chunk_at
+                    if isinstance(item_dict, dict) and item_dict.get("type") == "phase":
+                        ph = item_dict.get("phase")
+                        if ph and ph != "pulse":
+                            last_real_phase = str(ph)
+                            msg = item_dict.get("message")
+                            last_real_msg = str(msg) if msg is not None else None
                 elif t.is_alive() and (time.monotonic() - last_chunk_at) >= pulse_sec:
                     yield f"data: {json.dumps({'type': 'phase', 'phase': 'pulse', 'message': 'Probíhá výpočet na serveru (H/L nebo S/D může trvat dlouho)…'})}\n\n"
                     last_chunk_at = time.monotonic()
+                # True stall detection: no real events for too long (pulse doesn't reset this timer).
+                if t.is_alive() and idle_timeout_sec > 0 and (time.monotonic() - last_real_ev_at) >= idle_timeout_sec:
+                    stall_msg = (
+                        f"Build artefaktů se jeví jako zaseklý (bez progress eventu {idle_timeout_sec}s)."
+                    )
+                    if last_real_phase or last_real_msg:
+                        stall_msg += f" Poslední fáze: {last_real_phase or 'phase'}"
+                        if last_real_msg:
+                            stall_msg += f" · {last_real_msg}"
+                    append_audit_event(
+                        action="artifacts.build",
+                        actor_id=actor_id,
+                        entity="artifacts",
+                        status="error",
+                        details={
+                            "data_file": req.data_file,
+                            "error": stall_msg[:400],
+                            "stream": True,
+                            "stall": True,
+                            "idle_timeout_sec": idle_timeout_sec,
+                            "last_phase": last_real_phase,
+                        },
+                    )
+                    yield f"data: {json.dumps({'type': 'error', 'message': stall_msg})}\n\n"
+                    return
                 if not t.is_alive():
                     break
             while True:

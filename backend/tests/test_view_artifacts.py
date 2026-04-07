@@ -103,6 +103,209 @@ def test_build_view_naive_index_tz_aware_swing_iso_no_crash(tmp_path: Path) -> N
     assert len(out["markers"]) == 1
 
 
+def test_hl_swing_prefers_bar_index_over_bad_iso_time(tmp_path: Path) -> None:
+    """
+    Špatné / sdílené iso_time v Parquetu nesmí přebít platný bar_index — jinak spousta swingů
+    dostane stejné datum (stejný bar) a „Values“/Graf vypadají rozbitě.
+    """
+    data_dir = tmp_path / "data"
+    (data_dir / "t").mkdir(parents=True)
+    fpth = data_dir / "t" / "x.parquet"
+    _minimal_parquet(fpth)
+    rel = "t/x.parquet"
+    fp = fingerprint_dataset_file(fpth)
+    did = artifact_store.compute_dataset_id(rel, fp, years=None, start_iso=None, end_iso=None)
+
+    hl_dir = artifact_store.hl_version_dir(tmp_path, did)
+    hl_dir.mkdir(parents=True, exist_ok=True)
+    bad_iso = "2025-03-17T00:00:00+00:00"
+    sw = pd.DataFrame([
+        {"bar_index": 5, "iso_time": bad_iso, "type": "high", "price": 105.0},
+        {"bar_index": 10, "iso_time": bad_iso, "type": "low", "price": 99.5},
+        {"bar_index": 15, "iso_time": bad_iso, "type": "high", "price": 106.0},
+    ])
+    sw.to_parquet(hl_dir / "1d_swings.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_internals.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_majors.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_bos.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_trend.parquet", index=False)
+
+    hl_manifest = artifact_store.build_hl_manifest_skeleton(
+        dataset_id=did,
+        data_file=rel,
+        data_fingerprint=fp,
+        time_range_start="2024-06-01T00:00:00",
+        time_range_end="2024-06-30T00:00:00",
+        years=1.0,
+        hl_module_digest="test",
+        params_snapshot={},
+        tf_ladder=["1d"],
+    )
+    hl_manifest["artifacts"] = {
+        "1d": {
+            "swings": "1d_swings.parquet",
+            "internals": "1d_internals.parquet",
+            "majors": "1d_majors.parquet",
+            "bos": "1d_bos.parquet",
+            "trend": "1d_trend.parquet",
+        }
+    }
+    (hl_dir / "manifest.json").write_text(json.dumps(hl_manifest), encoding="utf-8")
+
+    chart = pd.read_parquet(fpth)
+    out = build_view_from_artifacts(
+        data_dir=data_dir,
+        data_file=rel,
+        years=1.0,
+        start_iso=None,
+        end_iso=None,
+        df_chart=chart,
+        chart_tf_normalized="1D",
+        include_sd=False,
+        repo_root_for_artifacts=tmp_path,
+    )
+    assert out["artifact_status"] in {"ok", "stale_fingerprint"}
+    marks = [m for m in out["markers"] if m.get("type") in ("high", "low")]
+    assert len(marks) == 3
+    dates = {m["date"][:10] for m in marks}
+    assert len(dates) == 3, dates
+    assert "2025-03-17" not in dates
+
+
+def test_pick_hl_tf_key_missing_30m_falls_back_and_sets_banner(tmp_path: Path) -> None:
+    """
+    When the chart wants 30m artifacts but the manifest doesn't include them (default ladder),
+    we should explicitly disclose the fallback TF in the banner so users don't misdiagnose
+    "few swings" as a compute failure.
+    """
+    data_dir = tmp_path / "data"
+    (data_dir / "t").mkdir(parents=True)
+    fpth = data_dir / "t" / "x.parquet"
+    _minimal_parquet(fpth)
+    rel = "t/x.parquet"
+    fp = fingerprint_dataset_file(fpth)
+    did = artifact_store.compute_dataset_id(rel, fp, years=None, start_iso=None, end_iso=None)
+
+    hl_dir = artifact_store.hl_version_dir(tmp_path, did)
+    hl_dir.mkdir(parents=True, exist_ok=True)
+    # Provide only 1h artifacts (no 30m).
+    sw = pd.DataFrame(
+        [{"bar_index": 5, "iso_time": "2024-06-06T00:00:00", "type": "high", "price": 105.0}]
+    )
+    sw.to_parquet(hl_dir / "1h_swings.parquet", index=False)
+    for name in ("internals", "majors", "bos", "trend"):
+        pd.DataFrame([]).to_parquet(hl_dir / f"1h_{name}.parquet", index=False)
+
+    hl_manifest = artifact_store.build_hl_manifest_skeleton(
+        dataset_id=did,
+        data_file=rel,
+        data_fingerprint=fp,
+        time_range_start="2024-06-01T00:00:00",
+        time_range_end="2024-06-30T00:00:00",
+        years=None,
+        hl_module_digest="test",
+        params_snapshot={},
+        tf_ladder=["1h"],
+    )
+    hl_manifest["artifacts"] = {
+        "1h": {
+            "swings": "1h_swings.parquet",
+            "internals": "1h_internals.parquet",
+            "majors": "1h_majors.parquet",
+            "bos": "1h_bos.parquet",
+            "trend": "1h_trend.parquet",
+            "bar_count": 30,
+        }
+    }
+    (hl_dir / "manifest.json").write_text(json.dumps(hl_manifest), encoding="utf-8")
+
+    chart = pd.read_parquet(fpth)
+    out = build_view_from_artifacts(
+        data_dir=data_dir,
+        data_file=rel,
+        years=0.0,
+        start_iso=None,
+        end_iso=None,
+        df_chart=chart,
+        chart_tf_normalized="30m",
+        include_sd=False,
+        repo_root_for_artifacts=tmp_path,
+    )
+    assert len(out["markers"]) == 1
+    assert out["artifact_banner"] is not None
+    assert "30m" in out["artifact_banner"]
+    assert "1h" in out["artifact_banner"]
+
+
+def test_artifacts_iso_window_maps_by_time_without_suffix_offset(tmp_path: Path) -> None:
+    """
+    If the client uses an explicit ISO window (start/end), suffix bar-index offset must be disabled
+    and mapping should rely on timestamps. This prevents accidental shifting when viewing a mid-series slice.
+    """
+    data_dir = tmp_path / "data"
+    (data_dir / "t").mkdir(parents=True)
+    fpth = data_dir / "t" / "full.parquet"
+    full_idx = pd.date_range("2024-06-01", periods=30, freq="1D")
+    pd.DataFrame(
+        {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0},
+        index=full_idx,
+    ).to_parquet(fpth)
+    rel = "t/full.parquet"
+    fp = fingerprint_dataset_file(fpth)
+    did = artifact_store.compute_dataset_id(rel, fp, years=None, start_iso=None, end_iso=None)
+
+    hl_dir = artifact_store.hl_version_dir(tmp_path, did)
+    hl_dir.mkdir(parents=True, exist_ok=True)
+
+    # Global artifact bar_index=12 (full-series), but we will view a mid-window starting at bar 10.
+    iso12 = pd.Timestamp(full_idx[12]).isoformat()
+    sw = pd.DataFrame([{"bar_index": 12, "iso_time": iso12, "type": "high", "price": 105.0}])
+    sw.to_parquet(hl_dir / "1d_swings.parquet", index=False)
+    for name in ("internals", "majors", "bos", "trend"):
+        pd.DataFrame([]).to_parquet(hl_dir / f"1d_{name}.parquet", index=False)
+
+    hl_manifest = artifact_store.build_hl_manifest_skeleton(
+        dataset_id=did,
+        data_file=rel,
+        data_fingerprint=fp,
+        time_range_start=str(full_idx[0]),
+        time_range_end=str(full_idx[-1]),
+        years=None,
+        hl_module_digest="test",
+        params_snapshot={},
+        tf_ladder=["1d"],
+    )
+    hl_manifest["artifacts"] = {
+        "1d": {
+            "swings": "1d_swings.parquet",
+            "internals": "1d_internals.parquet",
+            "majors": "1d_majors.parquet",
+            "bos": "1d_bos.parquet",
+            "trend": "1d_trend.parquet",
+            "bar_count": 30,
+        }
+    }
+    (hl_dir / "manifest.json").write_text(json.dumps(hl_manifest), encoding="utf-8")
+
+    chart = pd.read_parquet(fpth).iloc[10:20]
+    start_iso = pd.Timestamp(chart.index.min()).isoformat()
+    end_iso = pd.Timestamp(chart.index.max()).isoformat()
+    out = build_view_from_artifacts(
+        data_dir=data_dir,
+        data_file=rel,
+        years=0.0,
+        start_iso=start_iso,
+        end_iso=end_iso,
+        df_chart=chart,
+        chart_tf_normalized="1D",
+        include_sd=False,
+        repo_root_for_artifacts=tmp_path,
+    )
+    assert len(out["markers"]) == 1
+    # In the 10..19 window, global 12 should map to local index 2 by time mapping.
+    assert out["markers"][0]["bar_index"] == 2
+
+
 def test_hl_markers_suffix_offset_truncated_chart(tmp_path: Path) -> None:
     """Artefakt na plné řadě (bar_count=30); View jen tail 10 barů — globální bar_index musí přemapovat."""
     data_dir = tmp_path / "data"
@@ -164,7 +367,7 @@ def test_hl_markers_suffix_offset_truncated_chart(tmp_path: Path) -> None:
     )
     assert len(out["markers"]) == 1
     assert out["markers"][0]["bar_index"] == 5
-    assert abs(out["markers"][0]["value"] - 105.0) < 1e-6
+    assert abs(out["markers"][0]["value"] - 101.0) < 1e-6
 
 
 def test_hl_markers_suffix_offset_legacy_trend_row_count(tmp_path: Path) -> None:
@@ -377,7 +580,7 @@ def test_hl_markers_use_bar_index_when_iso_unusable(tmp_path: Path) -> None:
         repo_root_for_artifacts=tmp_path,
     )
     assert len(out["markers"]) == 2
-    assert {m["value"] for m in out["markers"]} == {105.0, 98.0}
+    assert {m["value"] for m in out["markers"]} == {101.0, 99.0}
 
 
 def test_native_chart_tf_picks_matching_hl_artifact_not_coarsest(tmp_path: Path) -> None:
@@ -453,7 +656,7 @@ def test_native_chart_tf_picks_matching_hl_artifact_not_coarsest(tmp_path: Path)
         repo_root_for_artifacts=tmp_path,
     )
     assert len(out["markers"]) == 1
-    assert out["markers"][0]["value"] == 105.0
+    assert out["markers"][0]["value"] == 101.0
 
 
 def test_build_view_hl_swings_and_sd_zone(tmp_path: Path) -> None:

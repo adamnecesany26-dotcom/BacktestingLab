@@ -1,7 +1,9 @@
 """View API: optional start_iso / end_iso slice after years cutoff."""
 
+import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -37,6 +39,27 @@ def test_load_ohlc_slice_inclusive(monkeypatch: pytest.MonkeyPatch, tiny_parquet
     assert cut.index.min() == pd.Timestamp("2024-06-02")
     assert cut.index.max() == pd.Timestamp("2024-06-04")
 
+def test_load_ohlc_slice_accepts_tz_aware_bounds_on_naive_index(
+    monkeypatch: pytest.MonkeyPatch, tiny_parquet: Path
+):
+    """
+    Regression guard: tz-aware ISO bounds (e.g. trailing 'Z') must not raise TypeError
+    when the OHLC index is tz-naive; the API should slice deterministically.
+    """
+    data_dir = tiny_parquet.parent
+
+    def fake_get_data_dir() -> Path:
+        return data_dir
+
+    monkeypatch.setattr(view_mod, "_get_data_dir", fake_get_data_dir)
+    rel = tiny_parquet.name
+
+    # tz-aware bounds should be accepted and interpreted in tz-naive space for tz-naive index.
+    cut = view_mod._load_ohlc(rel, 0.0, "2024-06-02T00:00:00Z", "2024-06-04T00:00:00Z")
+    assert len(cut) == 3
+    assert cut.index.min() == pd.Timestamp("2024-06-02")
+    assert cut.index.max() == pd.Timestamp("2024-06-04")
+
 
 def test_view_request_has_start_end_iso():
     """Regression: handler uses req.start_iso / req.end_iso — model must define them (no AttributeError)."""
@@ -53,3 +76,19 @@ def test_view_request_has_start_end_iso():
     )
     assert parsed.start_iso == "2024-01-01"
     assert parsed.end_iso is None
+
+
+def test_sanitize_for_json_replaces_nan_in_markers():
+    raw = {
+        "ohlc": [],
+        "markers": [
+            {"date": "2024-01-01", "value": float("nan"), "type": "high"},
+            {"date": "2024-01-02", "value": np.float64(np.nan), "type": "low"},
+        ],
+        "zones": [{"value_low": float("inf")}],
+    }
+    out = view_mod._sanitize_for_json(raw)
+    json.dumps(out)
+    assert out["markers"][0]["value"] is None
+    assert out["markers"][1]["value"] is None
+    assert out["zones"][0]["value_low"] is None

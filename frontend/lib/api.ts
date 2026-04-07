@@ -247,7 +247,7 @@ export type ViewDataOptions = {
 
 export type ViewDataResponse = {
   ohlc: OhlcBar[];
-  markers: { date: string; type: string; value: number; bar_index?: number }[];
+  markers: { date: string; type: string; value: number | null; bar_index?: number | string }[];
   lines: ViewLine[];
   zones?: ViewZone[];
   artifact_status?: string;

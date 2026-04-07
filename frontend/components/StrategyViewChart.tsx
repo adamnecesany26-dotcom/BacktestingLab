@@ -30,7 +30,10 @@ import {
   effectiveViewDataTimeframe,
   shuffleWindowBarCount,
 } from "@/lib/viewChartTimeframe";
-import { remapViewMarkersBarIndexForWindow } from "@/lib/viewDemoObdobiSlice";
+import {
+  coerceViewMarkerBarIndex,
+  remapViewMarkersBarIndexForWindow,
+} from "@/lib/viewDemoObdobiSlice";
 import {
   HL_TREND_STATE_COLORS,
   lineDataHasTrendState,
@@ -55,7 +58,14 @@ function formatArtifactBuildElapsed(sec: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-type ViewMarker = { date: string; type: string; value: number; bar_index?: number };
+type ViewMarker = { date: string; type: string; value: number | null; bar_index?: number | string };
+
+function formatMarkerValueCell(v: unknown): string {
+  if (v == null) return "—";
+  const n = typeof v === "number" ? v : Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return n.toFixed(2);
+}
 
 function toModuleName(name: string): string {
   return (name || "module").replace(/\s+/g, "_").replace(/-/g, "_").replace(/\./g, "_") || "module";
@@ -179,8 +189,14 @@ function applyViewDemoObdobiSlice(
     return ds >= startDate && ds <= endDate;
   };
 
-  const markersInWindow = fullMarkers.filter((m) => inRange(m.date));
-  const markers = remapViewMarkersBarIndexForWindow(markersInWindow, startIdx, windowOhlc.length);
+  const markersInWindow = fullMarkers.filter((m) => {
+    const gi = coerceViewMarkerBarIndex(m.bar_index);
+    if (gi !== null) {
+      return gi >= startIdx && gi < fullOhlc.length;
+    }
+    return inRange(m.date);
+  });
+  const markers = remapViewMarkersBarIndexForWindow(markersInWindow, startIdx, windowOhlc.length, windowOhlc);
   const lines = fullLines
     .map((line) => {
       if (isViewRegimeHistogramLine(line)) {
@@ -490,6 +506,11 @@ export function StrategyViewChart({
   const [artifactBuildError, setArtifactBuildError] = useState<string | null>(null);
   const [artifactBuildProgressPct, setArtifactBuildProgressPct] = useState(0);
   const [artifactBuildPhaseLabel, setArtifactBuildPhaseLabel] = useState("");
+  const [artifactBuildPulseCount, setArtifactBuildPulseCount] = useState(0);
+  const [artifactBuildLastServerEventAt, setArtifactBuildLastServerEventAt] = useState<number>(0);
+  const [artifactBuildRecentEvents, setArtifactBuildRecentEvents] = useState<
+    { at: number; phase: string; message: string; pct?: number }[]
+  >([]);
   /** Nutné kvůli odvozenému uběhu času i při throttlingu záložky (interval + Date.now). */
   const [artifactBuildUiPulse, setArtifactBuildUiPulse] = useState(0);
   const artifactBuildWallT0Ref = useRef<number>(0);
@@ -755,6 +776,15 @@ export function StrategyViewChart({
     ? Math.max(0, Math.floor((Date.now() - artifactBuildWallT0Ref.current) / 1000))
     : 0;
 
+  const artifactBuildLastServerEventAgeSec = artifactBuilding
+    ? Math.max(
+        0,
+        Math.floor(
+          (Date.now() - (artifactBuildLastServerEventAt || artifactBuildWallT0Ref.current)) / 1000
+        )
+      )
+    : 0;
+
   const artifactBuildDisplayPct = useMemo(() => {
     if (!artifactBuilding) return 0;
     const sinceSec = Math.max(0, (Date.now() - artifactBuildLastServerPctAtRef.current) / 1000);
@@ -777,6 +807,9 @@ export function StrategyViewChart({
     setArtifactBuildError(null);
     setArtifactBuildProgressPct(1);
     setArtifactBuildPhaseLabel("Navazuji spojení…");
+    setArtifactBuildPulseCount(0);
+    setArtifactBuildLastServerEventAt(Date.now());
+    setArtifactBuildRecentEvents([]);
     try {
       await buildArtifactsStreaming(
         dataFile,
@@ -791,10 +824,25 @@ export function StrategyViewChart({
         (ev: ArtifactBuildStreamEvent) => {
           if (ev.type !== "phase") return;
           flushSync(() => {
+            const now = Date.now();
+            setArtifactBuildLastServerEventAt(now);
+            setArtifactBuildRecentEvents((prev) => {
+              const msg = (ev.message || ev.phase || "").trim();
+              const item = {
+                at: now,
+                phase: ev.phase || "phase",
+                message: msg || "(bez zprávy)",
+                pct: typeof ev.pct === "number" ? ev.pct : undefined,
+              };
+              const next = [...prev, item];
+              return next.length > 18 ? next.slice(next.length - 18) : next;
+            });
             // Pulz nesmí přepsat konkrétní fázi (např. „H/L · 30m (6/6) — výpočet…“).
             if (ev.phase !== "pulse") {
               if (ev.message) setArtifactBuildPhaseLabel(ev.message);
               else if (ev.phase) setArtifactBuildPhaseLabel(ev.phase);
+            } else {
+              setArtifactBuildPulseCount((x) => x + 1);
             }
             if (typeof ev.pct === "number") {
               artifactBuildLastServerPctAtRef.current = Date.now();
@@ -949,7 +997,13 @@ export function StrategyViewChart({
           return ds >= startDate && ds <= endDate;
         };
 
-        const mCount = fullMarkers.filter((m) => inRangeProbe(m.date)).length;
+        const mCount = fullMarkers.filter((m) => {
+          const gi = coerceViewMarkerBarIndex(m.bar_index);
+          if (gi !== null) {
+            return gi >= startIdx && gi < endIdx;
+          }
+          return inRangeProbe(m.date);
+        }).length;
         const zCount = fullZones.filter((z) => {
           const zStart = Date.parse(z.date_start);
           const zEnd = Date.parse(z.date_end);
@@ -998,9 +1052,16 @@ export function StrategyViewChart({
       setOhlc(windowOhlc);
       setMarkers(
         remapViewMarkersBarIndexForWindow(
-          fullMarkers.filter((m) => inRange(m.date)),
+          fullMarkers.filter((m) => {
+            const gi = coerceViewMarkerBarIndex(m.bar_index);
+            if (gi !== null) {
+              return gi >= startIdx && gi < fullOhlc.length;
+            }
+            return inRange(m.date);
+          }),
           startIdx,
-          windowOhlc.length
+          windowOhlc.length,
+          windowOhlc
         )
       );
       setLines(
@@ -1133,18 +1194,29 @@ export function StrategyViewChart({
       m.type !== "internal_low"
   );
 
-  const chartTimeSpanMs = (() => {
-    if (n < 2) return 7 * 86400000;
-    const a = Date.parse(ohlc[0]?.date ?? "");
-    const b = Date.parse(ohlc[n - 1]?.date ?? "");
-    if (!Number.isFinite(a) || !Number.isFinite(b)) return 7 * 86400000;
-    return Math.abs(b - a) + 86400000;
-  })();
+  /** Swing H/L na správném baru musí sedět na knot svíčky (Parquet někdy nese jiné měřítko ceny než View OHLC). */
+  const ohlcYForSwingMarker = (typ: string, idx: number): number | null => {
+    const bar = ohlc[idx];
+    if (!bar) return null;
+    switch (typ) {
+      case "high":
+      case "major_high":
+      case "internal_high":
+        return typeof bar.high === "number" && Number.isFinite(bar.high) ? bar.high : null;
+      case "low":
+      case "major_low":
+      case "internal_low":
+        return typeof bar.low === "number" && Number.isFinite(bar.low) ? bar.low : null;
+      default:
+        return null;
+    }
+  };
 
   const mapMarkerToIndex = (m: ViewMarker) => {
     // bar_index jen pokud leží v aktuálním okně OHLC — jinak spadneme na datum (jinak všechny mimo rozsah skončí na n−1 vpravo).
-    if (typeof m.bar_index === "number" && Number.isFinite(m.bar_index) && n > 0) {
-      const i = Math.floor(m.bar_index);
+    const bi0 = coerceViewMarkerBarIndex(m.bar_index);
+    if (bi0 !== null && n > 0) {
+      const i = bi0;
       if (i >= 0 && i < n) return i;
     }
     const exact = dateToIndex.get(m.date);
@@ -1170,6 +1242,13 @@ export function StrategyViewChart({
     const dayFallback = dayToIndex.get(dayKey);
     if (dayFallback !== undefined && dayFallback >= 0) return dayFallback;
     if (!Number.isFinite(t) || n <= 0) return -1;
+    const firstMs = Date.parse(ohlc[0]?.date ?? "");
+    const lastMs = Date.parse(ohlc[n - 1]?.date ?? "");
+    if (!Number.isFinite(firstMs) || !Number.isFinite(lastMs)) return -1;
+    // Markery s časem mimo viditelné okno nesmí jít na „nejblíže“ v okně — dříve maxMs = šířka celého
+    // grafu (např. rok) přitáhlo všechny březnové body k první svíčce v září → jeden sloupec na X.
+    const padMs = 86400000;
+    if (t < firstMs - padMs || t > lastMs + padMs) return -1;
     let best = -1;
     let bestAbs = Infinity;
     for (let i = 0; i < n; i++) {
@@ -1181,21 +1260,46 @@ export function StrategyViewChart({
         best = i;
       }
     }
-    const maxMs = Math.max(7 * 86400000, chartTimeSpanMs);
-    return best >= 0 && bestAbs <= maxMs ? best : -1;
+    const stepMs =
+      n >= 2 ? Math.max(3600000, (lastMs - firstMs) / Math.max(1, n - 1)) : 86400000;
+    const maxFuzzyMs = Math.min(7 * 86400000, Math.max(3 * stepMs, 2 * 3600000));
+    return best >= 0 && bestAbs <= maxFuzzyMs ? best : -1;
   };
 
-  const highMapped = highMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
-  const lowMapped = lowMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
-  const majorHighMapped = majorHighMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
-  const majorLowMapped = majorLowMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
+  const mapSwingMarker = (m: ViewMarker) => {
+    const idx = mapMarkerToIndex(m);
+    if (idx < 0) return { idx, val: null as number | null };
+    const yOhlc = ohlcYForSwingMarker(m.type, idx);
+    const v =
+      yOhlc != null
+        ? yOhlc
+        : typeof m.value === "number" && Number.isFinite(m.value)
+          ? m.value
+          : null;
+    return { idx, val: v };
+  };
+
+  const highMapped = highMarkers
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+  const lowMapped = lowMarkers
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+  const majorHighMapped = majorHighMarkers
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+  const majorLowMapped = majorLowMarkers
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
   const internalHighMapped = internalHighMarkers
-    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
-    .filter((p) => p.idx >= 0);
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
   const internalLowMapped = internalLowMarkers
+    .map((m) => mapSwingMarker(m))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+  const otherMapped = otherMarkers
     .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
-    .filter((p) => p.idx >= 0);
-  const otherMapped = otherMarkers.map((m) => ({ idx: mapMarkerToIndex(m), val: m.value })).filter((p) => p.idx >= 0);
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
 
   const inducementPointsByZone = zones.flatMap((z) =>
     (z.inducements ?? []).map((ind) => {
@@ -1212,7 +1316,10 @@ export function StrategyViewChart({
       }
       return { idx, val: ind.value, zoneName: z.name };
     })
-  ).filter((p): p is { idx: number; val: number; zoneName: string } => p.idx >= 0);
+  ).filter(
+    (p): p is { idx: number; val: number; zoneName: string } =>
+      p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val)
+  );
 
   const inducementDemand = inducementPointsByZone.filter((p) => p.zoneName === "Demand");
   const inducementSupply = inducementPointsByZone.filter((p) => p.zoneName === "Supply");
@@ -2002,6 +2109,20 @@ export function StrategyViewChart({
                 <div className="text-sm text-zinc-300 font-mono">
                   {formatArtifactBuildElapsed(artifactBuildElapsedSec)}
                 </div>
+                <div className="mt-1">
+                  <div className="text-zinc-400">Poslední zpráva ze serveru</div>
+                  <div
+                    className={`text-sm font-mono ${
+                      artifactBuildLastServerEventAgeSec >= 90 ? "text-rose-300" : "text-zinc-300"
+                    }`}
+                    title="Čas od posledního SSE eventu. Pokud roste bez pulzů, může být spojení přerušené nebo server zaseknutý."
+                  >
+                    {artifactBuildLastServerEventAgeSec}s
+                  </div>
+                  <div className="text-[10px] text-zinc-500">
+                    Pulzy: <span className="text-zinc-400 font-mono">{artifactBuildPulseCount}</span>
+                  </div>
+                </div>
               </div>
             </div>
             <div className="h-3 rounded-full bg-zinc-800 overflow-hidden mb-1 ring-1 ring-zinc-700/80">
@@ -2016,9 +2137,49 @@ export function StrategyViewChart({
               <span>Milník ze serveru: {Math.round(artifactBuildProgressPct)}%</span>
               <span>Časový odhad (48 h): → 94%</span>
             </div>
+            {artifactBuildLastServerEventAgeSec >= 180 ? (
+              <div className="mb-3 px-3 py-2 rounded border border-rose-600/35 bg-rose-950/35 text-rose-200/90 text-[11px] leading-snug">
+                Žádná zpráva ze serveru už <span className="font-mono">{artifactBuildLastServerEventAgeSec}s</span>. To
+                obvykle znamená, že se proces zasekl (nebo spadlo SSE spojení). Zkontroluj backend log / případný lock
+                a jestli stále běží uvicorn.
+              </div>
+            ) : null}
             <p className="text-sm text-violet-200/90 min-h-[2.75rem] leading-snug border-t border-zinc-800/80 pt-3">
               {artifactBuildPhaseLabel || "Navazuji stream…"}
             </p>
+            {artifactBuildRecentEvents.length > 0 ? (
+              <div className="mt-3 rounded-lg border border-zinc-800/70 bg-zinc-950/30">
+                <div className="px-3 py-2 border-b border-zinc-800/70 flex items-center justify-between">
+                  <div className="text-[10px] text-zinc-500">Timeline (poslední kroky)</div>
+                  <div className="text-[10px] text-zinc-600 font-mono">
+                    {artifactBuildRecentEvents.length} eventů
+                  </div>
+                </div>
+                <div className="max-h-32 overflow-auto">
+                  {artifactBuildRecentEvents
+                    .slice()
+                    .reverse()
+                    .map((e, i) => {
+                      const ageSec = Math.max(0, Math.floor((Date.now() - e.at) / 1000));
+                      return (
+                        <div
+                          key={`${e.at}-${i}`}
+                          className="px-3 py-1.5 border-t border-zinc-900/60 text-[11px] text-zinc-300 flex items-center gap-2"
+                        >
+                          <span className="text-zinc-500 font-mono w-10 shrink-0">{ageSec}s</span>
+                          <span className="text-zinc-400 font-mono w-14 shrink-0">{e.phase}</span>
+                          <span className="truncate flex-1" title={e.message}>
+                            {e.message}
+                          </span>
+                          {typeof e.pct === "number" ? (
+                            <span className="text-zinc-500 font-mono shrink-0">{Math.round(e.pct)}%</span>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                </div>
+              </div>
+            ) : null}
             <p className="text-[10px] text-zinc-500 leading-snug mt-2">
               Server hlásí každý timeframe H/L a S/D (start + hotovo). 30m se v artefaktech nepočítá
               (žebříček do 1h); u 1h na velkém intraday souboru může krok trvat dlouho — očekávané. Velké číslo nahoře doplňuje drobný časový
@@ -2075,7 +2236,7 @@ export function StrategyViewChart({
                           <tr key={i} className="border-t border-zinc-700/50">
                             <td className="px-3 py-2 text-zinc-200">{m.date}</td>
                             <td className="px-3 py-2 text-zinc-300">{m.type}</td>
-                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{m.value.toFixed(2)}</td>
+                            <td className="px-3 py-2 text-right text-zinc-200 font-mono">{formatMarkerValueCell(m.value)}</td>
                           </tr>
                         ))}
                       </tbody>
