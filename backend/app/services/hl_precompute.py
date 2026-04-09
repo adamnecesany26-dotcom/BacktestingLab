@@ -227,13 +227,7 @@ def run_hl_precompute(
             p = dict(merged)
             p["timeframe"] = ctf
             p["data_timeframe"] = inferred_native
-            p["include_internals"] = True
-            p["require_hl_alternation"] = False
-            p["omit_swings_overlapping_major"] = False
-            # max_bars z merged (VIEW_PARAMS / TF_CONFIG); nevnucovat 0 — rolling na dlouhých řadách jako ve View.
-            p.setdefault("bos_include_internal_pivots", merged.get("bos_include_internal_pivots", 0))
             p["_view_chart_tf"] = ctf
-            p["_view_ohlc_native"] = native
 
             tf_key = str(raw_tf).replace("/", "_")
             work_items.append({"raw_tf": raw_tf, "ctf": ctf, "df_chart": df_chart, "p": p, "tf_key": tf_key})
@@ -253,20 +247,17 @@ def run_hl_precompute(
 
             if on_tf_step is not None:
                 on_tf_step(idx, n_work, str(ctf), "swings")
-            swing_res = sh.get_swings(df_chart, p)
-            if not isinstance(swing_res, dict):
-                swing_res = {"swings": swing_res or [], "internals": [], "major_swings": []}
-
-            swings = swing_res.get("swings") or []
-            internals = swing_res.get("internals") or []
-            majors = swing_res.get("major_swings") or []
+            swings = sh.get_swings(df_chart, p)
+            if not isinstance(swings, list):
+                swings = (swings or {}).get("swings") or []
 
             if on_tf_step is not None:
                 on_tf_step(idx, n_work, str(ctf), "bos")
             bos = sh.get_bos(df_chart, p)
+            store_trend = ctf in ("1M", "1d")
             if on_tf_step is not None:
                 on_tf_step(idx, n_work, str(ctf), "trend")
-            line = sh.get_line(df_chart, p)
+            line = sh.get_line(df_chart, p) if store_trend else None
 
             rel: dict[str, str] = {}
 
@@ -277,14 +268,12 @@ def run_hl_precompute(
             s_df.to_parquet(path_sw, index=False)
             rel["swings"] = path_sw.name
 
-            i_df = pd.DataFrame(_swing_rows(internals, df_chart.index))
             path_int = hl_dir / f"{tf_key}_internals.parquet"
-            i_df.to_parquet(path_int, index=False)
+            pd.DataFrame(columns=["bar_index", "iso_time", "type", "price"]).to_parquet(path_int, index=False)
             rel["internals"] = path_int.name
 
-            m_df = pd.DataFrame(_swing_rows(majors, df_chart.index))
             path_maj = hl_dir / f"{tf_key}_majors.parquet"
-            m_df.to_parquet(path_maj, index=False)
+            pd.DataFrame(columns=["bar_index", "iso_time", "type", "price"]).to_parquet(path_maj, index=False)
             rel["majors"] = path_maj.name
 
             b_df = pd.DataFrame(_bos_rows(bos))
@@ -293,7 +282,7 @@ def run_hl_precompute(
             rel["bos"] = path_bos.name
 
             trend_rows: list[dict] = []
-            if line and isinstance(line, dict):
+            if store_trend and line and isinstance(line, dict):
                 tdata = (line.get("Trend") or {}).get("data") or []
                 for i, row in enumerate(tdata):
                     if not isinstance(row, dict):
@@ -312,17 +301,16 @@ def run_hl_precompute(
                         "score": float(row.get("score", 0.0)),
                         "state": str(row.get("state", "")),
                     })
-            t_df = pd.DataFrame(trend_rows)
-            path_tr = hl_dir / f"{tf_key}_trend.parquet"
-            t_df.to_parquet(path_tr, index=False)
-            rel["trend"] = path_tr.name
+            if store_trend:
+                t_df = pd.DataFrame(trend_rows)
+                path_tr = hl_dir / f"{tf_key}_trend.parquet"
+                t_df.to_parquet(path_tr, index=False)
+                rel["trend"] = path_tr.name
             rel["bar_count"] = int(len(df_chart))
 
             # --- Quality diagnostics (sanity gates) ---
             bar_count = int(len(df_chart))
             swing_count = int(len(s_df))
-            internal_count = int(len(i_df))
-            major_count = int(len(m_df))
             bos_count = int(len(b_df))
             warn: list[str] = []
             # Heuristic: on long series, a swing detector returning single digits is almost certainly misconfigured.
@@ -332,11 +320,6 @@ def run_hl_precompute(
                 warn.append(
                     f"too_few_swings: swings={swing_count}, bars={bar_count}, expected>={min_swings}"
                 )
-            # Majors should exist for TFs that define major sources (roughly: 1d and finer) when series is non-trivial.
-            if ctf in ("1d", "4h", "1h", "30m", "15m", "5m", "1m") and bar_count >= 200 and major_count == 0:
-                warn.append(f"missing_majors: majors=0 on {ctf} (bars={bar_count})")
-            if bar_count >= 300 and internal_count == 0:
-                warn.append(f"missing_internals: internals=0 (bars={bar_count})")
             if bar_count >= 300 and bos_count == 0:
                 warn.append(f"missing_bos: bos=0 (bars={bar_count})")
 
@@ -344,8 +327,8 @@ def run_hl_precompute(
                 "chart_tf": str(ctf),
                 "bar_count": bar_count,
                 "swing_count": swing_count,
-                "internal_count": internal_count,
-                "major_count": major_count,
+                "internal_count": 0,
+                "major_count": 0,
                 "bos_count": bos_count,
                 "warnings": warn,
             }
