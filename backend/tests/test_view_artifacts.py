@@ -9,7 +9,7 @@ import pandas as pd
 
 from app.services import artifact_store
 from app.services.data_ohlc import fingerprint_dataset_file
-from app.services.view_artifacts import build_view_from_artifacts
+from app.services.view_artifacts import _hl_row_bar_index, _ts_to_chart_bar_index, build_view_from_artifacts
 
 
 def _minimal_parquet(path: Path) -> None:
@@ -882,3 +882,51 @@ def test_hl_markers_prefer_iso_over_misleading_bar_index(tmp_path: Path) -> None
     )
     assert len(out["markers"]) == 1
     assert out["markers"][0]["bar_index"] == 5
+
+
+def test_ts_to_chart_bar_index_exact_timestamp_in_index() -> None:
+    """Přesná shoda času s indexem → řádek podle get_indexer, ne jen searchsorted slepě."""
+    idx = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2024-06-01 00:00:00", tz="UTC"),
+            pd.Timestamp("2024-06-02 00:00:00", tz="UTC"),
+        ]
+    )
+    bi = _ts_to_chart_bar_index(idx, pd.Timestamp("2024-06-02 00:00:00", tz="UTC"))
+    assert bi == 1
+
+
+def test_hl_row_bar_index_coarse_daily_uses_calendar_day() -> None:
+    """Hrubá denní řada: ISO o půlnoci sedí na správný kalendářní den i při ne-00:00 štítcích svíček."""
+    idx = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2024-06-01 18:00:00", tz="UTC"),
+            pd.Timestamp("2024-06-02 18:00:00", tz="UTC"),
+            pd.Timestamp("2024-06-03 18:00:00", tz="UTC"),
+        ]
+    )
+    iso = "2024-06-02T00:00:00+00:00"
+    bi = _hl_row_bar_index(idx, iso, None, len(idx))
+    assert bi == 1
+
+
+def test_swing_hl_rolling_carry_roundtrip_index_translation() -> None:
+    """Sanity: přenos stavu rollujících oken překládá absolutní bar na lokální offset okna."""
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    path = root / "strategies" / "sd_zone_strategy" / "modules" / "Swing_HL.py"
+    spec = importlib.util.spec_from_file_location("swing_hl_carry_test", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    carry = {"last_swing_type": "high", "last_swing_price": 101.0, "last_swing_abs": 145}
+    init = mod._rolling_carry_to_initial_state(carry, window_abs_start=100)
+    assert init is not None
+    assert init["last_swing_idx"] == 45
+    back = mod._rolling_final_to_carry(
+        {"last_swing_type": "low", "last_swing_idx": 10, "last_swing_price": 99.0},
+        window_abs_start=100,
+    )
+    assert back["last_swing_abs"] == 110

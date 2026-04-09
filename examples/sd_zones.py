@@ -394,34 +394,11 @@ def _append_major_proximity_chop_zones(
             atr_series,
             atr_period,
         )
-        inducements, inducement_count, inducement_points = _find_inducements(
-            ohlc,
-            zone_low,
-            zone_high,
-            mi,
-            rightmost,
-            zname,
-            swings,
-            internals,
-            major_swings,
-            atr_series,
-        )
-
-        bos_kind = "major"
+        # Inducements se počítají až po finálních filtrech (jednou pro všechny zóny).
         if zname == "Demand":
-            if bos_kind == "major":
-                fill = "rgba(59, 130, 246, 0.40)" if has_touch else "rgba(59, 130, 246, 0.28)"
-            elif bos_kind == "internal":
-                fill = "rgba(134, 239, 172, 0.30)" if has_touch else "rgba(134, 239, 172, 0.20)"
-            else:
-                fill = "rgba(34, 197, 94, 0.38)" if has_touch else "rgba(34, 197, 94, 0.25)"
+            fill = "rgba(59, 130, 246, 0.40)" if has_touch else "rgba(59, 130, 246, 0.28)"
         else:
-            if bos_kind == "major":
-                fill = "rgba(168, 85, 247, 0.40)" if has_touch else "rgba(168, 85, 247, 0.28)"
-            elif bos_kind == "internal":
-                fill = "rgba(252, 165, 165, 0.30)" if has_touch else "rgba(252, 165, 165, 0.20)"
-            else:
-                fill = "rgba(239, 68, 68, 0.38)" if has_touch else "rgba(239, 68, 68, 0.25)"
+            fill = "rgba(168, 85, 247, 0.40)" if has_touch else "rgba(168, 85, 247, 0.28)"
 
         zd: dict[str, Any] = {
             "date_start": _to_date_str(index[leftmost]),
@@ -436,12 +413,11 @@ def _append_major_proximity_chop_zones(
             "base_length": base_length,
             "impulse_score": impulse_score,
             "has_touch": has_touch,
-            "is_major": False,
-            "inducements": inducements,
-            "inducement_count": inducement_count,
-            "inducement_points": inducement_points,
-            "zone_origin": "major_chop",
-            "bos_swing_kind": bos_kind,
+            "inducements": [],
+            "inducement_count": 0,
+            "inducement_points": 0,
+            "bos_origin": "none",
+            "zone_origin": "major_proximity_chop",
         }
         if has_touch and touch_bi is not None and touch_mp is not None:
             zd["touch_bar_index"] = int(touch_bi)
@@ -496,13 +472,6 @@ def _sd_zone_max_base_cap(params: dict | None) -> int:
     return 11
 
 
-def _event_bos_swing_kind(ev: dict) -> str:
-    k = ev.get("bos_swing_kind")
-    if isinstance(k, str) and k.strip():
-        return k.strip()
-    return "major" if ev.get("is_major") else "swing"
-
-
 def _sd_skip_zone_after_metrics(
     bos_kind: str,
     base_length: int,
@@ -513,20 +482,6 @@ def _sd_skip_zone_after_metrics(
     params: dict,
 ) -> bool:
     if base_cap > 0 and int(base_length) > base_cap:
-        return True
-    if bos_kind != "internal":
-        return False
-    try:
-        min_leg = int(params.get("internal_bos_min_leg_bars", 5))
-    except (TypeError, ValueError):
-        min_leg = 5
-    if min_leg > 0 and (int(bos_idx) - int(swing_idx)) < min_leg:
-        return True
-    try:
-        min_imp = int(params.get("internal_bos_min_impulse_score", 2))
-    except (TypeError, ValueError):
-        min_imp = 2
-    if min_imp > 0 and int(impulse_score) < min_imp:
         return True
     return False
 
@@ -556,10 +511,8 @@ VIEW_PARAMS = {
     "max_pivot_candle_range_atr": 5.0,
     "sd_zone_max_base_bars": 11,
     "trend_filter_enabled": 0,
-    "bos_include_internal_pivots": 0,
-    "show_sd_zones_from_major_bos": 1,
-    "show_sd_zones_from_swing_bos": 1,
-    "show_sd_zones_from_internal_bos": 0,
+    "demand_zone_mode": "wick_to_body",
+    "supply_zone_mode": "wick_to_body",
 }
 
 # Internal defaults – not exposed in UI but still respected if passed by strategy/engine.
@@ -589,6 +542,11 @@ _VIEW_PARAMS_INTERNAL = {
     "pivot_volume_spike_min_range_atr": 1.0,
     "pivot_zone_height_cap_atr": 3.0,
     "pivot_zone_height_cap_atr_supply": 1.75,
+    "pivot_zone_height_cap_atr_demand": 0.0,
+    "pivot_sweep_enabled": 1,
+    "pivot_sweep_min_atr": 0.25,
+    "pivot_sweep_lookback_bars": 220,
+    "require_pivot_sweep": 0,
     "zone_far_invalidate_enabled": 1,
     "zone_touch_departure_cooldown_bars": 6,
     "zone_departure_min_atr": 0.25,
@@ -600,8 +558,6 @@ _VIEW_PARAMS_INTERNAL = {
     "range_major_zone_width_atr": 0.85,
     "range_major_require_chop_trend": 1,
     "range_major_impulse_lookahead_bars": 8,
-    "internal_bos_min_leg_bars": 5,
-    "internal_bos_min_impulse_score": 2,
 }
 
 VIEW_PARAMS_META = {
@@ -779,34 +735,6 @@ VIEW_PARAMS_META = {
     "sd_zone_max_base_bars": {
         "title": "Max. délka base — zónu vůbec neregistrovat",
         "whatItMeans": "Demand/Supply s base_length větší než tato hodnota se ignorují (typicky dlouhá konsolidace). 0 = bez limitu.",
-    },
-    "bos_include_internal_pivots": {
-        "title": "Počítat BOS i na Internal H/L",
-        "whatItMeans": "Zapnuto = třetí nezávislý proud BOS událostí z internal pivotů (pro zóny); oranžové BOS čáry z internalů se ve View nevykreslují.",
-        "boolean_widget": True,
-    },
-    "show_sd_zones_from_major_bos": {
-        "title": "Zobrazit S/D zóny z BOS na Major swing",
-        "whatItMeans": "Demand/Supply vzniklé z prolomení major high/low.",
-        "boolean_widget": True,
-    },
-    "show_sd_zones_from_swing_bos": {
-        "title": "Zobrazit S/D zóny z BOS na běžném swing",
-        "whatItMeans": "Demand/Supply z klasického swing BOS.",
-        "boolean_widget": True,
-    },
-    "show_sd_zones_from_internal_bos": {
-        "title": "Zobrazit S/D zóny z BOS na Internal H/L",
-        "whatItMeans": "Výchozí vypnuto — zapni pro více zón; doporučeno s přísnějšími prahy internal_bos_*.",
-        "boolean_widget": True,
-    },
-    "internal_bos_min_leg_bars": {
-        "title": "Internal BOS — min. bary od pivotu k BOS",
-        "whatItMeans": "Kratší „nohy“ se zahodí (méně šumu v chopu). 0 = vypnuto.",
-    },
-    "internal_bos_min_impulse_score": {
-        "title": "Internal BOS — min. impulse score (1–4)",
-        "whatItMeans": "Zóna z internal BOS jen pokud impulzní skóre legu ≥ této hodnoty. 0 = vypnuto.",
     },
 }
 
@@ -1524,6 +1452,61 @@ def _clamp_pivot_zone_height(
     return zone_low, zone_high
 
 
+def _zone_bounds_from_pivot(
+    pivot_idx: int,
+    zone_type: str,
+    mode: str,
+    high_col: Any,
+    low_col: Any,
+    open_col: Any,
+    close_col: Any,
+) -> tuple[float, float]:
+    """
+    Konstrukce výšky zóny z pivot svíčky.
+
+    Mode:
+      - full: low -> high (původní)
+      - wick_to_body:
+          Demand: low -> max(open, close)
+          Supply: min(open, close) -> high
+      - body_only: min(open, close) -> max(open, close)
+      - refined:
+          Demand: low -> close pokud bullish, jinak low -> max(open, close)
+          Supply: close -> high pokud bearish, jinak min(open, close) -> high
+    """
+    i = int(pivot_idx)
+    lo = float(low_col.iloc[i])
+    hi = float(high_col.iloc[i])
+    op = float(open_col.iloc[i])
+    cl = float(close_col.iloc[i])
+    m = (mode or "full").strip().lower()
+    if m not in ("full", "wick_to_body", "body_only", "refined"):
+        m = "full"
+
+    body_low = min(op, cl)
+    body_high = max(op, cl)
+    if m == "full":
+        return lo, hi
+    if m == "body_only":
+        return body_low, body_high
+    if m == "wick_to_body":
+        if zone_type == "Demand":
+            return lo, body_high
+        if zone_type == "Supply":
+            return body_low, hi
+        return lo, hi
+    # refined
+    if zone_type == "Demand":
+        if cl >= op:
+            return lo, cl
+        return lo, body_high
+    if zone_type == "Supply":
+        if cl <= op:
+            return cl, hi
+        return body_low, hi
+    return lo, hi
+
+
 def _compute_impulse_score(
     ohlc: pd.DataFrame,
     pivot_idx: int,
@@ -1622,15 +1605,95 @@ def _find_pivot_momentum_leg(
     bos_type: str,
     high_col: Any,
     low_col: Any,
+    open_col: Any,
+    close_col: Any,
+    atr_series: pd.Series,
     major_swings: list[dict] | None = None,
     internals: list[dict] | None = None,
-) -> int | None:
+) -> tuple[int | None, dict]:
     """
     Pivot = bar s extrémem v momentum leg.
     Demand: min(low) od posledního swing low k BOS.
     Supply: max(high) od posledního swing high k BOS.
     Bez validního swingu v momentum leg zónu nevytváříme (žádný fallback bos_idx-30).
     """
+    meta: dict[str, Any] = {}
+    n = len(ohlc) if ohlc is not None else 0
+    if n <= 0:
+        return None, meta
+
+    def _refine(extreme_idx: int, search_start: int, search_end: int, zone_type: str) -> tuple[int, dict]:
+        """
+        Pivot refinement: nebrat slepě absolutní wick extrém, pokud je v legu dostupný podobně
+        hluboký (v ATR) bar s lepší kvalitou těla/close.
+        """
+        out_meta: dict[str, Any] = {
+            "pivot_idx_raw": int(extreme_idx),
+            "leg_start": int(search_start),
+            "leg_end": int(search_end),
+        }
+        if search_end <= search_start:
+            out_meta["pivot_refined"] = False
+            return int(extreme_idx), out_meta
+
+        try:
+            atr_ref = max(0, min(int(extreme_idx), len(atr_series) - 1))
+            atr_val = float(atr_series.iloc[atr_ref])
+        except Exception:
+            atr_val = 0.0
+        if atr_val <= 1e-12:
+            atr_val = 1e-8
+
+        k = 6
+        cand_idx: list[int] = list(range(int(search_start), int(search_end) + 1))
+        if zone_type == "Demand":
+            cand_idx.sort(key=lambda i: float(low_col.iloc[i]))
+        else:
+            cand_idx.sort(key=lambda i: -float(high_col.iloc[i]))
+        cand_idx = cand_idx[: min(k, len(cand_idx))]
+        if int(extreme_idx) not in cand_idx:
+            cand_idx.append(int(extreme_idx))
+
+        def score(i: int) -> float:
+            lo = float(low_col.iloc[i])
+            hi = float(high_col.iloc[i])
+            op = float(open_col.iloc[i])
+            cl = float(close_col.iloc[i])
+            rng = hi - lo
+            if rng <= 1e-12:
+                return -1e9
+            body = abs(cl - op)
+            body_ratio = body / rng
+            close_pos = (cl - lo) / rng  # 0..1
+            lower_wick = min(op, cl) - lo
+            upper_wick = hi - max(op, cl)
+            lower_wick_ratio = max(0.0, lower_wick) / rng
+            upper_wick_ratio = max(0.0, upper_wick) / rng
+            if zone_type == "Demand":
+                wick_pen = lower_wick_ratio
+                close_term = close_pos
+                dist = (lo - float(low_col.iloc[extreme_idx])) / atr_val  # >=0
+            else:
+                wick_pen = upper_wick_ratio
+                close_term = (1.0 - close_pos)
+                dist = (float(high_col.iloc[extreme_idx]) - hi) / atr_val  # >=0
+            dist = max(0.0, dist)
+            # body + close quality, penalizuj extrémní wick a vzdálenost od extrému legu
+            return (0.75 * body_ratio + 0.55 * close_term) - (0.95 * wick_pen) - (0.55 * dist)
+
+        best_i = int(extreme_idx)
+        best_s = score(best_i)
+        for i in cand_idx:
+            si = score(int(i))
+            if si > best_s + 1e-9:
+                best_s = si
+                best_i = int(i)
+
+        out_meta["pivot_idx_refined"] = best_i
+        out_meta["pivot_refined"] = bool(best_i != int(extreme_idx))
+        out_meta["pivot_refine_score"] = float(best_s)
+        return best_i, out_meta
+
     if bos_type == "bos_bullish":
         before = [s for s in swings if s["type"] == "low" and s["index"] < swing_idx]
         if internals:
@@ -1644,18 +1707,19 @@ def _find_pivot_momentum_leg(
                 if s.get("type") == "major_low" and s["index"] < swing_idx
             ]
         if not before:
-            return None
+            return None, meta
         start_idx = max(s["index"] for s in before)
         start_idx = min(start_idx, bos_idx - 1)
         search_start = max(0, start_idx)
         search_end = min(bos_idx, len(ohlc) - 1)
         if search_end <= search_start:
-            return None
+            return None, meta
         min_low_idx = min(
             range(search_start, search_end + 1),
             key=lambda i: float(low_col.iloc[i]),
         )
-        return min_low_idx
+        refined_idx, meta = _refine(int(min_low_idx), int(search_start), int(search_end), "Demand")
+        return refined_idx, meta
     else:
         before = [s for s in swings if s["type"] == "high" and s["index"] < swing_idx]
         if internals:
@@ -1669,18 +1733,19 @@ def _find_pivot_momentum_leg(
                 if s.get("type") == "major_high" and s["index"] < swing_idx
             ]
         if not before:
-            return None
+            return None, meta
         start_idx = max(s["index"] for s in before)
         start_idx = min(start_idx, bos_idx - 1)
         search_start = max(0, start_idx)
         search_end = min(bos_idx, len(ohlc) - 1)
         if search_end <= search_start:
-            return None
+            return None, meta
         max_high_idx = max(
             range(search_start, search_end + 1),
             key=lambda i: float(high_col.iloc[i]),
         )
-        return max_high_idx
+        refined_idx, meta = _refine(int(max_high_idx), int(search_start), int(search_end), "Supply")
+        return refined_idx, meta
 
 
 def _find_inducements(
@@ -1826,7 +1891,7 @@ def _atr_at_idx(atr_series: pd.Series, idx: int) -> float:
 
 
 def _zone_is_dominant_sd(z: dict, params: dict) -> bool:
-    if bool(z.get("is_major")):
+    if str(z.get("zone_origin") or "") == "major_proximity_chop":
         return True
     try:
         mb = int(params.get("dominant_zone_min_base", 4))
@@ -1924,11 +1989,7 @@ def _filter_demands_low_rrr_vs_major_supply(
     except (TypeError, ValueError):
         max_pair_atr = 4.0
 
-    supplies_major = [
-        z
-        for z in zones
-        if z.get("name") == "Supply" and bool(z.get("is_major"))
-    ]
+    supplies_major = [z for z in zones if z.get("name") == "Supply" and str(z.get("zone_origin") or "") == "major_proximity_chop"]
     remove: set[tuple[str, int, int]] = set()
 
     for d in zones:
@@ -2008,6 +2069,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     close_col = ohlc["close"] if "close" in ohlc.columns else ohlc["Close"]
     index = ohlc.index
     atr_series = _compute_atr(ohlc, atr_period)
+    vol_s = _volume_series(ohlc)
 
     events = get_bos(ohlc, hp)
     if not events:
@@ -2037,13 +2099,10 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
     zones: list[dict] = []
     base_cap = _sd_zone_max_base_cap(params)
 
-    # BOS - horizontální čára od Swing H/L k místu BOS (internal BOS jen do logiky zón, ne jako čára)
+    # BOS - horizontální čára od Swing H/L k místu BOS (po refaktoru Swing HL je BOS jen ze swingů)
     for ev in events:
-        if _event_bos_swing_kind(ev) == "internal":
-            continue
-        is_major = ev.get("is_major", False)
-        name = "BOS (M)" if is_major else "BOS"
-        fill = "rgba(251, 191, 36, 0.45)" if is_major else "rgba(245, 158, 11, 0.35)"
+        name = "BOS"
+        fill = "rgba(245, 158, 11, 0.35)"
         zones.append({
             "date_start": ev["swing_date"],
             "date_end": ev["bos_date"],
@@ -2064,35 +2123,113 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         if bos_idx < 1:
             continue
 
-        bos_kind = _event_bos_swing_kind(ev)
-        if bos_kind == "major" and not bool(int(params.get("show_sd_zones_from_major_bos", 1))):
-            continue
-        if bos_kind == "swing" and not bool(int(params.get("show_sd_zones_from_swing_bos", 1))):
-            continue
-        if bos_kind == "internal" and not bool(int(params.get("show_sd_zones_from_internal_bos", 0))):
-            continue
+        # BOS stream je jednotný („swing“) – filtr podle kindu nedává smysl.
+        bos_kind = "swing"
 
-        pivot_idx = _find_pivot_momentum_leg(
-            ohlc, swings, bos_idx, swing_idx, ev["type"], high_col, low_col, major_swings, internals
+        pivot_idx, pivot_meta = _find_pivot_momentum_leg(
+            ohlc,
+            swings,
+            bos_idx,
+            swing_idx,
+            ev["type"],
+            high_col,
+            low_col,
+            open_col,
+            close_col,
+            atr_series,
+            major_swings,
+            internals,
         )
         if pivot_idx is None:
             continue
 
-        zone_low = float(low_col.iloc[pivot_idx])
-        zone_high = float(high_col.iloc[pivot_idx])
+        # Výška zóny podle zvoleného módu (Demand/Supply zvlášť).
+        try:
+            dm_mode = str(params.get("demand_zone_mode", "wick_to_body"))
+        except Exception:
+            dm_mode = "wick_to_body"
+        try:
+            sp_mode = str(params.get("supply_zone_mode", "wick_to_body"))
+        except Exception:
+            sp_mode = "wick_to_body"
 
         atr_ref = pivot_idx - 1 if pivot_idx > 0 else pivot_idx
         atr_val = float(atr_series.iloc[atr_ref]) if atr_ref < len(atr_series) else float(atr_series.iloc[-1])
-        pivot_range = zone_high - zone_low
-        vol_s = _volume_series(ohlc)
-        if _pivot_skip_volume_spike(pivot_idx, pivot_range, atr_val, vol_s, params):
-            continue
-
+        # Nejprve určeme typ zóny z BOS
         if ev["type"] == "bos_bullish":
             zone_type = "Demand"
         elif ev["type"] == "bos_bearish":
             zone_type = "Supply"
         else:
+            continue
+
+        # Sweep kontext: pivot zasáhl prior swing liquidity?
+        sweep_meta: dict[str, Any] = {}
+        try:
+            sweep_enabled = bool(int(params.get("pivot_sweep_enabled", 1)))
+        except (TypeError, ValueError):
+            sweep_enabled = True
+        try:
+            sweep_min_atr = float(params.get("pivot_sweep_min_atr", 0.25))
+        except (TypeError, ValueError):
+            sweep_min_atr = 0.25
+        try:
+            sweep_lb = int(params.get("pivot_sweep_lookback_bars", 220))
+        except (TypeError, ValueError):
+            sweep_lb = 220
+
+        pivot_low_raw = float(low_col.iloc[pivot_idx])
+        pivot_high_raw = float(high_col.iloc[pivot_idx])
+        swept = False
+        dist_atr = 0.0
+        ref_idx = None
+        ref_price = None
+        if sweep_enabled and atr_val > 1e-12 and sweep_min_atr > 0:
+            lb_start = max(0, int(pivot_idx) - max(10, sweep_lb))
+            if zone_type == "Demand":
+                cands = [s for s in swings if s.get("type") == "low" and lb_start <= int(s.get("index", -1)) < int(pivot_idx)]
+                if cands:
+                    ref = max(cands, key=lambda s: int(s.get("index", 0)))
+                    ref_idx = int(ref.get("index", 0))
+                    ref_price = float(ref.get("price", 0.0))
+                    dist = ref_price - pivot_low_raw
+                    if dist > sweep_min_atr * atr_val:
+                        swept = True
+                        dist_atr = dist / atr_val
+            else:
+                cands = [s for s in swings if s.get("type") == "high" and lb_start <= int(s.get("index", -1)) < int(pivot_idx)]
+                if cands:
+                    ref = max(cands, key=lambda s: int(s.get("index", 0)))
+                    ref_idx = int(ref.get("index", 0))
+                    ref_price = float(ref.get("price", 0.0))
+                    dist = pivot_high_raw - ref_price
+                    if dist > sweep_min_atr * atr_val:
+                        swept = True
+                        dist_atr = dist / atr_val
+
+        sweep_meta = {
+            "pivot_sweep_enabled": bool(sweep_enabled),
+            "pivot_swept_prior_liquidity": bool(swept),
+            "pivot_sweep_distance_atr": float(dist_atr),
+            "pivot_sweep_ref_index": ref_idx,
+            "pivot_sweep_ref_price": ref_price,
+        }
+        if bool(int(params.get("require_pivot_sweep", 0))) and not swept:
+            continue
+
+        mode = dm_mode if zone_type == "Demand" else sp_mode
+        zone_low, zone_high = _zone_bounds_from_pivot(
+            int(pivot_idx),
+            zone_type,
+            mode,
+            high_col,
+            low_col,
+            open_col,
+            close_col,
+        )
+
+        pivot_range = zone_high - zone_low
+        if _pivot_skip_volume_spike(pivot_idx, pivot_range, atr_val, vol_s, params):
             continue
 
         zone_low, zone_high = _clamp_pivot_zone_height(zone_low, zone_high, zone_type, atr_val, params)
@@ -2139,7 +2276,6 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         if skip_duplicate:
             continue
 
-        is_major_bos = bool(ev.get("is_major", False))
         rightmost, has_touch, touch_bi, touch_mp = _compute_zone_width_right(
             ohlc,
             pivot_idx,
@@ -2153,7 +2289,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
             far_inv_atr,
             major_prot,
             params,
-            skip_far_invalidate=is_major_bos,
+            skip_far_invalidate=False,
         )
 
         if ev["type"] == "bos_bullish":
@@ -2167,16 +2303,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 bos_kind, base_length, base_cap, bos_idx, swing_idx, impulse_score, params
             ):
                 continue
-            inducements, inducement_count, inducement_points = _find_inducements(
-                ohlc, zone_low, zone_high, pivot_idx, rightmost, "Demand",
-                swings, internals, major_swings, atr_series,
-            )
-            if bos_kind == "major":
-                fill = "rgba(59, 130, 246, 0.40)" if has_touch else "rgba(59, 130, 246, 0.28)"
-            elif bos_kind == "internal":
-                fill = "rgba(134, 239, 172, 0.30)" if has_touch else "rgba(134, 239, 172, 0.20)"
-            else:
-                fill = "rgba(34, 197, 94, 0.38)" if has_touch else "rgba(34, 197, 94, 0.25)"
+            fill = "rgba(34, 197, 94, 0.38)" if has_touch else "rgba(34, 197, 94, 0.25)"
             zone_dict: dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
@@ -2190,13 +2317,16 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "base_length": base_length,
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
-                "is_major": ev.get("is_major", False),
-                "bos_swing_kind": bos_kind,
-                "zone_origin": "bos",
-                "inducements": inducements,
-                "inducement_count": inducement_count,
-                "inducement_points": inducement_points,
+                "bos_origin": "swing",
+                "zone_origin": "bos_swing",
+                "inducements": [],
+                "inducement_count": 0,
+                "inducement_points": 0,
             }
+            if pivot_meta:
+                zone_dict["pivot_meta"] = dict(pivot_meta)
+            if sweep_meta:
+                zone_dict.update(sweep_meta)
             if gap_info:
                 zone_dict.update(gap_info)
             if has_touch and touch_bi is not None and touch_mp is not None:
@@ -2216,16 +2346,7 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 bos_kind, base_length, base_cap, bos_idx, swing_idx, impulse_score, params
             ):
                 continue
-            inducements, inducement_count, inducement_points = _find_inducements(
-                ohlc, zone_low, zone_high, pivot_idx, rightmost, "Supply",
-                swings, internals, major_swings, atr_series,
-            )
-            if bos_kind == "major":
-                fill = "rgba(168, 85, 247, 0.40)" if has_touch else "rgba(168, 85, 247, 0.28)"
-            elif bos_kind == "internal":
-                fill = "rgba(252, 165, 165, 0.30)" if has_touch else "rgba(252, 165, 165, 0.20)"
-            else:
-                fill = "rgba(239, 68, 68, 0.38)" if has_touch else "rgba(239, 68, 68, 0.25)"
+            fill = "rgba(239, 68, 68, 0.38)" if has_touch else "rgba(239, 68, 68, 0.25)"
             zone_dict = {
                 "date_start": _to_date_str(index[leftmost]),
                 "date_end": _to_date_str(index[rightmost]),
@@ -2239,13 +2360,16 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
                 "base_length": base_length,
                 "impulse_score": impulse_score,
                 "has_touch": has_touch,
-                "is_major": ev.get("is_major", False),
-                "bos_swing_kind": bos_kind,
-                "zone_origin": "bos",
-                "inducements": inducements,
-                "inducement_count": inducement_count,
-                "inducement_points": inducement_points,
+                "bos_origin": "swing",
+                "zone_origin": "bos_swing",
+                "inducements": [],
+                "inducement_count": 0,
+                "inducement_points": 0,
             }
+            if pivot_meta:
+                zone_dict["pivot_meta"] = dict(pivot_meta)
+            if sweep_meta:
+                zone_dict.update(sweep_meta)
             if gap_info:
                 zone_dict.update(gap_info)
             if has_touch and touch_bi is not None and touch_mp is not None:
@@ -2278,14 +2402,6 @@ def get_zones(ohlc: pd.DataFrame, params: dict | None = None) -> list[dict]:
         price_overlap_threshold,
         atr_period,
     )
-
-    if base_cap > 0:
-        zones = [
-            z
-            for z in zones
-            if z.get("name") not in ("Demand", "Supply")
-            or int(z.get("base_length") or 0) <= base_cap
-        ]
 
     if 0 < overlap_trim <= 1.0:
         _trim_overlapping_sd_zones(zones, index, overlap_trim)

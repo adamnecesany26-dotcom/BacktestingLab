@@ -1184,6 +1184,8 @@ export function StrategyViewChart({
   const majorLowMarkers = markers.filter((m) => m.type === "major_low");
   const internalHighMarkers = markers.filter((m) => m.type === "internal_high");
   const internalLowMarkers = markers.filter((m) => m.type === "internal_low");
+  const bosBullMarkers = markers.filter((m) => m.type === "bos_bullish");
+  const bosBearMarkers = markers.filter((m) => m.type === "bos_bearish");
   const otherMarkers = markers.filter(
     (m) =>
       m.type !== "high" &&
@@ -1191,7 +1193,9 @@ export function StrategyViewChart({
       m.type !== "major_high" &&
       m.type !== "major_low" &&
       m.type !== "internal_high" &&
-      m.type !== "internal_low"
+      m.type !== "internal_low" &&
+      m.type !== "bos_bullish" &&
+      m.type !== "bos_bearish"
   );
 
   /** Swing H/L na správném baru musí sedět na knot svíčky (Parquet někdy nese jiné měřítko ceny než View OHLC). */
@@ -1298,6 +1302,13 @@ export function StrategyViewChart({
     .map((m) => mapSwingMarker(m))
     .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
   const otherMapped = otherMarkers
+    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+
+  const bosBullMapped = bosBullMarkers
+    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
+    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
+  const bosBearMapped = bosBearMarkers
     .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
     .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
 
@@ -1465,6 +1476,42 @@ export function StrategyViewChart({
             line: { color: "#fff", width: 1 },
           },
           name: "Signal",
+          showlegend: true,
+        }
+      : null;
+
+  const bosBullTrace: any =
+    bosBullMapped.length > 0
+      ? {
+          type: "scatter",
+          x: bosBullMapped.map((p) => p.idx),
+          y: bosBullMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 11,
+            color: "#14b8a6",
+            symbol: "triangle-up",
+            line: { color: "#fff", width: 1 },
+          },
+          name: "BOS ↑",
+          showlegend: true,
+        }
+      : null;
+
+  const bosBearTrace: any =
+    bosBearMapped.length > 0
+      ? {
+          type: "scatter",
+          x: bosBearMapped.map((p) => p.idx),
+          y: bosBearMapped.map((p) => p.val),
+          mode: "markers",
+          marker: {
+            size: 11,
+            color: "#c084fc",
+            symbol: "triangle-down",
+            line: { color: "#fff", width: 1 },
+          },
+          name: "BOS ↓",
           showlegend: true,
         }
       : null;
@@ -1793,6 +1840,8 @@ export function StrategyViewChart({
   if (visibility.major_hl && majorLowTrace) traces.push({ ...majorLowTrace, ...pax });
   if (visibility.internal_hl && internalHighTrace) traces.push({ ...internalHighTrace, ...pax });
   if (visibility.internal_hl && internalLowTrace) traces.push({ ...internalLowTrace, ...pax });
+  if (visibility.swing_hl && bosBullTrace) traces.push({ ...bosBullTrace, ...pax });
+  if (visibility.swing_hl && bosBearTrace) traces.push({ ...bosBearTrace, ...pax });
   if (otherTrace) traces.push({ ...otherTrace, ...pax });
   if (visibility.inducement_points) {
     if (inducementDemandTrace) traces.push({ ...inducementDemandTrace, ...pax });

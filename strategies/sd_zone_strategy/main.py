@@ -1242,7 +1242,9 @@ class Strategy(bt.Strategy):
             n_far = int(getattr(self.params, "zone_trading_far_consecutive_exec_bars", 0) or 0)
             min_track = int(getattr(self.params, "zone_trading_far_min_track_exec_bars", 0) or 0)
             track_age_bars = len(self) - int(st.get("track_started_bar", len(self)))
-            is_mj = bool(z.get("is_major"))
+            # S/D modul normalizuje schema: místo `is_major` používá `zone_origin`.
+            # Major-proximity zóny (chop kolem major structure) neukončujeme far pravidlem.
+            is_mj = str(z.get("zone_origin") or "") == "major_proximity_chop"
             if not is_mj and mult_far > 0 and n_far > 0 and track_age_bars >= min_track:
                 dist = _distance_close_to_zone_box(bar_close, zl, zh)
                 if dist > mult_far * atr_live:

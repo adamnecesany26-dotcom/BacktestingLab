@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from app.services import artifact_store
@@ -136,6 +137,18 @@ def _resolve_want_hl_artifact_tf_key(
     return _infer_native_tf_key_from_chart_index(chart_index)
 
 
+def _htf_trend_source_tf_key(chart_artifact_tf: str | None) -> str:
+    """Shodně se Swing_HL._htf_trend_source_tf: měsíc a týden → 1M artefakt, jinak 1d."""
+    if not chart_artifact_tf:
+        return "1d"
+    s = str(chart_artifact_tf).strip().replace("/", "_")
+    if s == "1M" or s.upper() in ("1MO", "1ME"):
+        return "1M"
+    if s.lower() == "1w":
+        return "1M"
+    return "1d"
+
+
 def _pick_hl_tf_key(manifest: dict[str, Any], want_key: str | None) -> str | None:
     """
     Vybere klíč TF v H/L manifestu.
@@ -249,6 +262,10 @@ def _iso_within_index(idx: pd.DatetimeIndex, iso_s: str) -> bool:
 
 def _ts_to_chart_bar_index(idx: pd.DatetimeIndex, ts: pd.Timestamp) -> int | None:
     try:
+        if idx is not None and not idx.empty:
+            loc = idx.get_indexer([pd.Timestamp(ts)], method=None)
+            if len(loc) and int(loc[0]) >= 0:
+                return int(loc[0])
         pos = int(idx.searchsorted(ts, side="left"))
         return int(min(max(0, pos), len(idx) - 1))
     except Exception:
@@ -328,6 +345,36 @@ def _row_bos_time(row: pd.Series) -> Any:
     return None
 
 
+def _bar_index_from_calendar_date(chart_index: pd.DatetimeIndex, iso_cell: Any) -> int | None:
+    """Denní / týdenní graf: najdi první bar se stejným kalendářním datem jako iso (TZ odolné)."""
+    ts = _coerce_ts_for_chart_index(chart_index, iso_cell)
+    if ts is None:
+        try:
+            ts = pd.Timestamp(str(iso_cell).strip())
+        except Exception:
+            return None
+    if ts is None or pd.isna(ts):
+        return None
+    try:
+        d = pd.Timestamp(ts).date()
+    except Exception:
+        return None
+    try:
+        t0d = pd.Timestamp(chart_index.min()).date()
+        t1d = pd.Timestamp(chart_index.max()).date()
+    except Exception:
+        return None
+    if d < t0d or d > t1d:
+        return None
+    for i in range(len(chart_index)):
+        try:
+            if pd.Timestamp(chart_index[i]).date() == d:
+                return int(i)
+        except Exception:
+            continue
+    return None
+
+
 def _hl_row_bar_index(
     chart_index: pd.DatetimeIndex,
     iso_cell: Any,
@@ -336,20 +383,43 @@ def _hl_row_bar_index(
 ) -> int | None:
     """
     Swing/BOS/trend řádek → index baru na aktuálním df_chart.
-    Pořadí: **platný bar_index (po offsetu)** → čas ze souboru → syrový čas oříznutý do [min,max].
 
-    Dříve měl čas přednost — špatně parsované / nesouvisející `iso_time` z Parquetu pak uměly
-    `searchsorted` shodit tisíce řádků na jeden bar (stejné datum na grafu i v „Values“).
+    1) ``iso_time`` **uvnitř** [min,max] grafu → pozice podle času (správně při suffix okně / špatném offsetu).
+    2) Platný ``bar_index`` po offsetu (spolehlivé při sdíleném špatném ISO mimo rozsah grafu).
+    3) Slack na okrajích (_artifact_ts_usable_on_chart).
+    4) Kalendářní shoda data při řadách hrubších než intradenní.
     """
+    if chart_len <= 0 or chart_index is None or chart_index.empty:
+        return None
+
+    gap_med = _median_bar_gap_minutes(chart_index)
+    coarse_series = gap_med is not None and float(gap_med) >= 12.0 * 60.0
+
+    if iso_cell is not None:
+        # U denních/týdenních řad ISO často drží půlnoc, index grafu může být session offset —
+        # searchsorted dřív mapoval na „špatnou“ svíčku; kalendářní den první.
+        if coarse_series:
+            bi_cal = _bar_index_from_calendar_date(chart_index, iso_cell)
+            if bi_cal is not None:
+                return bi_cal
+        ts_in = parse_iso_timestamp_for_index(chart_index, iso_cell)
+        if ts_in is not None and _ts_within_index(chart_index, ts_in):
+            pos = _ts_to_chart_bar_index(chart_index, ts_in)
+            if pos is not None:
+                return pos
+
     bi_cand = _safe_bar_index_for_chart(bi_adj, chart_len) if bi_adj is not None else None
     if bi_cand is not None:
         return bi_cand
+
     ts_use = _artifact_ts_usable_on_chart(chart_index, iso_cell)
     if ts_use is not None:
         return _ts_to_chart_bar_index(chart_index, ts_use)
-    # Dříve zde běžel fallback: tclip = clamp(ts_raw, t0, t1) → searchsorted. Časy z artefaktu
-    # **před** začátkem viditelného okna pak vždy skončily na t0 → jeden bar (první svíčka),
-    # stejné datum u stovek markerů ve Values i na grafu.
+
+    if coarse_series and iso_cell is not None:
+        bi_cal = _bar_index_from_calendar_date(chart_index, iso_cell)
+        if bi_cal is not None:
+            return bi_cal
     return None
 
 
@@ -394,6 +464,101 @@ def _suffix_bar_index_offset(
     if chart_len > int(artifact_bar_count):
         return 0
     return max(0, int(artifact_bar_count) - chart_len)
+
+
+def _infer_artifact_bar_count_from_parquet(df: pd.DataFrame | None) -> int | None:
+    """
+    Když je manifest ``bar_count`` chybný/legacy, dokážeme odhadnout délku precompute řady
+    z Parquetu: max(bar_index)+1. To je robustnější než spoléhat na iso_time.
+    """
+    if df is None or df.empty or "bar_index" not in df.columns:
+        return None
+    try:
+        s = pd.to_numeric(df["bar_index"], errors="coerce")
+        s = s[pd.notna(s)]
+        if len(s) == 0:
+            return None
+        mx = int(s.max())
+        # Heuristic: artifact bar_count should never be smaller than the currently loaded chart window.
+        # If Parquet contains a single bogus/zero index, don't treat it as a reliable bar_count.
+        return mx + 1 if mx >= 0 else None
+    except Exception:
+        return None
+
+
+def _best_suffix_bar_index_offset(
+    *,
+    df_hint: pd.DataFrame | None,
+    manifest_bar_count: int | None,
+    chart_len: int,
+    start_iso: str | None,
+    end_iso: str | None,
+) -> int:
+    """
+    Vybere offset, který dá nejvíc platných indexů v aktuálním ``df_chart``.
+    Priorita: manifest offset, ale pokud je zjevně špatný (mapuje téměř nic),
+    zkusíme odhad z Parquetu.
+    """
+    if start_iso and str(start_iso).strip():
+        return 0
+    if end_iso and str(end_iso).strip():
+        return 0
+    cand: list[int] = []
+    cand.append(_suffix_bar_index_offset(manifest_bar_count, chart_len, start_iso, end_iso))
+    inferred = _infer_artifact_bar_count_from_parquet(df_hint)
+    if inferred is not None and inferred >= int(chart_len):
+        cand.append(_suffix_bar_index_offset(inferred, chart_len, start_iso, end_iso))
+    cand.append(0)
+    # uniq preserve order
+    seen: set[int] = set()
+    cand2: list[int] = []
+    for c in cand:
+        if c in seen:
+            continue
+        seen.add(c)
+        cand2.append(c)
+
+    def _score(off: int) -> int:
+        if df_hint is None or df_hint.empty or "bar_index" not in df_hint.columns:
+            return 0
+        try:
+            s = pd.to_numeric(df_hint["bar_index"], errors="coerce")
+            s = s[pd.notna(s)]
+            if len(s) == 0:
+                return 0
+            # count in-range after offset
+            adj = s.astype("int64") - int(off)
+            return int(((adj >= 0) & (adj < int(chart_len))).sum())
+        except Exception:
+            return 0
+
+    if not cand2:
+        return 0
+
+    baseline = cand2[0]
+    baseline_score = _score(baseline)
+
+    best = baseline
+    best_score = baseline_score
+    for c in cand2[1:]:
+        sc = _score(c)
+        if sc > best_score:
+            best, best_score = c, sc
+
+    # If manifest provides bar_count, prefer its offset unless the alternative is a *clear* win.
+    # This protects against cases where Parquet has a misleading/small bar_index column but correct iso_time.
+    if manifest_bar_count is not None and best != baseline:
+        try:
+            total = int(len(df_hint)) if (df_hint is not None and not df_hint.empty) else 0
+        except Exception:
+            total = 0
+        # Require a meaningful absolute improvement (at least 20 rows or 10% of file) to override manifest.
+        min_abs = 20
+        min_rel = int(max(0, total) * 0.10)
+        if (best_score - baseline_score) < max(min_abs, min_rel):
+            return int(baseline)
+
+    return int(best)
 
 
 def _normalize_hl_marker_type(raw: str, role: str) -> str:
@@ -446,6 +611,38 @@ def _sync_hl_marker_price_to_ohlc_bar(
     if t in ("low", "major_low", "internal_low") and lo is not None:
         return lo
     return price
+
+
+def _count_swings_rows_mappable_to_chart(
+    sw_df: pd.DataFrame,
+    chart_index: pd.DatetimeIndex,
+    bar_index_offset: int,
+) -> int:
+    """
+    Počet řádků swings Parquet, u kterých známe cílový bar v ``chart_index`` (stejná logika jako u
+    mapování, jen bez kontroly / synchronizace ceny). Pro heuristiku banneru při oříznutém View —
+    nelze porovnávat ``len(sw_marks)`` s ``len(sw_df)`` z celého datasetu.
+    """
+    sw_df = _normalize_hl_parquet_df(sw_df)
+    if sw_df is None or sw_df.empty or chart_index.empty:
+        return 0
+    n = len(chart_index)
+    off = max(0, int(bar_index_offset))
+    cnt = 0
+    for _, row in sw_df.iterrows():
+        rs = row if isinstance(row, pd.Series) else pd.Series(row)
+        iso_cell = _row_iso_like(rs)
+        bi_raw = rs.get("bar_index")
+        bi_adj: int | None = None
+        if bi_raw is not None:
+            try:
+                if not (isinstance(bi_raw, float) and pd.isna(bi_raw)):
+                    bi_adj = int(bi_raw) - off
+            except (TypeError, ValueError):
+                bi_adj = None
+        if _hl_row_bar_index(chart_index, iso_cell, bi_adj, n) is not None:
+            cnt += 1
+    return int(cnt)
 
 
 def _markers_from_hl_parquet(
@@ -571,6 +768,58 @@ def _trend_line_from_df(
         pts.append(p)
     if not pts:
         return None
+    return {"name": "HL trend", "data": pts}
+
+
+def _trend_line_merge_htf_to_chart(
+    htf_df: pd.DataFrame,
+    chart_index: pd.DatetimeIndex,
+) -> dict[str, Any] | None:
+    """
+    HTF trend parquet (1M nebo 1d) → řada ``data[]`` se stejnou délkou jako ``chart_index``
+    (merge_asof backward + ffill), aby View nemusel přepočítávat modul.
+    """
+    df = _normalize_hl_parquet_df(htf_df)
+    if df is None or df.empty or chart_index.empty:
+        return None
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        rs = row if isinstance(row, pd.Series) else pd.Series(row)
+        iso_cell = _row_iso_like(rs)
+        ts = _coerce_ts_for_chart_index(chart_index, iso_cell)
+        if ts is None:
+            continue
+        val = _float_or_none(rs.get("line_value", rs.get("value")))
+        if val is None:
+            continue
+        sc = _float_or_none(rs.get("score"))
+        st = rs.get("state")
+        rows.append({
+            "ts": pd.Timestamp(ts),
+            "value": val,
+            "score": 0.0 if sc is None else sc,
+            "state": str(st) if st is not None and str(st).strip() else "RANGE",
+        })
+    if not rows:
+        return None
+    r = pd.DataFrame(rows).sort_values("ts").drop_duplicates(subset=["ts"], keep="last")
+    l_df = pd.DataFrame({"ord": np.arange(len(chart_index)), "ts": chart_index})
+    l_sorted = l_df.sort_values("ts")
+    m = pd.merge_asof(l_sorted, r, on="ts", direction="backward")
+    m = m.sort_values("ord")
+    m["value"] = pd.to_numeric(m["value"], errors="coerce").ffill().bfill()
+    m["score"] = pd.to_numeric(m["score"], errors="coerce").ffill().bfill()
+    m["state"] = m["state"].ffill().bfill().fillna("RANGE")
+    pts: list[dict[str, Any]] = []
+    for i in range(len(m)):
+        bi = int(m["ord"].iloc[i])
+        sc_f = float(m["score"].iloc[i]) if pd.notna(m["score"].iloc[i]) else 0.0
+        pts.append({
+            "date": _to_iso(chart_index[bi]),
+            "value": float(m["value"].iloc[i]),
+            "score": sc_f,
+            "state": str(m["state"].iloc[i]),
+        })
     return {"name": "HL trend", "data": pts}
 
 
@@ -751,6 +1000,13 @@ def build_view_from_artifacts(
             p = hl_dir / sw_name
             if p.is_file():
                 sw_df = _normalize_hl_parquet_df(pd.read_parquet(p))
+                bi_off = _best_suffix_bar_index_offset(
+                    df_hint=sw_df,
+                    manifest_bar_count=artifact_bar_count,
+                    chart_len=len(chart_index),
+                    start_iso=start_iso,
+                    end_iso=end_iso,
+                )
                 sw_marks = _markers_from_hl_parquet(
                     sw_df,
                     chart_index,
@@ -758,54 +1014,35 @@ def build_view_from_artifacts(
                     bar_index_offset=bi_off,
                     ohlc_df=df_chart,
                 )
+                in_window = _count_swings_rows_mappable_to_chart(sw_df, chart_index, bi_off)
+                min_mapped = max(8, int(in_window * 0.22))
                 if (
                     sw_df is not None
                     and not sw_df.empty
-                    and len(sw_df) > 80
-                    and len(sw_marks) < max(8, len(sw_df) // 25)
+                    and in_window > 80
+                    and len(sw_marks) < min_mapped
                 ):
                     warn = (
-                        f"Swings ({tf_key}): v Parquet je {len(sw_df)} řádků, na graf se podařilo "
-                        f"namapovat jen {len(sw_marks)} — zkontroluj data/TF, popř. Build znovu."
+                        f"Swings ({tf_key}): v čase grafu je ~{in_window} swingů z artefaktu, "
+                        f"namapovalo se jen {len(sw_marks)} (cena/typ?) — zkontroluj data/TF, popř. Build znovu."
                     )
                     banner = f"{banner}; {warn}" if banner else warn
                 markers.extend(sw_marks)
-        int_name = arts.get("internals")
-        if int_name:
-            p = hl_dir / int_name
-            if p.is_file():
-                markers.extend(
-                    _markers_from_hl_parquet(
-                        pd.read_parquet(p),
-                        chart_index,
-                        "internal",
-                        bar_index_offset=bi_off,
-                        ohlc_df=df_chart,
-                    )
-                )
-        maj_name = arts.get("majors")
-        if maj_name:
-            p = hl_dir / maj_name
-            if p.is_file():
-                markers.extend(
-                    _markers_from_hl_parquet(
-                        pd.read_parquet(p),
-                        chart_index,
-                        "major",
-                        bar_index_offset=bi_off,
-                        ohlc_df=df_chart,
-                    )
-                )
         bos_name = arts.get("bos")
         if bos_name:
             p = hl_dir / bos_name
             if p.is_file():
                 markers.extend(_markers_from_bos_df(pd.read_parquet(p), chart_index, bar_index_offset=bi_off))
-        tr_name = arts.get("trend")
+
+        trend_src_tf = _htf_trend_source_tf_key(want_tf or tf_key)
+        trend_pkg = (hl_manifest.get("artifacts") or {}).get(trend_src_tf) or {}
+        tr_name = trend_pkg.get("trend") if isinstance(trend_pkg, dict) else None
+        if not tr_name:
+            tr_name = arts.get("trend")
         if tr_name:
             p = hl_dir / tr_name
             if p.is_file():
-                tl = _trend_line_from_df(pd.read_parquet(p), chart_index, bar_index_offset=bi_off)
+                tl = _trend_line_merge_htf_to_chart(pd.read_parquet(p), chart_index)
                 if tl:
                     lines.append(tl)
 
