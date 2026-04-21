@@ -766,6 +766,110 @@ def test_build_view_hl_swings_and_sd_zone(tmp_path: Path) -> None:
     assert out["zones"][0].get("touch_bar_index") is not None
 
 
+def test_build_view_sd_zones_filtered_by_chart_timeframe(tmp_path: Path) -> None:
+    """S/D Parquet může obsahovat více ``source_tf``; View má ukázat jen TF shodný s grafem (jako H/L)."""
+    data_dir = tmp_path / "data"
+    (data_dir / "t").mkdir(parents=True)
+    fpth = data_dir / "t" / "x.parquet"
+    _minimal_parquet(fpth)
+    rel = "t/x.parquet"
+    fp = fingerprint_dataset_file(fpth)
+    did = artifact_store.compute_dataset_id(rel, fp, years=None, start_iso=None, end_iso=None)
+
+    hl_dir = artifact_store.hl_version_dir(tmp_path, did)
+    hl_dir.mkdir(parents=True, exist_ok=True)
+    sw = pd.DataFrame([
+        {"bar_index": 5, "iso_time": "2024-06-06T00:00:00", "type": "high", "price": 105.0},
+    ])
+    sw.to_parquet(hl_dir / "1d_swings.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_internals.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_majors.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_bos.parquet", index=False)
+    pd.DataFrame([]).to_parquet(hl_dir / "1d_trend.parquet", index=False)
+
+    hl_manifest = artifact_store.build_hl_manifest_skeleton(
+        dataset_id=did,
+        data_file=rel,
+        data_fingerprint=fp,
+        time_range_start="2024-06-01T00:00:00",
+        time_range_end="2024-06-30T00:00:00",
+        years=1.0,
+        hl_module_digest="test",
+        params_snapshot={},
+        tf_ladder=["1d"],
+    )
+    hl_manifest["artifacts"] = {
+        "1d": {
+            "swings": "1d_swings.parquet",
+            "internals": "1d_internals.parquet",
+            "majors": "1d_majors.parquet",
+            "bos": "1d_bos.parquet",
+            "trend": "1d_trend.parquet",
+        }
+    }
+    (hl_dir / "manifest.json").write_text(json.dumps(hl_manifest), encoding="utf-8")
+
+    def _zone_row(zid: str, source_tf: str) -> dict:
+        return {
+            "zone_id": zid,
+            "kind": "demand",
+            "source_tf": source_tf,
+            "born_at": "2024-06-10T00:00:00",
+            "range_start_at": "2024-06-08T00:00:00",
+            "range_end_at": "2024-06-20T00:00:00",
+            "died_at": None,
+            "price_low": 97.0,
+            "price_high": 99.0,
+            "range_size": 2.0,
+            "base_length": 2,
+            "has_inducement": False,
+            "impulse_score": 2.0,
+            "touch1_at": None,
+            "touch1_price": None,
+            "touch2_at": None,
+            "touch2_price": None,
+            "max_age_before_death": None,
+            "with_trend": False,
+            "pivot_idx": 0,
+            "start_idx": 0,
+            "end_idx": 0,
+        }
+
+    sd_dir = artifact_store.sd_version_dir(tmp_path, did)
+    sd_dir.mkdir(parents=True, exist_ok=True)
+    zrows = [_zone_row("daily", "1d"), _zone_row("h4", "4h")]
+    pd.DataFrame(zrows).to_parquet(sd_dir / "zones.parquet", index=False)
+    sd_m = artifact_store.build_sd_manifest_skeleton(
+        dataset_id=did,
+        data_file=rel,
+        data_fingerprint=fp,
+        time_range_start="2024-06-01T00:00:00",
+        time_range_end="2024-06-30T00:00:00",
+        years=1.0,
+        hl_module_digest="test",
+        sd_module_digest="test",
+        params_snapshot={},
+        hl_manifest_path_rel=f"{did}/hl/v1/manifest.json",
+    )
+    sd_m["artifacts"] = {"zones": "zones.parquet", "rows": 2}
+    (sd_dir / "manifest.json").write_text(json.dumps(sd_m), encoding="utf-8")
+
+    chart = pd.read_parquet(fpth)
+    out = build_view_from_artifacts(
+        data_dir=data_dir,
+        data_file=rel,
+        years=1.0,
+        start_iso=None,
+        end_iso=None,
+        df_chart=chart,
+        chart_tf_normalized="1D",
+        include_sd=True,
+        repo_root_for_artifacts=tmp_path,
+    )
+    assert len(out["zones"]) == 1
+    assert out["zones"][0].get("name") == "Demand"
+
+
 def test_hl_manifest_tf_key_legacy_1D_capital(tmp_path: Path) -> None:
     """Manifest klíč ``1D`` (legacy) musí sedět s požadavkem na denní TF."""
     data_dir = tmp_path / "data"

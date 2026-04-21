@@ -65,6 +65,63 @@ def test_get_swings_always_list(sh):
     assert all(s.get("type") in ("high", "low") for s in out)
 
 
+def test_bos_bullish_uses_actually_broken_high_not_only_latest_swing(sh):
+    """
+    Starší nižší swing high je close proražen, ale mezitím vznikl novější vyšší high, který
+    close ještě nezlomilo — BOS musí platit vůči nižšímu (relevantnímu) high, ne vůči „poslednímu“
+    swing high bez ohledu na průraz.
+    """
+    idx = pd.date_range("2020-01-01", periods=50, freq="1D", tz="UTC")
+    ohlc = pd.DataFrame(
+        {
+            "open": [100.0] * 50,
+            "high": [100.0] * 50,
+            "low": [100.0] * 50,
+            "close": [100.0] * 50,
+        },
+        index=idx,
+    )
+    swings = [
+        {"type": "high", "price": 100.0, "index": 10, "timestamp": idx[10]},
+        {"type": "low", "price": 90.0, "index": 12, "timestamp": idx[12]},
+        {"type": "high", "price": 110.0, "index": 20, "timestamp": idx[20]},
+    ]
+    ohlc.loc[idx[25], ["open", "high", "low", "close"]] = [102.0, 104.0, 102.0, 103.0]
+    bos = sh._find_bos_from_swings(ohlc, swings, {"acceptance_bars": 1})
+    assert len(bos) == 1
+    assert bos[0]["type"] == "bos_bullish"
+    assert int(bos[0]["bos_index"]) == 25
+    assert abs(float(bos[0]["level"]) - 100.0) < 1e-9
+
+
+def test_bos_extreme_vs_newest_pick_among_two_broken_highs(sh):
+    """extreme = nejvyšší proražené high; newest = nejnovější index mezi proraženými."""
+    idx = pd.date_range("2020-01-01", periods=45, freq="1D", tz="UTC")
+    ohlc = pd.DataFrame(
+        {
+            "open": [99.0] * 45,
+            "high": [99.0] * 45,
+            "low": [99.0] * 45,
+            "close": [99.0] * 45,
+        },
+        index=idx,
+    )
+    swings = [
+        {"type": "high", "price": 106.0, "index": 5, "timestamp": idx[5]},
+        {"type": "high", "price": 102.0, "index": 25, "timestamp": idx[25]},
+    ]
+    ohlc.loc[idx[30], ["open", "high", "low", "close"]] = [106.5, 108.0, 106.0, 107.0]
+    for k in range(31, 45):
+        ohlc.loc[idx[k], ["open", "high", "low", "close"]] = [107.0, 108.0, 106.5, 107.5]
+    p_ext = {"acceptance_bars": 1, "bos_max_lookback_swings": 0, "bos_pivot_pick": "extreme"}
+    p_new = {"acceptance_bars": 1, "bos_max_lookback_swings": 0, "bos_pivot_pick": "newest"}
+    bos_e = sh._find_bos_from_swings(ohlc, swings, p_ext)
+    bos_n = sh._find_bos_from_swings(ohlc, swings, p_new)
+    assert len(bos_e) >= 1 and len(bos_n) >= 1
+    assert abs(float(bos_e[0]["level"]) - 106.0) < 1e-9
+    assert abs(float(bos_n[0]["level"]) - 102.0) < 1e-9
+
+
 def test_get_bos_single_pivot_stream_no_major_events(sh):
     """Jeden zdroj pivotů — BOS jen z běžných high/low (žádná paralelní major větev)."""
     rng = np.random.default_rng(7)

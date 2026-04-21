@@ -1,0 +1,581 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtesting_app — S/D zones + Swing HL + BOS (Option B spec). v1.1.4
+//@version=6
+indicator("SD Zones + Swing HL + BOS", shorttitle="SD_HL_BOS", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000)
+
+float ATR_FLOOR = 0.0001
+float MIN_THRESHOLD_ATR_RATIO = 0.24
+
+string gSwing = "Swings"
+float inpSensitivity = input.float(0.93, "Sensitivity", minval=0.5, maxval=3.0, step=0.01, group=gSwing)
+float inpAtrMult = input.float(1.44, "ATR multiplier", minval=0.5, maxval=3.5, step=0.01, group=gSwing)
+float inpSwingSpacing = input.float(1.0, "Swing spacing (sparsity)", minval=0.35, maxval=5.0, step=0.05, group=gSwing)
+color inpColSwingHigh = input.color(color.new(#22c55e, 65), "Swing high color", group=gSwing)
+color inpColSwingLow = input.color(color.new(#3b82f6, 65), "Swing low color", group=gSwing)
+
+string gBos = "BOS"
+color inpColBos = input.color(color.new(#ef4444, 45), "BOS line color", group=gBos)
+int inpBosWidth = input.int(1, "BOS line width", minval=1, maxval=4, group=gBos)
+string inpBosStyle = input.string("Dashed", "BOS line style", options=["Solid", "Dashed", "Dotted"], group=gBos)
+int inpBosMaxLookbackSwings = input.int(20, "BOS max lookback swings (0 = all)", minval=0, maxval=100, group=gBos)
+string inpBosPivotPick = input.string("extreme", "BOS pivot pick", options=["extreme", "newest"], group=gBos)
+int inpAcceptanceBars = input.int(1, "Acceptance bars after BOS", minval=0, maxval=5, group=gBos)
+
+string gZone = "Zones"
+color inpDemandFill = input.color(color.new(#22c55e, 86), "Demand fill (~14% opacity)", group=gZone)
+color inpSupplyFill = input.color(color.new(#ef4444, 86), "Supply fill (~14% opacity)", group=gZone)
+color inpZoneBorder = input.color(color.new(#facc15, 5), "Zone border (yellow)", group=gZone)
+float inpZoneBorderW = input.float(2.5, "Zone border width", minval=0.5, maxval=5, step=0.5, group=gZone)
+
+string gTouch = "Touch"
+color inpTouchCol = input.color(color.new(#facc15, 0), "Touch marker color", group=gTouch)
+color inpDepCol = input.color(color.new(#a78bfa, 0), "Departure marker color (first bar fully outside range)", group=gTouch)
+
+string gDisplay = "Display"
+bool inpShowZones = input.bool(true, "Show zones", group=gDisplay)
+bool inpShowTouch = input.bool(true, "Show touch labels (T)", group=gDisplay)
+bool inpShowBos = input.bool(true, "Show BOS lines", group=gDisplay)
+bool inpShowDeparture = input.bool(true, "Show departure (first bar: high/low both outside zone)", group=gDisplay)
+
+string gAlert = "Alerts"
+bool inpAlertTouch = input.bool(true, "Alert on touch (retest / invalidate)", group=gAlert)
+
+string gPerf = "Performance"
+int inpMaxConsEntries = input.int(320, "Max BOS consumed swing entries (speed)", minval=64, maxval=2000, group=gPerf, tooltip="Caps consHigh/consLow array length so duplicate checks stay fast on decades of data. Oldest entries drop first; only matters if the same swing bar could be re-tested after thousands of BOS events.")
+
+// ~2 trading years on a 1D chart: 252 sessions/year × 2. Same bar count on every timeframe (not calendar-stretched).
+int MAX_VISIBLE_BARS = 504
+// Right-edge window: drawings + zone arrays (alerts/touch) only where true
+bool drawScope = last_bar_index - bar_index < MAX_VISIBLE_BARS
+
+f_vis_fill(bool show, bool isDemand) =>
+    show ? (isDemand ? inpDemandFill : inpSupplyFill) : color.new(#787b86, 100)
+
+f_vis_border(bool show) =>
+    show ? inpZoneBorder : color.new(inpZoneBorder, 100)
+
+f_touch_tip(string kind, float px) =>
+    str.format_time(time, "yyyy-MM-dd", syminfo.timezone) + " · " + kind + " · " + str.tostring(px, format.mintick)
+
+tfKey() =>
+    // v6: timeframe.period always includes a multiplier (e.g. "1D" not "D"); keep legacy aliases.
+    string p = timeframe.period
+    p == "1" or p == "3" or p == "5" or p == "15" or p == "45" ? "30m" :
+     p == "30" ? "30m" :
+     p == "60" ? "1h" :
+     p == "120" ? "2h" :
+     p == "240" ? "4h" :
+     p == "D" or p == "1D" ? "1d" :
+     p == "W" or p == "1W" ? "1w" :
+     p == "M" or p == "1M" ? "1M" : "1h"
+
+presetAtrPeriod() =>
+    string k = tfKey()
+    k == "30m" ? 24 :
+     k == "1h" ? 17 :
+     k == "2h" ? 15 :
+     k == "4h" ? 13 :
+     k == "1d" ? 10 :
+     k == "1w" ? 8 :
+     k == "1M" ? 6 : 17
+
+presetMinBars() =>
+    string k = tfKey()
+    k == "30m" ? 6 :
+     k == "1h" ? 5 :
+     k == "2h" ? 5 :
+     k == "4h" ? 6 :
+     k == "1d" ? 4 :
+     k == "1w" ? 4 :
+     k == "1M" ? 3 : 5
+
+presetTimeConfirm() =>
+    string k = tfKey()
+    k == "1h" ? 6 :
+     k == "2h" ? 5 :
+     k == "4h" ? 5 :
+     k == "1d" ? 4 :
+     k == "1w" ? 3 :
+     k == "1M" ? 2 : 0
+
+presetAltAfter() =>
+    string k = tfKey()
+    k == "1h" ? 10 : k == "4h" ? 6 : 0
+
+presetAltFrac() =>
+    string k = tfKey()
+    k == "1h" ? 0.80 : k == "4h" ? 0.75 : 0.0
+
+lineStyleFrom(string s) =>
+    s == "Solid" ? line.style_solid : s == "Dotted" ? line.style_dotted : line.style_dashed
+
+float sp = math.max(0.35, math.min(inpSwingSpacing, 5.0))
+int mb0 = math.max(presetMinBars(), 2)
+int effMinBars = math.max(2, int(math.round(mb0 * sp)))
+float atrBump = 1.0 + 0.06 * math.max(0.0, sp - 1.0)
+float effAtrMult = math.min(3.5, inpAtrMult * atrBump)
+int effAtrPeriod = presetAtrPeriod()
+float effMinPull = 0.58
+int effTimeConfirm = presetTimeConfirm()
+int effAltAfter = presetAltAfter()
+float effAltFrac = presetAltFrac()
+float sensitivity = math.max(0.5, inpSensitivity)
+
+atrVal = ta.atr(effAtrPeriod)
+
+var float candHigh = na
+var int candHighIdx = na
+var float candLow = na
+var int candLowIdx = na
+var int lastSwingIdx = -1000000000
+var string lastSwingType = na
+
+var array<float> swingPx = array.new_float()
+var array<int> swingBar = array.new_int()
+var array<int> swingTyp = array.new_int()
+
+var array<int> consHigh = array.new_int()
+var array<int> consLow = array.new_int()
+
+var array<int> barsList = array.new_int()
+// One-pass BOS: collect matching swing bar indices before pushing to cons*
+var array<int> bosCandSix = array.new_int()
+
+var int prevSwingN = 0
+
+var bool alertTouch = false
+
+MAX_Z = 60
+var array<box> zBox = array.new_box()
+var array<float> zLo = array.new_float()
+var array<float> zHi = array.new_float()
+var array<int> zDir = array.new_int()
+var array<int> zPivot = array.new_int()
+var array<bool> zSeenOut = array.new_bool()
+var array<bool> zTouchDone = array.new_bool()
+var array<bool> zAlive = array.new_bool()
+// Bar index kdy zóna vstoupila do pole (vznik) — departure se nehodnotí na tom samém baru
+var array<int> zBorn = array.new_int()
+
+f_cons_has(array<int> a, int ix) =>
+    bool hit = false
+    n = array.size(a)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(a, i) == ix
+                hit := true
+                break
+    hit
+
+f_trim_cons_tail(array<int> a, int cap) =>
+    while array.size(a) > cap
+        array.shift(a)
+
+f_zone_wtb(int pivotOff, int zoneDir) =>
+    float lo = low[pivotOff]
+    float hi = high[pivotOff]
+    float op = open[pivotOff]
+    float cl = close[pivotOff]
+    float bh = math.max(op, cl)
+    float bl = math.min(op, cl)
+    float zl = zoneDir == 1 ? lo : bl
+    float zh = zoneDir == 1 ? bh : hi
+    [zl, zh]
+
+f_pivot_in_window(int six, array<int> sortedBars, int winLo) =>
+    bool ok = false
+    if inpBosMaxLookbackSwings <= 0
+        ok := true
+    else
+        n = array.size(sortedBars)
+        if n > 0
+            for t = winLo to n - 1
+                if array.get(sortedBars, t) == six
+                    ok := true
+                    break
+    ok
+
+// Match Swing_HL._find_bos_from_swings: acceptance is on bars *after* BOS bar i (i+1..i+A), not past closes.
+accept_bull_ok(float lvl) =>
+    int A = inpAcceptanceBars
+    if A <= 0
+        true
+    else
+        bool ok = not na(close[A]) and close[A] > lvl
+        if ok
+            for k = 0 to A - 1
+                float cj = close[k]
+                if na(cj) or cj < lvl
+                    ok := false
+                    break
+        ok
+
+accept_bear_ok(float lvl) =>
+    int A = inpAcceptanceBars
+    if A <= 0
+        true
+    else
+        bool ok = not na(close[A]) and close[A] < lvl
+        if ok
+            for k = 0 to A - 1
+                float cj = close[k]
+                if na(cj) or cj > lvl
+                    ok := false
+                    break
+        ok
+
+pine_i = bar_index - 1
+// Swings only on confirmed bars: less work on the live, forming bar and matches BOS/zone timing
+if barstate.isconfirmed and bar_index >= 2 and pine_i >= 1
+    int atrOff = bar_index - pine_i
+    float av = atrVal[atrOff]
+    av := na(av) or av <= 0 ? ATR_FLOOR : av
+    float thr = math.max(av * effAtrMult, av * MIN_THRESHOLD_ATR_RATIO) / sensitivity
+    float minPb = av * effMinPull / sensitivity
+
+    int midOff = bar_index - pine_i
+    float hMid = high[midOff]
+    float hL = high[midOff + 1]
+    float hR = high[midOff - 1]
+    float lMid = low[midOff]
+    float lL = low[midOff + 1]
+    float lR = low[midOff - 1]
+
+    bool lookHigh = na(lastSwingType) or lastSwingType == "low"
+    bool lookLow = na(lastSwingType) or lastSwingType == "high"
+
+    if lookHigh and hMid > hL and hMid > hR
+        if na(candHigh) or hMid >= candHigh
+            candHigh := hMid
+            candHighIdx := pine_i
+
+    if lookLow and lMid < lL and lMid < lR
+        if na(candLow) or lMid <= candLow
+            candLow := lMid
+            candLowIdx := pine_i
+
+    float cLow = low[midOff]
+    float cHigh = high[midOff]
+
+    bool lfHi = na(lastSwingType) or lastSwingType == "low"
+    bool lfLo = na(lastSwingType) or lastSwingType == "high"
+    bool canConf = pine_i - lastSwingIdx >= effMinBars
+
+    if canConf
+        bool hiOk = false
+        if not na(candHigh) and not na(candHighIdx) and lfHi and pine_i > candHighIdx
+            bool cpull = cLow <= candHigh - thr
+            if not cpull and effAltAfter > 0 and effAltFrac > 0 and (pine_i - candHighIdx) >= effAltAfter
+                cpull := cLow <= candHigh - thr * effAltFrac
+            bool tconf = effTimeConfirm > 0 and (pine_i - candHighIdx) >= math.max(effMinBars, effTimeConfirm) and cLow <= candHigh - minPb
+            hiOk := cpull or tconf
+
+        bool loOk = false
+        if not na(candLow) and not na(candLowIdx) and lfLo and pine_i > candLowIdx
+            bool cpull = cHigh >= candLow + thr
+            if not cpull and effAltAfter > 0 and effAltFrac > 0 and (pine_i - candLowIdx) >= effAltAfter
+                cpull := cHigh >= candLow + thr * effAltFrac
+            bool tconf = effTimeConfirm > 0 and (pine_i - candLowIdx) >= math.max(effMinBars, effTimeConfirm) and cHigh >= candLow + minPb
+            loOk := cpull or tconf
+
+        if hiOk or loOk
+            bool preferLow = loOk and (not hiOk or (not na(candLowIdx) and not na(candHighIdx) and candLowIdx <= candHighIdx))
+            if preferLow
+                array.push(swingPx, candLow)
+                array.push(swingBar, candLowIdx)
+                array.push(swingTyp, -1)
+                lastSwingIdx := candLowIdx
+                lastSwingType := "low"
+            else
+                array.push(swingPx, candHigh)
+                array.push(swingBar, candHighIdx)
+                array.push(swingTyp, 1)
+                lastSwingIdx := candHighIdx
+                lastSwingType := "high"
+            candHigh := na
+            candHighIdx := na
+            candLow := na
+            candLowIdx := na
+
+    while array.size(swingBar) > 400
+        array.shift(swingPx)
+        array.shift(swingBar)
+        array.shift(swingTyp)
+
+if barstate.isconfirmed
+    alertTouch := false
+
+if barstate.isconfirmed and bar_index >= 2
+    float cls = close
+    int bi = bar_index
+    int A = inpAcceptanceBars
+    bool bosReady = A == 0 or bar_index >= A
+    // When not bosReady, disable BOS scan (biBos < 0 => six < biBos never true for valid bars)
+    int biBos = bosReady ? (A == 0 ? bi : bi - A) : -1
+    float clsBos = bosReady ? (A == 0 ? cls : close[A]) : na
+    int ns = array.size(swingBar)
+
+    array.clear(barsList)
+    if bosReady and ns > 0
+        for s = 0 to ns - 1
+            int sb = array.get(swingBar, s)
+            if sb < biBos
+                array.push(barsList, sb)
+    int nList = array.size(barsList)
+    if nList > 1
+        array.sort(barsList, order.ascending)
+    int winLo = 0
+    if inpBosMaxLookbackSwings > 0 and nList > inpBosMaxLookbackSwings
+        winLo := nList - inpBosMaxLookbackSwings
+
+    int bestHBar = na
+    float bestHPx = na
+    bool foundH = false
+    array.clear(bosCandSix)
+    if ns > 0
+        for s = 0 to ns - 1
+            if array.get(swingTyp, s) == 1
+                int six = array.get(swingBar, s)
+                float px = array.get(swingPx, s)
+                if six < biBos and px < clsBos and not f_cons_has(consHigh, six) and f_pivot_in_window(six, barsList, winLo)
+                    array.push(bosCandSix, six)
+                    if not foundH
+                        foundH := true
+                        bestHBar := six
+                        bestHPx := px
+                    else
+                        if inpBosPivotPick == "newest"
+                            if six > bestHBar
+                                bestHBar := six
+                                bestHPx := px
+                        else
+                            if px > bestHPx or (px == bestHPx and six > bestHBar)
+                                bestHBar := six
+                                bestHPx := px
+
+    if bosReady and foundH and not na(bestHBar) and accept_bull_ok(bestHPx)
+        int nCand = array.size(bosCandSix)
+        if nCand > 0
+            for ci = 0 to nCand - 1
+                array.push(consHigh, array.get(bosCandSix, ci))
+            f_trim_cons_tail(consHigh, inpMaxConsEntries)
+
+        if drawScope
+            if inpShowBos
+                int offSwing = bar_index - bestHBar
+                // BOS level is horizontal at the broken swing price (not close→swing diagonal)
+                line.new(time[offSwing], bestHPx, time, bestHPx, xloc=xloc.bar_time, extend=extend.none, color=inpColBos, width=inpBosWidth, style=lineStyleFrom(inpBosStyle))
+
+            int legStart = na
+            if ns > 0
+                for s = 0 to ns - 1
+                    if array.get(swingTyp, s) == -1
+                        int six = array.get(swingBar, s)
+                        if six < bestHBar
+                            legStart := na(legStart) ? six : math.max(legStart, six)
+            int piv = na
+            if not na(legStart)
+                int ss = math.min(legStart, biBos - 1)
+                int ee = biBos
+                if ee >= ss
+                    int minAt = ss
+                    float minLv = low[bar_index - ss]
+                    for j = ss to ee
+                        int o = bar_index - j
+                        float lj = low[o]
+                        if lj < minLv
+                            minLv := lj
+                            minAt := j
+                    piv := minAt
+
+            if not na(piv)
+                int pOff = bar_index - piv
+                [zl, zh] = f_zone_wtb(pOff, 1)
+                if zh > zl and array.size(zBox) < MAX_Z
+                    box bx = box.new(left=piv, top=zh, right=bi, bottom=zl, xloc=xloc.bar_index, bgcolor=f_vis_fill(inpShowZones, true), border_color=f_vis_border(inpShowZones), border_width=int(inpZoneBorderW), border_style=line.style_dashed)
+                    array.push(zBox, bx)
+                    array.push(zLo, zl)
+                    array.push(zHi, zh)
+                    array.push(zDir, 1)
+                    array.push(zPivot, piv)
+                    array.push(zSeenOut, false)
+                    array.push(zTouchDone, false)
+                    array.push(zAlive, true)
+                    array.push(zBorn, bar_index)
+
+    int bestLBar = na
+    float bestLPx = na
+    bool foundL = false
+    array.clear(bosCandSix)
+    if ns > 0
+        for s = 0 to ns - 1
+            if array.get(swingTyp, s) == -1
+                int six = array.get(swingBar, s)
+                float px = array.get(swingPx, s)
+                if six < biBos and px > clsBos and not f_cons_has(consLow, six) and f_pivot_in_window(six, barsList, winLo)
+                    array.push(bosCandSix, six)
+                    if not foundL
+                        foundL := true
+                        bestLBar := six
+                        bestLPx := px
+                    else
+                        if inpBosPivotPick == "newest"
+                            if six > bestLBar
+                                bestLBar := six
+                                bestLPx := px
+                        else
+                            if px < bestLPx or (px == bestLPx and six > bestLBar)
+                                bestLBar := six
+                                bestLPx := px
+
+    if bosReady and foundL and not na(bestLBar) and accept_bear_ok(bestLPx)
+        int nCandL = array.size(bosCandSix)
+        if nCandL > 0
+            for ci = 0 to nCandL - 1
+                array.push(consLow, array.get(bosCandSix, ci))
+            f_trim_cons_tail(consLow, inpMaxConsEntries)
+
+        if drawScope
+            if inpShowBos
+                int offLb = bar_index - bestLBar
+                line.new(time[offLb], bestLPx, time, bestLPx, xloc=xloc.bar_time, extend=extend.none, color=inpColBos, width=inpBosWidth, style=lineStyleFrom(inpBosStyle))
+
+            int legStartH = na
+            if ns > 0
+                for s = 0 to ns - 1
+                    if array.get(swingTyp, s) == 1
+                        int six = array.get(swingBar, s)
+                        if six < bestLBar
+                            legStartH := na(legStartH) ? six : math.max(legStartH, six)
+            int piv2 = na
+            if not na(legStartH)
+                int ss2 = math.min(legStartH, biBos - 1)
+                int ee2 = biBos
+                if ee2 >= ss2
+                    int maxAt = ss2
+                    float maxHv = high[bar_index - ss2]
+                    for j = ss2 to ee2
+                        int o2 = bar_index - j
+                        float hj = high[o2]
+                        if hj > maxHv
+                            maxHv := hj
+                            maxAt := j
+                    piv2 := maxAt
+
+            if not na(piv2)
+                int pOff2 = bar_index - piv2
+                [zl2, zh2] = f_zone_wtb(pOff2, -1)
+                if zh2 > zl2 and array.size(zBox) < MAX_Z
+                    box bx2 = box.new(left=piv2, top=zh2, right=bi, bottom=zl2, xloc=xloc.bar_index, bgcolor=f_vis_fill(inpShowZones, false), border_color=f_vis_border(inpShowZones), border_width=int(inpZoneBorderW), border_style=line.style_dashed)
+                    array.push(zBox, bx2)
+                    array.push(zLo, zl2)
+                    array.push(zHi, zh2)
+                    array.push(zDir, -1)
+                    array.push(zPivot, piv2)
+                    array.push(zSeenOut, false)
+                    array.push(zTouchDone, false)
+                    array.push(zAlive, true)
+                    array.push(zBorn, bar_index)
+
+// --- Touch (inpAlertTouch + labely „T“): jen po departure ---
+// Departure: první uzavřený bar **po** zBorn, kde [low,high] neprotíná [zone_low, zone_high] (low > zone_high nebo high < zone_low) → „D“ na té svíčce + zSeenOut. Bar vzniku zóny se nepočítá (jinak falešný D při BOS).
+// Touch/alert/„T“ až když priorSeenOut. Close invalidace bez departure = konec boxu bez touch.
+// Retest: priorSeenOut, dep_ok, overlap, směrový dotek hrany, bars od pivotu >= 1.
+int nz = array.size(zBox)
+if barstate.isconfirmed and nz > 0
+    for zi = 0 to nz - 1
+        if array.get(zAlive, zi)
+            float zlv = array.get(zLo, zi)
+            float zhv = array.get(zHi, zi)
+            int zd = array.get(zDir, zi)
+            int zPiv = array.get(zPivot, zi)
+            int zBr = array.get(zBorn, zi)
+            bool priorSeenOut = array.get(zSeenOut, zi)
+            // Celá svíčka mimo pásmo zóny (žádný překryv [low,high] s [zlv, zhv])
+            bool wholeOutside = low > zhv or high < zlv
+            // První „mimo“ až od **následujícího** baru po vzniku zóny (per zóna v poli zi)
+            bool departNow = wholeOutside and bar_index > zBr
+            bool dep_ok = bar_index - zPiv >= 1
+            bool overlap = low <= zhv and high >= zlv
+            bool retestLvlDemand = high >= zhv and low <= zhv
+            bool retestLvlSupply = low <= zlv and high >= zlv
+
+            if departNow and not priorSeenOut and inpShowDeparture
+                float yMid = (high + low) * 0.5
+                string depTip = str.format_time(time, "yyyy-MM-dd", syminfo.timezone) + " · První bar mimo zónu (od vzniku zóny)"
+                label.new(bar_index, yMid, xloc=xloc.bar_index, yloc=yloc.price, text="D", style=label.style_none, color=color(na), textcolor=inpDepCol, size=size.tiny, tooltip=depTip)
+
+            if zd == 1
+                if close < zlv
+                    box.set_right(array.get(zBox, zi), bar_index + 1)
+                    array.set(zAlive, zi, false)
+                    if priorSeenOut
+                        if not array.get(zTouchDone, zi)
+                            array.set(zTouchDone, zi, true)
+                            alertTouch := true
+                            if drawScope and inpShowTouch
+                                label.new(bar_index, zlv, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_down, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip=f_touch_tip("Demand invalidate", zlv))
+                else if priorSeenOut and dep_ok and overlap and retestLvlDemand
+                    if not array.get(zTouchDone, zi)
+                        array.set(zTouchDone, zi, true)
+                        alertTouch := true
+                        if drawScope and inpShowTouch
+                            label.new(bar_index, zhv, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_down, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip=f_touch_tip("Demand retest", zhv))
+                    box.set_right(array.get(zBox, zi), bar_index + 1)
+                    array.set(zAlive, zi, false)
+            else
+                if close > zhv
+                    box.set_right(array.get(zBox, zi), bar_index + 1)
+                    array.set(zAlive, zi, false)
+                    if priorSeenOut
+                        if not array.get(zTouchDone, zi)
+                            array.set(zTouchDone, zi, true)
+                            alertTouch := true
+                            if drawScope and inpShowTouch
+                                label.new(bar_index, zhv, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_up, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip=f_touch_tip("Supply invalidate", zhv))
+                else if priorSeenOut and dep_ok and overlap and retestLvlSupply
+                    if not array.get(zTouchDone, zi)
+                        array.set(zTouchDone, zi, true)
+                        alertTouch := true
+                        if drawScope and inpShowTouch
+                            label.new(bar_index, zlv, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_up, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip=f_touch_tip("Supply retest", zlv))
+                    box.set_right(array.get(zBox, zi), bar_index + 1)
+                    array.set(zAlive, zi, false)
+
+            array.set(zSeenOut, zi, priorSeenOut or departNow)
+
+            if array.get(zAlive, zi)
+                box b = array.get(zBox, zi)
+                box.set_right(b, bar_index)
+
+// Synchronizace viditelnosti všech zone boxů (toggle + historické zóny)
+int nzVis = array.size(zBox)
+if nzVis > 0
+    for ziVis = 0 to nzVis - 1
+        box zb = array.get(zBox, ziVis)
+        bool isDemV = array.get(zDir, ziVis) == 1
+        box.set_bgcolor(zb, f_vis_fill(inpShowZones, isDemV))
+        box.set_border_color(zb, f_vis_border(inpShowZones))
+
+bool newSwing = array.size(swingBar) > prevSwingN
+if barstate.isconfirmed
+    prevSwingN := array.size(swingBar)
+
+int lastTyp = na
+float lastPx = na
+int lastSb = na
+if array.size(swingBar) > 0
+    lastTyp := array.get(swingTyp, array.size(swingBar) - 1)
+    lastPx := array.get(swingPx, array.size(swingBar) - 1)
+    lastSb := array.get(swingBar, array.size(swingBar) - 1)
+
+bool markH = newSwing and lastTyp == 1
+bool markL = newSwing and lastTyp == -1
+
+// Swing marks at exact pivot price: use labels (plotshape has no price `y` in v5/v6)
+if barstate.isconfirmed and drawScope and markH
+    label.new(lastSb, lastPx, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, color=inpColSwingHigh, size=size.tiny, text="", tooltip="Swing high")
+if barstate.isconfirmed and drawScope and markL
+    label.new(lastSb, lastPx, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, color=inpColSwingLow, size=size.tiny, text="", tooltip="Swing low")
+
+alertcondition(inpAlertTouch and alertTouch and barstate.isconfirmed, title="SD Touch", message="SD zone touch / invalidate / retest")

@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import type { BacktestFieldHelp } from "@/components/backtestFieldMeta";
 
 interface FieldHelpPopoverProps {
-  help: BacktestFieldHelp;
+  help: BacktestFieldHelp | undefined;
 }
 
 export function FieldHelpPopover({ help }: FieldHelpPopoverProps) {
@@ -44,6 +44,10 @@ export function FieldHelpPopover({ help }: FieldHelpPopoverProps) {
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [open]);
+
+  if (!help?.title) {
+    return null;
+  }
 
   return (
     <div ref={rootRef} className="inline-flex items-center">

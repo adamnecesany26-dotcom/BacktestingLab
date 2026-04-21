@@ -7,6 +7,20 @@ function parseBarMs(s: string | undefined): number {
   return Date.parse(s);
 }
 
+function zoneMetaTimeBoundsMs(t: Trade): { lo: number; hi: number } | null {
+  const zm = t.zoneMeta;
+  if (!zm || typeof zm !== "object" || Array.isArray(zm)) return null;
+  const o = zm as Record<string, unknown>;
+  const ds = typeof o.zoneDateStart === "string" ? o.zoneDateStart : null;
+  const de = typeof o.zoneDateEnd === "string" ? o.zoneDateEnd : null;
+  const t0 = ds ? Date.parse(ds) : NaN;
+  const t1 = de ? Date.parse(de) : NaN;
+  if (!Number.isFinite(t0) && !Number.isFinite(t1)) return null;
+  const lo = Number.isFinite(t0) ? t0 : (t1 as number);
+  const hi = Number.isFinite(t1) ? t1 : (t0 as number);
+  return { lo: Math.min(lo, hi), hi: Math.max(lo, hi) };
+}
+
 /** Stejné parsování času jako u řady OHLC — vyhnout se posunu oproti `toISOString()` u naivních řetězců. */
 function formatMsAlignedToOhlc(ms: number, windowOhlc: OhlcBar[]): string {
   const sample = windowOhlc.find((b) => b.date && b.date.length >= 10)?.date ?? "";
@@ -75,6 +89,14 @@ export function computeDetailedChartWindow(
         minT = Math.min(minT, x);
         maxT = Math.max(maxT, x);
       }
+      // For S/D trades: always include the zone origin bounds (zoneDateStart/End),
+      // even if the zone is much older than entry/exit. This ensures "where the zone was born"
+      // is visible in Detailed results.
+      const zb = zoneMetaTimeBoundsMs(t);
+      if (zb) {
+        minT = Math.min(minT, zb.lo);
+        maxT = Math.max(maxT, zb.hi);
+      }
     }
     if (!Number.isFinite(minT)) {
       return {
@@ -85,8 +107,12 @@ export function computeDetailedChartWindow(
         hasNext,
       };
     }
-    const span = Math.max(maxT - minT, 24 * 3600 * 1000);
-    const pad = span * 0.12 + 3 * 24 * 3600 * 1000;
+    const DAY = 24 * 3600 * 1000;
+    const span = Math.max(maxT - minT, DAY);
+    // We want more context, but avoid a gigantic window when zone origin is very old.
+    // Pad grows with span, but is capped.
+    const padBase = span * 0.12;
+    const pad = Math.min(45 * DAY, Math.max(7 * DAY, padBase + 3 * DAY));
     const lo = minT - pad;
     const hi = maxT + pad;
     const win = ohlc.filter((b) => {

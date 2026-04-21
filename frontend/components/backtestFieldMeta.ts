@@ -1064,12 +1064,14 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "artifactViewBuildFeatures",
     title: "View: Build features",
     whatItMeans:
-      "Spust\u00ed na serveru H/L precompute na **cel\u00fd** obsah **data_file** a na **ka\u017ed\u00fd timeframe** v intern\u00edm \u017eeb\u0159\u00ed\u010dku, pak S/D z\u00f3ny pro **v\u0161echny** tyto TF. **Obdob\u00ed** ve View se buildu net\u00fdk\u00e1 \u2014 jen omezuje, co se na grafu vykresl\u00ed. " +
+      "Pod li\u0161tou View za\u0161krtni **Kroky buildu**: **H/L**, **S/D z\u00f3ny**, nebo oboj\u00ed. **Dataset** je v\u017edy **data_file** z rozbalov\u00e1\u010dky instrumentu v\u00fd\u0161e \u2014 nez\u00e1vis\u00ed na tom, kter\u00fd modul/strategie m\u00e1\u0161 jen pro graf. Jen **S/D** = mus\u00ed u\u017e b\u00fdt H/L artefakt. " +
+      "H/L precompute b\u011b\u017e\u00ed na **cel\u00fd** obsah **data_file** a na **ka\u017ed\u00fd timeframe** v intern\u00edm \u017eeb\u0159\u00ed\u010dku, pak S/D z\u00f3ny pro **v\u0161echny** tyto TF. **Obdob\u00ed** ve View se buildu net\u00fdk\u00e1 \u2014 jen omezuje, co se na grafu vykresl\u00ed. " +
       "Velk\u00e9 soubory mohou trvat **des\u00edtky minut**; HTTP 500 po dlouh\u00e9 \u010dek\u00e1n\u00ed: pod\u00edvej se do termin\u00e1lu **uvicorn** (traceback) nebo zda t\u011b proxy nep\u0159eru\u0161ila spojen\u00ed. " +
       "V\u00fdsledek se ulo\u017e\u00ed do workspace .backtest_artifacts (z\u00e1mek se po p\u00e1du procesu uvoln\u00ed, pokud PID u\u017e neb\u011b\u017e\u00ed).",
     whyItMatters:
       "Artefakty jsou zdroj pravdy pro USE_SD_ARTIFACTS a pro vrstvy z cache ve View \u2014 bez buildu nejsou Parquet z\u00f3ny k dispozici.",
     howToUse: [
+      "Kroky buildu: H/L = swingy/BOS/trend do cache; S/D = z\u00f3ny z examples/sd_zones; oboj\u00ed = standardn\u00ed pln\u00fd pipeline.",
       "Po zm\u011bn\u011b dat, k\u00f3du H/L nebo S/D, nebo parametr\u016f z\u00f3n build spus\u0165 znovu.",
       "\u010cekni chybovou hl\u00e1\u0161ku pod tla\u010d\u00edtky, pokud build spadne.",
     ],
@@ -1141,6 +1143,58 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     recommendedDefault: "Kontroluj po ka\u017ed\u00e9 zm\u011bn\u011b logiky vstupu/v\u00fdstupu.",
     withoutIt: "\u0158\u00edk\u00e1\u0161 si, \u017ee strategie m\u00e1 R edge, ale nem\u00e1\u0161 spo\u010d\u00edtan\u00fd rozptyl.",
     bestPractices: ["Dr\u017e v k\u00f3du konzistentn\u00ed zapisov\u00e1n\u00ed stop do metadat z\u00f3n."],
+  },
+  sdZoneTestBreakevenMoveR: {
+    id: "sdZoneTestBreakevenMoveR",
+    title: "Breakeven (p\u0159esun SL na entry)",
+    whatItMeans:
+      "Po dosa\u017een\u00ed zadan\u00e9ho po\u010detu R ve prosp\u011bch (na sv\u00ed\u010dk\u00e1ch po entry baru) se stop-loss analyticky p\u0159esune na cenu vstupu. Pot\u00e9 u\u017e model \u0159e\u0161\u00ed jen z\u00e1sah c\u00edlov\u00e9ho winner R, z\u00e1sah entry (BE) nebo strop MFE.",
+    whyItMatters: "Simuluje zaji\u0161t\u011bn\u00ed obchodu po jist\u00e9m pohybu ve prosp\u011bch, ani\u017e bys musel ru\u010dn\u011b filtrovat dotyky.",
+    howToUse: [
+      "Nap\u0159. 1 = po 1R ve prosp\u011bch je SL na entry; v\u00fdhra se po\u010d\u00edt\u00e1 a\u017e pokud je dosa\u017een winner threshold na nebo po t\u00e9to sv\u00ed\u010dce a p\u0159ed BE/SL z\u00e1sahy.",
+      "Nech pr\u00e1zdn\u00e9 pro p\u016fvodn\u00ed chov\u00e1n\u00ed (BE z\u00e1znam jen jako prvn\u00ed n\u00e1vrat k entry z cesty).",
+    ],
+    recommendedDefault: "Pr\u00e1zdn\u00e9 (vypnuto) nebo 1 pro konzervativn\u00ed zaji\u0161t\u011bn\u00ed.",
+    withoutIt: "SL z\u016fst\u00e1v\u00e1 po celou dobu u p\u016fvodn\u00edho modelu z\u00f3ny.",
+    bestPractices: ["Slad\u011b s winner threshold: BE prah by m\u011bl b\u00fdt typicky \u2264 nebo bl\u00edzko c\u00edlov\u00e9mu R, kter\u00fd skute\u010dn\u011b chce\u0161 \u201elovat\u201c po zaji\u0161t\u011bn\u00ed."],
+  },
+  sdZoneTestSlMult: {
+    id: "sdZoneTestSlMult",
+    title: "Stop loss (mult v\u00fd\u0161ky z\u00f3ny)",
+    whatItMeans:
+      "Demand: stop = horn\u00ed hranice z\u00f3ny minus mult \u00d7 (value_high \u2212 value_low). Supply symetricky od spodn\u00ed hrany nahoru.",
+    whyItMatters: "Definuje jednotku R (vzd\u00e1lenost vstup \u2192 stop) pro MFE/MAE a cap v R.",
+    howToUse: [
+      "1.25 odpov\u00edd\u00e1 125 % v\u00fd\u0161ky boxu od referen\u010dn\u00ed hrany (viz backend `stop_loss_from_zone_height`).",
+      "Slad\u011b s t\u00edm, jak riskuje\u0161 retesty S/D v re\u00e1lu.",
+    ],
+    recommendedDefault: "1.25 jako v\u00fdchoz\u00ed experiment.",
+    withoutIt: "Nelze interpretovat v\u00fdsledky v jednotk\u00e1ch R konzistentn\u011b.",
+    bestPractices: ["Po zm\u011bn\u011b multu znovu spus\u0165 S/D precompute nepou\u017e\u00edv\u00e1\u0161 \u2014 dotyky jsou z artefaktu, SL jen analytick\u00fd model."],
+  },
+  sdZoneTestMaxMfeR: {
+    id: "sdZoneTestMaxMfeR",
+    title: "Cap MFE (R)",
+    whatItMeans: "Forward scan se zastav\u00ed, jakmile nejlep\u0161\u00ed dosavadn\u00ed MFE dos\u00e1hne tohoto stropu v jednotk\u00e1ch R.",
+    whyItMatters: "O\u0159ez\u00e1v\u00e1 extr\u00e9mn\u00ed outlier bar\u016f a stabilizuje agregace.",
+    howToUse: ["Typicky 10R pro exploraci; sn\u00ed\u017e pro konzervativn\u011bj\u0161\u00ed report."],
+    recommendedDefault: "10",
+    withoutIt: "Dlouh\u00e9 trendy mohou zkreslovat pr\u016fm\u011bry.",
+    bestPractices: ["Srovnej v\u00fdsledky p\u0159i 5R vs 10R, zda se \u0159ad\u00ed po\u0159ad\u00ed touch\u016f m\u011bn\u00ed."],
+  },
+  sdZoneTestRiskUsd: {
+    id: "sdZoneTestRiskUsd",
+    title: "Re\u017eim R vs USD",
+    whatItMeans:
+      "Re\u017eim R: metriky v R. USD: MFE/MAE se \u0161k\u00e1luj\u00ed jako R \u00d7 (equity \u00d7 risk_pct), p\u0159\u00edpadn\u011b risk_pct n\u00e1hodn\u011b v rozmez\u00ed se seedem.",
+    whyItMatters: "Propojuje abstraktn\u00ed R s velikost\u00ed \u00fa\u010dtu a fixn\u00edm rizikem na obchod.",
+    howToUse: [
+      "Nastav equity shodn\u011b s \u00fa\u010dtem, risk_pct jako zlomek kapit\u00e1lu na jeden hypotetick\u00fd vstup.",
+      "Rozsah min\u2013max + seed reprodukuje n\u00e1hodn\u00e9 riziko mezi runy.",
+    ],
+    recommendedDefault: "Za\u010d\u00ednej v R; USD pou\u017eij pro reporting t\u00fdmu.",
+    withoutIt: "Chyb\u00ed kontext velikosti pozice.",
+    bestPractices: ["Seed ukl\u00e1dej k v\u00fdsledk\u016fm, aby \u0161lo run zopakovat."],
   },
 };
 

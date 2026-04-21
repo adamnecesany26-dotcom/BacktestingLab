@@ -31,4 +31,5 @@ SD_ZONE_PARQUET_COLUMNS: tuple[str, ...] = (
     "pivot_idx",
     "start_idx",
     "end_idx",
+    "touch_events_json",
 )

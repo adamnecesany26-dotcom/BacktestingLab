@@ -331,6 +331,10 @@ interface BacktestSettingsProps {
   onRun: () => void;
   isRunning: boolean;
   canRun?: boolean;
+  /** Count of currently loaded saved runs (Run history). */
+  savedRunsCount?: number;
+  /** Soft-delete all saved runs for current strategy (Run history). */
+  onDeleteSavedBacktests?: () => void;
   /** Strategy parameters (from PARAMS dict) - only when strategy open */
   strategyParams?: StrategyParams;
   strategyParamMeta?: StrategyParamsMeta;
@@ -373,6 +377,8 @@ export function BacktestSettings({
   onRun,
   isRunning,
   canRun = true,
+  savedRunsCount = 0,
+  onDeleteSavedBacktests,
   strategyParams = {},
   strategyParamMeta = {},
   onStrategyParamsChange,
@@ -413,6 +419,7 @@ export function BacktestSettings({
   /** Keys `module:Name` / `indicator:Name` — default false = collapsed */
   const [paramPanelOpen, setParamPanelOpen] = useState<Record<string, boolean>>({});
   const [paramScopeTab, setParamScopeTab] = useState<"strategy" | "modules">("strategy");
+  const [confirmDeleteSaved, setConfirmDeleteSaved] = useState(false);
 
   const inputClass = "w-full px-3 py-2 rounded bg-zinc-800 border border-zinc-700 text-zinc-200";
   const labelTextClass = "text-sm text-zinc-400";
@@ -1914,6 +1921,55 @@ export function BacktestSettings({
         >
           {isRunning ? "Běží..." : canRun ? "Run" : "Otevřete strategii"}
         </button>
+
+        {canRun && onDeleteSavedBacktests ? (
+          <div className="pt-3 mt-3 border-t border-zinc-800 space-y-2">
+            <div className="text-xs text-zinc-500">
+              Uložené backtesty (Run history):{" "}
+              <span className="text-zinc-300 tabular-nums">{savedRunsCount}</span>
+            </div>
+            {!confirmDeleteSaved ? (
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteSaved(true)}
+                disabled={isRunning}
+                className="w-full py-2 rounded-lg bg-rose-600/20 hover:bg-rose-600/25 border border-rose-500/30 text-rose-200 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Soft-delete všech uložených runů pro tuto strategii"
+              >
+                🗑️ Smazat uložené backtesty
+              </button>
+            ) : (
+              <div className="rounded-lg border border-rose-500/30 bg-rose-500/10 p-3 space-y-2">
+                <div className="text-xs text-rose-100">
+                  Opravdu smazat <span className="font-medium">{savedRunsCount}</span> uložených backtestů? (soft-delete)
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setConfirmDeleteSaved(false)}
+                    className="flex-1 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm"
+                  >
+                    Zrušit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmDeleteSaved(false);
+                      onDeleteSavedBacktests();
+                    }}
+                    disabled={isRunning}
+                    className="flex-1 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Smazat vše
+                  </button>
+                </div>
+              </div>
+            )}
+            <div className="text-[11px] text-zinc-600 leading-snug">
+              Tip: smaže pouze historii uložených runů ve Firestore (neovlivní strategii ani kód).
+            </div>
+          </div>
+        ) : null}
       </SettingsSection>
     </div>
   );

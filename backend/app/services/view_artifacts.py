@@ -17,6 +17,7 @@ from app.services.data_ohlc import (
     parse_iso_timestamp_for_index,
     resolve_safe_data_path,
 )
+from app.services.hl_artifact_spec import canonical_precompute_tf
 from app.services.sd_zone_merge import zone_dict_from_artifact_row
 
 # Minuty řady TF — výběr artefaktu při nativním grafu a fallbacku (sjednoceno se Swing_HL._infer_data_timeframe).
@@ -832,14 +833,61 @@ def _touch_tier_from_row(row: Any) -> int:
 
 
 def _zone_fill_for_touch(kind: str, tier: int) -> str:
+    """
+    Demand / Supply jen v zelené / červené — žádná sdílená „výstražná“ oranžová pro dotčené zóny.
+    Vyšší tier = o něco sytější stejný odstín, stále nízká kryvost (lehká výplň).
+    """
     k = kind.strip().lower()
+    is_demand = k == "demand"
+    if is_demand:
+        if tier >= 2:
+            return "rgba(21, 128, 61, 0.26)"
+        if tier == 1:
+            return "rgba(34, 197, 94, 0.18)"
+        return "rgba(34, 197, 94, 0.12)"
     if tier >= 2:
-        return "rgba(220, 38, 38, 0.42)"
+        return "rgba(185, 28, 28, 0.26)"
     if tier == 1:
-        return "rgba(249, 115, 22, 0.38)"
-    if k == "demand":
-        return "rgba(34, 197, 94, 0.25)"
-    return "rgba(239, 68, 68, 0.25)"
+        return "rgba(239, 68, 68, 0.18)"
+    return "rgba(239, 68, 68, 0.12)"
+
+
+def _sd_zone_row_tf_key(raw: Any) -> str:
+    s = str(raw or "").strip()
+    return (canonical_precompute_tf(s) or s.replace("/", "_")).strip()
+
+
+def _filter_sd_zones_df_for_chart_tf(
+    zones_df: pd.DataFrame,
+    want_tf: str | None,
+) -> tuple[pd.DataFrame, str | None, str | None]:
+    """
+    Stejná logika výběru TF jako u H/L vrstvy: zobrazit jen zóny z ``source_tf`` odpovídajícího grafu.
+
+    Vrací (filtrovaný DataFrame, kanonický TF požadovaný grafem, skutečně použitý klíč po případném fallbacku).
+    Druhý a třetí prvek jsou None, pokud se nefiltruje (neznámý want_tf nebo chybí sloupec).
+    """
+    if zones_df is None or zones_df.empty:
+        return zones_df, None, None
+    if want_tf is None or not str(want_tf).strip():
+        return zones_df, None, None
+    if "source_tf" not in zones_df.columns:
+        return zones_df, None, None
+
+    keys_series = zones_df["source_tf"].map(_sd_zone_row_tf_key)
+    unique_keys = sorted({k for k in keys_series.tolist() if k})
+    if not unique_keys:
+        return zones_df, None, None
+
+    want_canon = (canonical_precompute_tf(str(want_tf).strip()) or str(want_tf).strip()).strip()
+    if want_canon in unique_keys:
+        return zones_df.loc[keys_series == want_canon].copy(), want_canon, want_canon
+
+    fake_manifest: dict[str, Any] = {"artifacts": {k: {} for k in unique_keys}}
+    picked = _pick_hl_tf_key(fake_manifest, want_canon)
+    if picked and picked in unique_keys:
+        return zones_df.loc[keys_series == picked].copy(), want_canon, picked
+    return zones_df.copy(), want_canon, None
 
 
 def _view_zones_from_sd_parquet(zones_df: pd.DataFrame, zoh: pd.DataFrame) -> list[dict[str, Any]]:
@@ -912,6 +960,7 @@ def build_view_from_artifacts(
     end_iso: str | None,
     df_chart: pd.DataFrame,
     chart_tf_normalized: str | None,
+    include_hl: bool = True,
     include_sd: bool = True,
     dataset_id_override: str | None = None,
     repo_root_for_artifacts: Path | None = None,
@@ -944,31 +993,42 @@ def build_view_from_artifacts(
     hl_manifest = artifact_store.read_json_if_exists(hl_mpath)
     banner: str | None = None
     status = "ok"
+    markers: list[dict[str, Any]] = []
+    lines: list[dict[str, Any]] = []
 
-    if not hl_manifest:
-        status = "missing_hl"
-        banner = "Chybí H/L artefakt (Build features). Graf ukazuje jen OHLC."
-        return {
-            "markers": [],
-            "lines": [],
-            "zones": [],
-            "artifact_status": status,
-            "artifact_banner": banner,
-            "dataset_id": dataset_id,
-        }
-
-    if artifact_store.manifest_is_stale_fingerprint(hl_manifest, fp):
-        status = "stale_fingerprint"
-        banner = "Artefakt neodpovídá aktuálnímu souboru dat (přepočti Build features)."
+    if include_hl:
+        if not hl_manifest:
+            status = "missing_hl"
+            banner = "Chybí H/L artefakt (Build features). Graf ukazuje jen OHLC."
+            if not include_sd:
+                return {
+                    "markers": [],
+                    "lines": [],
+                    "zones": [],
+                    "artifact_status": status,
+                    "artifact_banner": banner,
+                    "dataset_id": dataset_id,
+                }
+        elif artifact_store.manifest_is_stale_fingerprint(hl_manifest, fp):
+            status = "stale_fingerprint"
+            banner = "Artefakt neodpovídá aktuálnímu souboru dat (přepočti Build features)."
+    else:
+        if not hl_manifest and include_sd:
+            note = (
+                "H/L vrstva vypnutá (zvolen S/D modul ve View). "
+                "Zóny se berou z S/D artefaktu, pokud existuje — stav „Fresh“ může odkazovat na dřívější H/L build."
+            )
+            banner = note
+        elif hl_manifest and artifact_store.manifest_is_stale_fingerprint(hl_manifest, fp):
+            status = "stale_fingerprint"
+            banner = "Artefakt neodpovídá aktuálnímu souboru dat (přepočti Build features)."
 
     hl_dir = hl_mpath.parent
     chart_index = df_chart.index
     want_tf = _resolve_want_hl_artifact_tf_key(chart_tf_normalized, chart_index)
-    tf_key = _pick_hl_tf_key(hl_manifest, want_tf)
-    markers: list[dict[str, Any]] = []
-    lines: list[dict[str, Any]] = []
+    tf_key = _pick_hl_tf_key(hl_manifest, want_tf) if (include_hl and hl_manifest) else None
 
-    if tf_key:
+    if include_hl and hl_manifest and tf_key:
         if want_tf and tf_key != want_tf:
             # Make TF fallback explicit (common confusion on intraday: native 30m requested but ladder built only to 1h).
             warn_tf = (
@@ -1066,7 +1126,12 @@ def build_view_from_artifacts(
             if zname:
                 zp = sd_dir / zname
                 if zp.is_file():
-                    zones = _view_zones_from_sd_parquet(pd.read_parquet(zp), df_chart)
+                    zdf_all = pd.read_parquet(zp)
+                    zdf_use, want_sd_c, used_sd_c = _filter_sd_zones_df_for_chart_tf(zdf_all, want_tf)
+                    if want_sd_c and used_sd_c and want_sd_c != used_sd_c:
+                        warn_sd = f"S/D zóny: přesný TF ({want_sd_c}) není v cache; zobrazuji {used_sd_c}."
+                        banner = f"{banner}; {warn_sd}" if banner else warn_sd
+                    zones = _view_zones_from_sd_parquet(zdf_use, df_chart)
                 else:
                     if status == "ok":
                         status = "missing_sd"
@@ -1075,7 +1140,12 @@ def build_view_from_artifacts(
             else:
                 cand = sd_dir / "zones.parquet"
                 if cand.is_file():
-                    zones = _view_zones_from_sd_parquet(pd.read_parquet(cand), df_chart)
+                    zdf_all = pd.read_parquet(cand)
+                    zdf_use, want_sd_c, used_sd_c = _filter_sd_zones_df_for_chart_tf(zdf_all, want_tf)
+                    if want_sd_c and used_sd_c and want_sd_c != used_sd_c:
+                        warn_sd = f"S/D zóny: přesný TF ({want_sd_c}) není v cache; zobrazuji {used_sd_c}."
+                        banner = f"{banner}; {warn_sd}" if banner else warn_sd
+                    zones = _view_zones_from_sd_parquet(zdf_use, df_chart)
                 elif status == "ok":
                     status = "missing_sd"
                     if banner is None:

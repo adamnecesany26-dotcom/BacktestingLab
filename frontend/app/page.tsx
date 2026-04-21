@@ -31,7 +31,12 @@ import {
   type FirestoreItem,
 } from "@/lib/firestore";
 import { ensureAnonymousSession } from "@/lib/firebase";
-import { runBacktestStreaming, getAvailableData } from "@/lib/api";
+import { runBacktestStreaming, getAvailableData, type SdZoneTestResponse } from "@/lib/api";
+import type { SdZoneTestRunBody } from "@/lib/api";
+import { SdTestingSettings } from "@/components/SdTestingSettings";
+import { SdSavedRunsPicker } from "@/components/SdSavedRunsPicker";
+import { SdZoneTestResultsView } from "@/components/SdZoneTestResultsView";
+import { SdSavedRunsAnalyticsView } from "@/components/SdSavedRunsAnalyticsView";
 import { MIN_BACKTEST_YEARS } from "@/lib/dataRange";
 import {
   parseStrategyParams,
@@ -159,6 +164,16 @@ export default function Home() {
   const [isRunning, setIsRunning] = useState(false);
   const [runProgress, setRunProgress] = useState(0);
   const [showResults, setShowResults] = useState(false);
+  const [rightSettingsTab, setRightSettingsTab] = useState<"backtest" | "sd_test" | "sd_saved" | "analytics">("backtest");
+  const [sdTestLoading, setSdTestLoading] = useState(false);
+  const [sdTestResult, setSdTestResult] = useState<SdZoneTestResponse | null>(null);
+  const [showSdTestResults, setShowSdTestResults] = useState(false);
+  const [sdTestLastRequest, setSdTestLastRequest] = useState<SdZoneTestRunBody | null>(null);
+  /** Uložený S/D běh na backendu (cache nebo po „Uložit backtest“). */
+  const [sdTestSavedRunId, setSdTestSavedRunId] = useState<string | null>(null);
+  /** S/D testing: vlastní datový soubor a délka okna (nezávislé na výběru v Backtestu). */
+  const [sdTestDataFile, setSdTestDataFile] = useState<string | null>(null);
+  const [sdTestYears, setSdTestYears] = useState(1);
   const [abortController, setAbortController] = useState<AbortController | null>(null);
   const [terminalMinimized, setTerminalMinimized] = useState(false);
   /** Levé adresářové menu + pravý panel nastavení — lze schovat kvůli většímu prostoru pro editor / výsledky. */
@@ -171,6 +186,19 @@ export default function Home() {
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
   }, []);
+
+  // Plotly charts resize on window resize. When we collapse/expand side panels,
+  // the container width changes without a real window resize → force a resize event.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      try {
+        window.dispatchEvent(new Event("resize"));
+      } catch {
+        // ignore
+      }
+    }, 250); // match panel transition duration (200ms) with a bit of buffer
+    return () => clearTimeout(t);
+  }, [leftNavOpen, rightPanelOpen]);
 
   /** Sloučí statické importy, importlib.import_module("modules.X") a PARAM_MODULE_CHAIN → výběr modulů/indikátorů. */
   const applyLibraryAutoDetect = useCallback(
@@ -556,6 +584,26 @@ export default function Home() {
     const cap = minYearsAcrossSelected;
     setYears((y) => Math.min(y, cap));
   }, [selectedInstruments.length, minYearsAcrossSelected]);
+
+  /** S/D test: platný soubor vůči filtrovanému seznamu; výchozí první instrument. */
+  useEffect(() => {
+    setSdTestDataFile((prev) => {
+      if (prev && filteredInstruments.some((i) => i.file === prev)) return prev;
+      return filteredInstruments[0]?.file ?? null;
+    });
+  }, [filteredInstruments]);
+
+  const sdTestInstrument = useMemo(
+    () => filteredInstruments.find((i) => i.file === sdTestDataFile) ?? null,
+    [filteredInstruments, sdTestDataFile],
+  );
+
+  /** S/D test: drž roky v [min, max dostupných dat]. */
+  useEffect(() => {
+    if (!sdTestInstrument) return;
+    const cap = sdTestInstrument.yearsAvailable > 0 ? sdTestInstrument.yearsAvailable : 100;
+    setSdTestYears((y) => Math.max(MIN_BACKTEST_YEARS, Math.min(y, cap)));
+  }, [sdTestInstrument?.file, sdTestInstrument?.yearsAvailable]);
 
   /** Tick z brokerConfig jen při přesně jednom vybraném futures instrumentu */
   useEffect(() => {
@@ -1140,7 +1188,35 @@ export default function Home() {
     }
   };
 
-  const centerContent = showResults ? (
+  const centerContent =
+    showSdTestResults && sdTestResult ? (
+      <SdZoneTestResultsView
+        result={sdTestResult}
+        lastRequest={sdTestLastRequest}
+        onRerunRequest={setSdTestLastRequest}
+        onResult={setSdTestResult}
+        savedRunId={sdTestSavedRunId}
+        onSavedRunId={setSdTestSavedRunId}
+        onBack={() => {
+          setShowSdTestResults(false);
+        }}
+      />
+    ) : rightSettingsTab === "analytics" ? (
+      <SdSavedRunsAnalyticsView instruments={instruments} />
+    ) : rightSettingsTab === "sd_saved" ? (
+      <div className="p-4">
+        <SdSavedRunsPicker
+          instruments={instruments}
+          onOpen={(doc) => {
+            setSdTestLastRequest(doc.request as any);
+            setSdTestResult(doc.response as any);
+            setSdTestSavedRunId(String(doc.run_id || ""));
+            setShowSdTestResults(true);
+            setShowResults(false);
+          }}
+        />
+      </div>
+    ) : showResults ? (
     <ResultsView
       results={results}
       runHistory={runHistory}
@@ -1301,11 +1377,17 @@ export default function Home() {
       <div className="flex flex-1 flex-col min-w-0">
         <div className="flex-1 flex min-h-0">
           <div className="flex-1 flex flex-col min-w-0 border-r border-zinc-800 relative">
-            {isRunning && (
+            {(isRunning || sdTestLoading) && (
               <LoadingOverlay
-                progress={runProgress}
-                message={runProgress > 0 ? `Běží ${runProgress}%` : "Spouštím backtest..."}
-                onStop={handleStopRun}
+                progress={isRunning ? runProgress : 0}
+                message={
+                  sdTestLoading
+                    ? "S/D touch analytics…"
+                    : runProgress > 0
+                      ? `Běží ${runProgress}%`
+                      : "Spouštím backtest..."
+                }
+                onStop={isRunning ? handleStopRun : undefined}
               />
             )}
             {centerContent}
@@ -1325,7 +1407,78 @@ export default function Home() {
               rightPanelOpen ? "w-96 border-l border-zinc-800" : "w-0 border-l-0"
             }`}
           >
-            <div className="w-96 h-full min-h-0 overflow-y-auto p-4">
+            <div className="w-96 h-full min-h-0 overflow-y-auto p-4 flex flex-col gap-3">
+              <div className="flex rounded-lg border border-zinc-700 overflow-hidden text-[11px] shrink-0">
+                <button
+                  type="button"
+                  className={`flex-1 py-2 font-medium px-0.5 ${
+                    rightSettingsTab === "backtest" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
+                  }`}
+                  onClick={() => setRightSettingsTab("backtest")}
+                >
+                  Backtest
+                </button>
+                <button
+                  type="button"
+                  className={`flex-1 py-2 font-medium px-0.5 ${
+                    rightSettingsTab === "sd_test" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
+                  }`}
+                  onClick={() => setRightSettingsTab("sd_test")}
+                >
+                  S/D test
+                </button>
+                <button
+                  type="button"
+                  className={`flex-1 py-2 font-medium px-0.5 ${
+                    rightSettingsTab === "sd_saved" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
+                  }`}
+                  onClick={() => setRightSettingsTab("sd_saved")}
+                >
+                  S/D saved
+                </button>
+                <button
+                  type="button"
+                  className={`flex-1 py-2 font-medium px-0.5 ${
+                    rightSettingsTab === "analytics" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
+                  }`}
+                  onClick={() => setRightSettingsTab("analytics")}
+                >
+                  Analytics
+                </button>
+              </div>
+              {rightSettingsTab === "sd_test" ? (
+                <SdTestingSettings
+                  instruments={filteredInstruments}
+                  instrumentsLoaded={instrumentsLoaded}
+                  dataLoadError={dataLoadError}
+                  dataFile={sdTestDataFile}
+                  onDataFileChange={setSdTestDataFile}
+                  years={sdTestYears}
+                  onYearsChange={setSdTestYears}
+                  busy={sdTestLoading}
+                  onBusy={setSdTestLoading}
+                  onRequest={setSdTestLastRequest}
+                  onSavedRunId={setSdTestSavedRunId}
+                  savedRunsCount={runHistory.length}
+                  onDeleteSavedBacktests={handleDeleteAllRuns}
+                  onResult={(res) => {
+                    setSdTestResult(res);
+                    setShowSdTestResults(true);
+                    setShowResults(false);
+                  }}
+                />
+              ) : rightSettingsTab === "sd_saved" ? (
+                <SdSavedRunsPicker
+                  instruments={filteredInstruments}
+                  onOpen={(doc) => {
+                    setSdTestLastRequest(doc.request as any);
+                    setSdTestResult(doc.response as any);
+                    setSdTestSavedRunId(String(doc.run_id || ""));
+                    setShowSdTestResults(true);
+                    setShowResults(false);
+                  }}
+                />
+              ) : (
               <BacktestSettings
                 instruments={filteredInstruments}
                 instrumentsLoaded={instrumentsLoaded}
@@ -1352,6 +1505,8 @@ export default function Home() {
                 onRun={handleRun}
                 isRunning={isRunning}
                 canRun={openItem?.type === "strategies"}
+                savedRunsCount={runHistory.length}
+                onDeleteSavedBacktests={handleDeleteAllRuns}
                 strategyParams={strategyParams}
                 strategyParamMeta={strategyParamMeta}
                 onStrategyParamsChange={setStrategyParams}
@@ -1372,6 +1527,7 @@ export default function Home() {
                 edgeSettings={edgeSettings}
                 onEdgeSettingsChange={setEdgeSettings}
               />
+              )}
             </div>
           </div>
         </div>

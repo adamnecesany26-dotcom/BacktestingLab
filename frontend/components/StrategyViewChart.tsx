@@ -31,6 +31,10 @@ import {
   shuffleWindowBarCount,
 } from "@/lib/viewChartTimeframe";
 import {
+  filterZonesForSdZonesOnlyView,
+  isSupplyDemandZonesModuleView,
+} from "@/lib/viewModuleKinds";
+import {
   coerceViewMarkerBarIndex,
   remapViewMarkersBarIndexForWindow,
 } from "@/lib/viewDemoObdobiSlice";
@@ -41,6 +45,8 @@ import {
 } from "@/lib/viewChartLines";
 import { FieldHelpPopover } from "@/components/FieldHelpPopover";
 import { backtestFieldHelp } from "@/components/backtestFieldMeta";
+import { ViewLikeChart } from "@/components/charts/ViewLikeChart";
+import { DEFAULT_VISIBILITY, type VisibilityKey } from "@/components/charts/viewLikeChartSpec";
 
 /** Musí odpovídat backend ``PRECOMPUTE_TF_LADDER`` (pořadí od hrubého k jemnému; bez 30m). */
 const ARTIFACT_PRECOMPUTE_TF_OPTIONS = ["1M", "1w", "1d", "4h", "1h"] as const;
@@ -293,7 +299,6 @@ function buildZoneTouchMarkerTrace(
   if (numBars < 1) return null;
   const pts: { idx: number; val: number }[] = [];
   for (const z of zones) {
-    if (!z.has_touch) continue;
     const bi = z.touch_bar_index;
     const pr = z.touch_marker_price;
     if (typeof bi !== "number" || typeof pr !== "number" || !Number.isFinite(pr)) continue;
@@ -311,8 +316,8 @@ function buildZoneTouchMarkerTrace(
     marker: {
       size: 14,
       symbol: "circle",
-      color: "rgba(147, 197, 253, 0.55)",
-      line: { color: "rgba(191, 219, 254, 0.9)", width: 1.5 },
+      color: "rgba(245, 158, 11, 0.75)",
+      line: { color: "rgba(251, 191, 36, 0.95)", width: 1.5 },
     },
     name: "Touch zóny",
     showlegend: true,
@@ -351,29 +356,7 @@ async function resolveModuleDependencies(
   return out;
 }
 
-/** Klíče pro přepínání viditelnosti – rozšířitelné pro další moduly */
-export type VisibilityKey =
-  | "swing_hl"
-  | "internal_hl"
-  | "major_hl"
-  | "bos_levels"
-  | "inducement_points"
-  | "demand_supply_zones"
-  | "support_resistance_zones"
-  | "premium_discount_zones"
-  | "lines";
-
-const DEFAULT_VISIBILITY: Record<VisibilityKey, boolean> = {
-  swing_hl: true,
-  internal_hl: true,
-  major_hl: true,
-  bos_levels: true,
-  inducement_points: true,
-  demand_supply_zones: true,
-  support_resistance_zones: true,
-  premium_discount_zones: true,
-  lines: true,
-};
+// VisibilityKey + DEFAULT_VISIBILITY moved to shared View-like chart spec (to reuse in S/D results).
 
 /** Období zobrazení na grafu: Max → nejužší okno (řazeno od celé řady dolů k 1 měsíci). */
 const VIEW_DISPLAY_PERIODS = [
@@ -387,6 +370,20 @@ const VIEW_DISPLAY_PERIODS = [
   { label: "3M", years: 0.25 },
   { label: "1M", years: 0.083 },
 ] as const;
+
+/** Výchozí View: 6M, denní svíčky (když TF v žebříku není — např. nativně denní data — efekt přepne na native). */
+const VIEW_DEFAULT_DISPLAY_YEARS = 0.5;
+const VIEW_DEFAULT_CHART_TIMEFRAME = "1D";
+
+function pickViewDefaultDataFile(
+  list: DataInstrument[],
+  preferredFile: string | undefined
+): string {
+  if (preferredFile && list.some((i) => i.file === preferredFile)) return preferredFile;
+  const nq = list.find((i) => String(i.instrument ?? "").trim().toUpperCase() === "NQ");
+  if (nq) return nq.file;
+  return list[0]?.file ?? "";
+}
 
 function artifactOverallBadgeClass(overall: string | undefined): string {
   switch (overall) {
@@ -402,6 +399,44 @@ function artifactOverallBadgeClass(overall: string | undefined): string {
       return "bg-rose-950/50 text-rose-100/90 border-rose-600/40";
     default:
       return "bg-zinc-800/80 text-zinc-400 border-zinc-600/50";
+  }
+}
+
+/** Mapování stavu jedné vrstvy (hl/sd) na „overall“ klíč pro barvy badge. */
+function artifactLayerStateToPseudoOverall(
+  kind: "hl" | "sd",
+  state: string | undefined
+): string {
+  switch (state) {
+    case "fresh":
+      return "fresh";
+    case "missing":
+      return kind === "sd" ? "missing_sd" : "missing_hl";
+    case "stale_data":
+    case "stale_code":
+      return state;
+    case "error":
+      return "error";
+    default:
+      return "";
+  }
+}
+
+function artifactLayerBadgeLabel(kind: "hl" | "sd", state: string | undefined): string {
+  const prefix = kind === "hl" ? "H/L" : "S/D";
+  switch (state) {
+    case "fresh":
+      return `${prefix}: Fresh`;
+    case "missing":
+      return `${prefix}: chybí`;
+    case "stale_data":
+      return `${prefix}: stale (data)`;
+    case "stale_code":
+      return `${prefix}: stale (code)`;
+    case "error":
+      return `${prefix}: chyba`;
+    default:
+      return `${prefix}: —`;
   }
 }
 
@@ -437,7 +472,6 @@ export function StrategyViewChart({
   height = 960,
   strategyZoneSyncCode = null,
 }: StrategyViewChartProps) {
-  const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [ohlc, setOhlc] = useState<OhlcBar[]>([]);
   const [markers, setMarkers] = useState<ViewMarker[]>([]);
   const [loading, setLoading] = useState(true);
@@ -448,15 +482,12 @@ export function StrategyViewChart({
     if (instruments.length === 0) return;
     setDataFile((prev) => {
       if (prev && instruments.some((i) => i.file === prev)) return prev;
-      if (defaultDataFile && instruments.some((i) => i.file === defaultDataFile)) {
-        return defaultDataFile;
-      }
-      return instruments[0].file;
+      return pickViewDefaultDataFile(instruments, defaultDataFile);
     });
   }, [instruments, defaultDataFile]);
-  const [years, setYears] = useState(0.5);
+  const [years, setYears] = useState(VIEW_DEFAULT_DISPLAY_YEARS);
   /** Candle bar size for chart + module OHLC: native = instrument resolution; else server-side resample */
-  const [chartTimeframe, setChartTimeframe] = useState<string>("native");
+  const [chartTimeframe, setChartTimeframe] = useState<string>(VIEW_DEFAULT_CHART_TIMEFRAME);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(initialItemId ?? null);
   const [selectedItemType, setSelectedItemType] = useState<ViewItemType>(
     initialItemType ?? "module"
@@ -489,6 +520,14 @@ export function StrategyViewChart({
       gap_value_high?: number;
     }[]
   >([]);
+  const selectedItemLabel = useMemo(() => {
+    if (!selectedItemId) return null;
+    if (selectedItemType === "module") return modules.find((m) => m.id === selectedItemId)?.name ?? null;
+    if (selectedItemType === "indicator") return indicators.find((m) => m.id === selectedItemId)?.name ?? null;
+    if (selectedItemType === "strategy") return strategies.find((m) => m.id === selectedItemId)?.name ?? null;
+    return null;
+  }, [selectedItemId, selectedItemType, modules, indicators, strategies]);
+
   const [viewParamsSchema, setViewParamsSchema] = useState<StrategyParams>({});
   const [viewParamsMeta, setViewParamsMeta] = useState<StrategyParamsMeta>({});
   const [viewParamsValues, setViewParamsValues] = useState<StrategyParams>({});
@@ -519,7 +558,12 @@ export function StrategyViewChart({
   const [artifactBuildTimeframes, setArtifactBuildTimeframes] = useState<string[]>(() => [
     ...ARTIFACT_PRECOMPUTE_TF_OPTIONS,
   ]);
+  /** Co spustit v POST /api/artifacts/build — výběr uživatele (ne podle modulu ve View). */
+  const [artifactBuildIncludeHl, setArtifactBuildIncludeHl] = useState(true);
+  const [artifactBuildIncludeSd, setArtifactBuildIncludeSd] = useState(true);
   const viewParamsRef = useRef<StrategyParams>({});
+  /** Poslední úspěšně načtený main.py pro View (pro badge artefaktů podle typu modulu). */
+  const [viewMainPyCode, setViewMainPyCode] = useState<string | null>(null);
   /** Zvyšuje se při každém novém fetchi; starší async odpověď nesmí přepsat stav (Strict Mode / rychlé přepnutí modulu). */
   const viewRequestGenRef = useRef(0);
   /** Plotly někdy neaplikuje layout.shapes při prvním vykreslení; změna revision vynutí Plotly.react. */
@@ -527,6 +571,39 @@ export function StrategyViewChart({
   useEffect(() => {
     viewParamsRef.current = viewParamsValues;
   }, [viewParamsValues]);
+
+  const valuesCounts = useMemo(() => {
+    const zonesAny = zones ?? [];
+    const markersAny = (markers as any[]) ?? [];
+    const linesAny = lines ?? [];
+
+    const dsZones = zonesAny.filter((z: any) => z?.name === "Demand" || z?.name === "Supply");
+    const bosZones = zonesAny.filter((z: any) => String(z?.name ?? "").toLowerCase().startsWith("bos"));
+    const touches = zonesAny.filter((z: any) => Boolean(z?.has_touch) || typeof z?.touch_bar_index === "number");
+    const inducementPoints = zonesAny.reduce((s: number, z: any) => s + ((z?.inducements?.length as number | undefined) ?? 0), 0);
+
+    const swingMarkers = markersAny.filter((m: any) => ["high", "low"].includes(String(m?.type)));
+    const majorMarkers = markersAny.filter((m: any) => ["major_high", "major_low"].includes(String(m?.type)));
+    const internalMarkers = markersAny.filter((m: any) => ["internal_high", "internal_low"].includes(String(m?.type)));
+    const bosMarkers = markersAny.filter((m: any) => ["bos_bullish", "bos_bearish"].includes(String(m?.type)));
+
+    const linePointCount = linesAny.reduce((s: number, l: any) => s + (((l?.data as any[])?.length as number | undefined) ?? 0), 0);
+
+    return {
+      zones_total: zonesAny.length,
+      zones_ds: dsZones.length,
+      zones_bos: bosZones.length,
+      touches: touches.length,
+      inducement_points: inducementPoints,
+      markers_total: markersAny.length,
+      markers_swing: swingMarkers.length,
+      markers_major: majorMarkers.length,
+      markers_internal: internalMarkers.length,
+      markers_bos: bosMarkers.length,
+      lines_total: linesAny.length,
+      line_points: linePointCount,
+    };
+  }, [lines, markers, zones]);
 
   const selectedInstrument = useMemo((): DataInstrument | undefined => {
     const found = instruments.find((i) => i.file === dataFile);
@@ -625,6 +702,10 @@ export function StrategyViewChart({
     }
   }, [initialItemId, initialItemType]);
 
+  useEffect(() => {
+    setViewMainPyCode(null);
+  }, [selectedItemId, selectedItemType]);
+
   const fetchData = useCallback(async () => {
     const gen = ++viewRequestGenRef.current;
     setLoading(true);
@@ -696,6 +777,11 @@ export function StrategyViewChart({
       const moduleDeps =
         depNames.length > 0 ? await resolveModuleDependencies(depNames, modules) : undefined;
       const effectiveYears = needsDemoStyleClientSlice ? 0 : years;
+      const selMod =
+        selectedItemType === "module" && selectedItemId
+          ? modules.find((m) => m.id === selectedItemId)
+          : null;
+      const sdZonesOnlyView = isSupplyDemandZonesModuleView(code, selMod?.name);
       const res = await getViewData(
         dataFile,
         effectiveYears,
@@ -704,14 +790,25 @@ export function StrategyViewChart({
         moduleDeps,
         chartTimeframe,
         null,
-        useArtifactLayer ? { useArtifacts: true } : undefined
+        useArtifactLayer
+          ? {
+              useArtifacts: true,
+              artifactIncludeHl: !sdZonesOnlyView,
+            }
+          : undefined
       );
       if (gen !== viewRequestGenRef.current) return;
+      setViewMainPyCode(code);
       setArtifactBanner(useArtifactLayer ? (res.artifact_banner ?? null) : null);
       let nextOhlc = res.ohlc;
       let nextMarkers = res.markers ?? [];
       let nextLines = res.lines ?? [];
       let nextZones = res.zones ?? [];
+      if (sdZonesOnlyView) {
+        nextMarkers = [];
+        nextLines = [];
+        nextZones = filterZonesForSdZonesOnlyView(nextZones);
+      }
       if (needsDemoStyleClientSlice && years > 0) {
         const fromApiCount = nextMarkers.length;
         const sliced = applyViewDemoObdobiSlice(
@@ -743,6 +840,7 @@ export function StrategyViewChart({
       setPlotRevision((r) => r + 1);
     } catch (e) {
       if (gen !== viewRequestGenRef.current) return;
+      setViewMainPyCode(null);
       setError(e instanceof Error ? e.message : String(e));
       setOhlc([]);
       setMarkers([]);
@@ -799,17 +897,51 @@ export function StrategyViewChart({
     return Math.round(Math.min(94, Math.max(blended, timeSynth)) * 10) / 10;
   }, [artifactBuilding, artifactBuildElapsedSec, artifactBuildProgressPct, artifactBuildUiPulse]);
 
+  const artifactBuildButtonLabel = useMemo(() => {
+    if (artifactBuildIncludeHl && artifactBuildIncludeSd) return "Build features";
+    if (artifactBuildIncludeHl) return "Build H/L";
+    return "Build S/D";
+  }, [artifactBuildIncludeHl, artifactBuildIncludeSd]);
+
+  const artifactBuildButtonTitle = useMemo(() => {
+    const fileHint = dataFile ? `Dataset = aktuální instrument (${dataFile}). ` : "";
+    if (artifactBuildIncludeHl && artifactBuildIncludeSd) {
+      return (
+        fileHint +
+        "Precompute H/L a S/D na celý soubor; TF níže. Výstup do .backtest_artifacts. Období ve View jen zobrazení."
+      );
+    }
+    if (artifactBuildIncludeHl) {
+      return fileHint + "Jen H/L (swingy, BOS, trend). S/D Parquet se nemění. TF níže platí pro H/L.";
+    }
+    return (
+      fileHint +
+      "Jen S/D zóny z repozitářového examples/sd_zones — H/L se přeskakuje; musí existovat platný H/L artefakt. TF níže platí pro S/D."
+    );
+  }, [dataFile, artifactBuildIncludeHl, artifactBuildIncludeSd]);
+
   const handleBuildArtifacts = useCallback(async () => {
     if (!dataFile) return;
+    if (!artifactBuildIncludeHl && !artifactBuildIncludeSd) {
+      setArtifactBuildError("Vyber aspoň jednu vrstvu (H/L nebo S/D).");
+      return;
+    }
     artifactBuildWallT0Ref.current = Date.now();
     artifactBuildLastServerPctAtRef.current = Date.now();
     setArtifactBuilding(true);
     setArtifactBuildError(null);
     setArtifactBuildProgressPct(1);
-    setArtifactBuildPhaseLabel("Navazuji spojení…");
+    setArtifactBuildPhaseLabel(
+      artifactBuildIncludeHl && artifactBuildIncludeSd
+        ? "Navazuji spojení (H/L + S/D)…"
+        : artifactBuildIncludeHl
+          ? "Navazuji spojení (jen H/L)…"
+          : "Navazuji spojení (jen S/D)…"
+    );
     setArtifactBuildPulseCount(0);
     setArtifactBuildLastServerEventAt(Date.now());
     setArtifactBuildRecentEvents([]);
+
     try {
       await buildArtifactsStreaming(
         dataFile,
@@ -820,6 +952,8 @@ export function StrategyViewChart({
             artifactBuildTimeframes.length < ARTIFACT_PRECOMPUTE_TF_OPTIONS.length
               ? artifactBuildTimeframes
               : undefined,
+          skipHl: !artifactBuildIncludeHl,
+          skipSd: !artifactBuildIncludeSd,
         },
         (ev: ArtifactBuildStreamEvent) => {
           if (ev.type !== "phase") return;
@@ -865,6 +999,8 @@ export function StrategyViewChart({
   }, [
     dataFile,
     artifactBuildTimeframes,
+    artifactBuildIncludeHl,
+    artifactBuildIncludeSd,
     refreshArtifactStatus,
     useArtifactLayer,
     fetchData,
@@ -942,6 +1078,11 @@ export function StrategyViewChart({
         : years > 0
           ? Math.min(capAvail, 12, Math.max(years * 2.5, years + 0.75))
           : Math.min(capAvail, 10);
+      const selModShuffle =
+        selectedItemType === "module" && selectedItemId
+          ? modules.find((m) => m.id === selectedItemId)
+          : null;
+      const sdZonesOnlyShuffle = isSupplyDemandZonesModuleView(code, selModShuffle?.name);
       const res = await getViewData(
         dataFile,
         shuffleLoadYears,
@@ -950,14 +1091,22 @@ export function StrategyViewChart({
         moduleDeps,
         chartTimeframe,
         null,
-        useArtifactLayer ? { useArtifacts: true } : undefined
+        useArtifactLayer
+          ? { useArtifacts: true, artifactIncludeHl: !sdZonesOnlyShuffle }
+          : undefined
       );
       if (gen !== viewRequestGenRef.current) return;
+      setViewMainPyCode(code);
       setArtifactBanner(useArtifactLayer ? (res.artifact_banner ?? null) : null);
       const fullOhlc = res.ohlc;
-      const fullMarkers = res.markers ?? [];
-      const fullLines = res.lines ?? [];
-      const fullZones = res.zones ?? [];
+      let fullMarkers = res.markers ?? [];
+      let fullLines = res.lines ?? [];
+      let fullZones = res.zones ?? [];
+      if (sdZonesOnlyShuffle) {
+        fullMarkers = [];
+        fullLines = [];
+        fullZones = filterZonesForSdZonesOnlyView(fullZones);
+      }
 
       if (fullOhlc.length < 2) {
         setOhlc(fullOhlc);
@@ -1098,6 +1247,7 @@ export function StrategyViewChart({
       setPlotRevision((r) => r + 1);
     } catch (e) {
       if (gen !== viewRequestGenRef.current) return;
+      setViewMainPyCode(null);
       setError(e instanceof Error ? e.message : String(e));
       setOhlc([]);
       setMarkers([]);
@@ -1121,9 +1271,73 @@ export function StrategyViewChart({
     needsDemoStyleClientSlice,
   ]);
 
-  useEffect(() => {
-    import("react-plotly.js").then((mod) => setPlot(() => mod.default));
-  }, []);
+  const sdZonesOnlyViewForArtifactBadge = useMemo(
+    () =>
+      selectedItemType === "module" && viewMainPyCode
+        ? isSupplyDemandZonesModuleView(viewMainPyCode, selectedItemLabel)
+        : false,
+    [selectedItemType, viewMainPyCode, selectedItemLabel]
+  );
+
+  const artifactDatasetBadge = useMemo(() => {
+    if (!artifactStatus) {
+      return {
+        pseudoOverall: undefined as string | undefined,
+        label: undefined as string | undefined,
+        title: undefined as string | undefined,
+      };
+    }
+    if (!artifactStatus.ok) {
+      return {
+        pseudoOverall: artifactStatus.overall,
+        label: artifactStatus.overall_label ?? artifactStatus.overall,
+        title: artifactStatus.error ?? undefined,
+      };
+    }
+    const focusOverall =
+      !useArtifactLayer || selectedItemType !== "module" || !viewMainPyCode;
+    if (focusOverall) {
+      return {
+        pseudoOverall: artifactStatus.overall,
+        label: artifactStatus.overall_label ?? artifactStatus.overall,
+        title:
+          [artifactStatus.hl?.detail, artifactStatus.sd?.detail].filter(Boolean).join(" · ") ||
+          undefined,
+      };
+    }
+    if (sdZonesOnlyViewForArtifactBadge) {
+      const st = artifactStatus.sd?.state;
+      return {
+        pseudoOverall: artifactLayerStateToPseudoOverall("sd", st),
+        label: artifactLayerBadgeLabel("sd", st),
+        title:
+          [
+            artifactStatus.sd?.detail,
+            artifactStatus.hl?.detail ? `H/L: ${artifactStatus.hl.detail}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined,
+      };
+    }
+    const st = artifactStatus.hl?.state;
+    return {
+      pseudoOverall: artifactLayerStateToPseudoOverall("hl", st),
+      label: artifactLayerBadgeLabel("hl", st),
+      title:
+        [
+          artifactStatus.hl?.detail,
+          artifactStatus.sd?.detail ? `S/D: ${artifactStatus.sd.detail}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined,
+    };
+  }, [
+    artifactStatus,
+    useArtifactLayer,
+    selectedItemType,
+    viewMainPyCode,
+    sdZonesOnlyViewForArtifactBadge,
+  ]);
 
   useEffect(() => {
     fetchData();
@@ -1131,728 +1345,17 @@ export function StrategyViewChart({
 
   const inputClass = "px-3 py-1.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm";
 
-  if (!Plot) {
-    return (
-      <div className="flex items-center justify-center text-zinc-500" style={{ height }}>
-        Načítání Plotly...
-      </div>
-    );
-  }
-
-  const n = ohlc.length;
-  const indices = Array.from({ length: n }, (_, i) => i);
-  const dateToIndex = new Map(ohlc.map((b, i) => [b.date, i]));
-  const dayToIndex = new Map(ohlc.map((b, i) => [b.date.slice(0, 10), i]));
-  const opens = ohlc.map((b) => b.open);
-  const highs = ohlc.map((b) => b.high);
-  const lows = ohlc.map((b) => b.low);
-  const closes = ohlc.map((b) => b.close);
-
-  const tickStep = Math.max(1, Math.floor(n / 8));
-  const tickvals = Array.from({ length: Math.ceil(n / tickStep) + 1 }, (_, i) =>
-    Math.min(i * tickStep, n - 1)
+  // Chart rendering moved to shared `ViewLikeChart` to ensure identical visuals across View and S/D results.
+  const highMarkers = useMemo(() => markers.filter((m) => m.type === "high"), [markers]);
+  const lowMarkers = useMemo(() => markers.filter((m) => m.type === "low"), [markers]);
+  const majorHighMarkers = useMemo(() => markers.filter((m) => m.type === "major_high"), [markers]);
+  const majorLowMarkers = useMemo(() => markers.filter((m) => m.type === "major_low"), [markers]);
+  const internalHighMarkers = useMemo(() => markers.filter((m) => m.type === "internal_high"), [markers]);
+  const internalLowMarkers = useMemo(() => markers.filter((m) => m.type === "internal_low"), [markers]);
+  const inducementPoints = useMemo(
+    () => zones.flatMap((z) => z.inducements ?? []),
+    [zones],
   );
-  const ticktext = tickvals.map((i) => {
-    const raw = ohlc[i]?.date ?? "";
-    const parsed = new Date(raw);
-    if (Number.isNaN(parsed.getTime())) return raw;
-    const hasTime = /T\d{2}:\d{2}/.test(raw) || /\s\d{2}:\d{2}/.test(raw);
-    return parsed.toLocaleString("cs-CZ", {
-      year: "2-digit",
-      month: "2-digit",
-      day: "2-digit",
-      ...(hasTime ? { hour: "2-digit", minute: "2-digit" } : {}),
-    });
-  });
-
-  const candlestickTrace: any = {
-    type: "candlestick",
-    x: indices,
-    open: opens,
-    high: highs,
-    low: lows,
-    close: closes,
-    increasing: { line: { color: "#10b981", width: 1 }, fillcolor: "#10b981" },
-    decreasing: { line: { color: "#ef4444", width: 1 }, fillcolor: "#ef4444" },
-    xperiodalignment: "middle",
-    name: "OHLC",
-  };
-
-  const highMarkers = markers.filter((m) => m.type === "high");
-  const lowMarkers = markers.filter((m) => m.type === "low");
-  const majorHighMarkers = markers.filter((m) => m.type === "major_high");
-  const majorLowMarkers = markers.filter((m) => m.type === "major_low");
-  const internalHighMarkers = markers.filter((m) => m.type === "internal_high");
-  const internalLowMarkers = markers.filter((m) => m.type === "internal_low");
-  const bosBullMarkers = markers.filter((m) => m.type === "bos_bullish");
-  const bosBearMarkers = markers.filter((m) => m.type === "bos_bearish");
-  const otherMarkers = markers.filter(
-    (m) =>
-      m.type !== "high" &&
-      m.type !== "low" &&
-      m.type !== "major_high" &&
-      m.type !== "major_low" &&
-      m.type !== "internal_high" &&
-      m.type !== "internal_low" &&
-      m.type !== "bos_bullish" &&
-      m.type !== "bos_bearish"
-  );
-
-  /** Swing H/L na správném baru musí sedět na knot svíčky (Parquet někdy nese jiné měřítko ceny než View OHLC). */
-  const ohlcYForSwingMarker = (typ: string, idx: number): number | null => {
-    const bar = ohlc[idx];
-    if (!bar) return null;
-    switch (typ) {
-      case "high":
-      case "major_high":
-      case "internal_high":
-        return typeof bar.high === "number" && Number.isFinite(bar.high) ? bar.high : null;
-      case "low":
-      case "major_low":
-      case "internal_low":
-        return typeof bar.low === "number" && Number.isFinite(bar.low) ? bar.low : null;
-      default:
-        return null;
-    }
-  };
-
-  const mapMarkerToIndex = (m: ViewMarker) => {
-    // bar_index jen pokud leží v aktuálním okně OHLC — jinak spadneme na datum (jinak všechny mimo rozsah skončí na n−1 vpravo).
-    const bi0 = coerceViewMarkerBarIndex(m.bar_index);
-    if (bi0 !== null && n > 0) {
-      const i = bi0;
-      if (i >= 0 && i < n) return i;
-    }
-    const exact = dateToIndex.get(m.date);
-    if (exact !== undefined && exact >= 0) return exact;
-    const t = Date.parse(m.date);
-    const dayKey = (m.date || "").trim().slice(0, 10);
-    if (/^\d{4}-\d{2}-\d{2}$/.test(dayKey) && Number.isFinite(t) && n > 0) {
-      let bestDay = -1;
-      let bestDayAbs = Infinity;
-      for (let i = 0; i < n; i++) {
-        const raw = ohlc[i]?.date ?? "";
-        if (raw.slice(0, 10) !== dayKey) continue;
-        const bt = Date.parse(raw);
-        if (!Number.isFinite(bt)) continue;
-        const d = Math.abs(bt - t);
-        if (d < bestDayAbs) {
-          bestDayAbs = d;
-          bestDay = i;
-        }
-      }
-      if (bestDay >= 0) return bestDay;
-    }
-    const dayFallback = dayToIndex.get(dayKey);
-    if (dayFallback !== undefined && dayFallback >= 0) return dayFallback;
-    if (!Number.isFinite(t) || n <= 0) return -1;
-    const firstMs = Date.parse(ohlc[0]?.date ?? "");
-    const lastMs = Date.parse(ohlc[n - 1]?.date ?? "");
-    if (!Number.isFinite(firstMs) || !Number.isFinite(lastMs)) return -1;
-    // Markery s časem mimo viditelné okno nesmí jít na „nejblíže“ v okně — dříve maxMs = šířka celého
-    // grafu (např. rok) přitáhlo všechny březnové body k první svíčce v září → jeden sloupec na X.
-    const padMs = 86400000;
-    if (t < firstMs - padMs || t > lastMs + padMs) return -1;
-    let best = -1;
-    let bestAbs = Infinity;
-    for (let i = 0; i < n; i++) {
-      const bt = Date.parse(ohlc[i]?.date ?? "");
-      if (!Number.isFinite(bt)) continue;
-      const d = Math.abs(bt - t);
-      if (d < bestAbs) {
-        bestAbs = d;
-        best = i;
-      }
-    }
-    const stepMs =
-      n >= 2 ? Math.max(3600000, (lastMs - firstMs) / Math.max(1, n - 1)) : 86400000;
-    const maxFuzzyMs = Math.min(7 * 86400000, Math.max(3 * stepMs, 2 * 3600000));
-    return best >= 0 && bestAbs <= maxFuzzyMs ? best : -1;
-  };
-
-  const mapSwingMarker = (m: ViewMarker) => {
-    const idx = mapMarkerToIndex(m);
-    if (idx < 0) return { idx, val: null as number | null };
-    const yOhlc = ohlcYForSwingMarker(m.type, idx);
-    const v =
-      yOhlc != null
-        ? yOhlc
-        : typeof m.value === "number" && Number.isFinite(m.value)
-          ? m.value
-          : null;
-    return { idx, val: v };
-  };
-
-  const highMapped = highMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const lowMapped = lowMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const majorHighMapped = majorHighMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const majorLowMapped = majorLowMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const internalHighMapped = internalHighMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const internalLowMapped = internalLowMarkers
-    .map((m) => mapSwingMarker(m))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const otherMapped = otherMarkers
-    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-
-  const bosBullMapped = bosBullMarkers
-    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-  const bosBearMapped = bosBearMarkers
-    .map((m) => ({ idx: mapMarkerToIndex(m), val: m.value }))
-    .filter((p): p is { idx: number; val: number } => p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val));
-
-  const inducementPointsByZone = zones.flatMap((z) =>
-    (z.inducements ?? []).map((ind) => {
-      const rawIndex = (ind as { index?: number }).index;
-      let idx: number;
-      if (typeof rawIndex === "number" && !Number.isNaN(rawIndex)) {
-        idx = Math.max(0, Math.min(rawIndex, n - 1));
-      } else {
-        idx = mapMarkerToIndex({
-          date: ind.date ?? "",
-          type: "high",
-          value: ind.value,
-        });
-      }
-      return { idx, val: ind.value, zoneName: z.name };
-    })
-  ).filter(
-    (p): p is { idx: number; val: number; zoneName: string } =>
-      p.idx >= 0 && typeof p.val === "number" && Number.isFinite(p.val)
-  );
-
-  const inducementDemand = inducementPointsByZone.filter((p) => p.zoneName === "Demand");
-  const inducementSupply = inducementPointsByZone.filter((p) => p.zoneName === "Supply");
-  const inducementOther = inducementPointsByZone.filter((p) => p.zoneName !== "Demand" && p.zoneName !== "Supply");
-  const inducementPoints = inducementPointsByZone;
-
-  const inducementDemandTrace = buildInducementMarkerTrace(
-    inducementDemand.map((p) => ({ idx: p.idx, val: p.val })),
-    "#3b82f6",
-    "Inducement (D)",
-    n
-  );
-
-  const inducementSupplyTrace = buildInducementMarkerTrace(
-    inducementSupply.map((p) => ({ idx: p.idx, val: p.val })),
-    "#a855f7",
-    "Inducement (S)",
-    n
-  );
-
-  const inducementOtherTrace = buildInducementMarkerTrace(
-    inducementOther.map((p) => ({ idx: p.idx, val: p.val })),
-    "#64748b",
-    "Inducement",
-    n
-  );
-
-  const zoneTouchTrace = buildZoneTouchMarkerTrace(zones, n);
-
-  const highTrace: any = {
-    type: "scatter",
-    x: highMapped.map((p) => p.idx),
-    y: highMapped.map((p) => p.val),
-    mode: "markers",
-    marker: {
-      size: 10,
-      color: "#10b981",
-      symbol: "circle",
-      line: { color: "#fff", width: 1 },
-    },
-    name: "High",
-    showlegend: highMarkers.length > 0,
-  };
-
-  const lowTrace: any = {
-    type: "scatter",
-    x: lowMapped.map((p) => p.idx),
-    y: lowMapped.map((p) => p.val),
-    mode: "markers",
-    marker: {
-      size: 10,
-      color: "#ef4444",
-      symbol: "circle",
-      line: { color: "#fff", width: 1 },
-    },
-    name: "Low",
-    showlegend: lowMarkers.length > 0,
-  };
-
-  const majorHighTrace: any =
-    majorHighMapped.length > 0
-      ? {
-          type: "scatter",
-          x: majorHighMapped.map((p) => p.idx),
-          y: majorHighMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 14,
-            color: "#fbbf24",
-            symbol: "diamond",
-            line: { color: "#fff", width: 1.5 },
-          },
-          name: "Major High",
-          showlegend: true,
-        }
-      : null;
-
-  const majorLowTrace: any =
-    majorLowMapped.length > 0
-      ? {
-          type: "scatter",
-          x: majorLowMapped.map((p) => p.idx),
-          y: majorLowMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 14,
-            color: "#f59e0b",
-            symbol: "diamond",
-            line: { color: "#fff", width: 1.5 },
-          },
-          name: "Major Low",
-          showlegend: true,
-        }
-      : null;
-
-  const internalHighTrace: any =
-    internalHighMapped.length > 0
-      ? {
-          type: "scatter",
-          x: internalHighMapped.map((p) => p.idx),
-          y: internalHighMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 4,
-            color: "#6ee7b7",
-            symbol: "circle",
-            line: { color: "#10b981", width: 0.5 },
-          },
-          name: "Internal High",
-          showlegend: true,
-        }
-      : null;
-
-  const internalLowTrace: any =
-    internalLowMapped.length > 0
-      ? {
-          type: "scatter",
-          x: internalLowMapped.map((p) => p.idx),
-          y: internalLowMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 4,
-            color: "#fca5a5",
-            symbol: "circle",
-            line: { color: "#ef4444", width: 0.5 },
-          },
-          name: "Internal Low",
-          showlegend: true,
-        }
-      : null;
-
-  const otherTrace: any =
-    otherMapped.length > 0
-      ? {
-          type: "scatter",
-          x: otherMapped.map((p) => p.idx),
-          y: otherMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 10,
-            color: "#3b82f6",
-            symbol: "diamond",
-            line: { color: "#fff", width: 1 },
-          },
-          name: "Signal",
-          showlegend: true,
-        }
-      : null;
-
-  const bosBullTrace: any =
-    bosBullMapped.length > 0
-      ? {
-          type: "scatter",
-          x: bosBullMapped.map((p) => p.idx),
-          y: bosBullMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 11,
-            color: "#14b8a6",
-            symbol: "triangle-up",
-            line: { color: "#fff", width: 1 },
-          },
-          name: "BOS ↑",
-          showlegend: true,
-        }
-      : null;
-
-  const bosBearTrace: any =
-    bosBearMapped.length > 0
-      ? {
-          type: "scatter",
-          x: bosBearMapped.map((p) => p.idx),
-          y: bosBearMapped.map((p) => p.val),
-          mode: "markers",
-          marker: {
-            size: 11,
-            color: "#c084fc",
-            symbol: "triangle-down",
-            line: { color: "#fff", width: 1 },
-          },
-          name: "BOS ↓",
-          showlegend: true,
-        }
-      : null;
-
-  const lineColors = ["#3b82f6", "#f97316", "#a855f7", "#06b6d4"];
-  const trendNameCount = new Map<string, number>();
-  const standardLines = lines.filter((line): line is ViewLineSeries => !isViewRegimeHistogramLine(line));
-  const regimeHistogramLine = lines.find(isViewRegimeHistogramLine);
-
-  const lineTraces = standardLines.flatMap((line, i) => {
-    const fallbackColor = line.color ?? lineColors[i % lineColors.length];
-    const data = line.data ?? [];
-    // Backend může poslat více řad se stejným jménem (segmenty trendu) — každá má vlastní barvu z Pythonu
-    if (line.color) {
-      const pts = data
-        .map((p) => {
-          const idx = dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1;
-          let ht = "%{y:.4f}<extra></extra>";
-          if (p.state != null && String(p.state).length > 0) {
-            ht =
-              p.score != null && Number.isFinite(Number(p.score))
-                ? `${p.state} · ${Number(p.score).toFixed(0)}<extra></extra>`
-                : `${p.state}<extra></extra>`;
-          }
-          return { idx, val: p.value, ht };
-        })
-        .filter((p) => p.idx >= 0)
-        .sort((a, b) => a.idx - b.idx);
-      if (pts.length === 0) return [];
-      const prev = trendNameCount.get(line.name) ?? 0;
-      trendNameCount.set(line.name, prev + 1);
-      return [
-        {
-          type: "scatter" as const,
-          x: pts.map((p) => p.idx),
-          y: pts.map((p) => p.val),
-          mode: "lines" as const,
-          line: { color: line.color, width: 2, shape: "linear" as const },
-          connectgaps: true,
-          name: line.name,
-          legendgroup: line.name,
-          showlegend: prev === 0,
-          hovertemplate: "%{text}",
-          text: pts.map((p) => p.ht),
-        },
-      ];
-    }
-    if (lineDataHasTrendState(data)) {
-      const segs = groupIndexedTrendSegments(data, dateToIndex, dayToIndex);
-      if (segs.length === 0) return [];
-      const prev = trendNameCount.get(line.name) ?? 0;
-      trendNameCount.set(line.name, prev + 1);
-      const showLegendForLine = prev === 0;
-      return segs.map((seg, si) => ({
-        type: "scatter" as const,
-        x: seg.x,
-        y: seg.y,
-        mode: "lines" as const,
-        line: {
-          color: HL_TREND_STATE_COLORS[seg.state] ?? fallbackColor,
-          width: 2,
-          shape: "linear" as const,
-        },
-        connectgaps: true,
-        name: line.name,
-        legendgroup: line.name,
-        showlegend: showLegendForLine && si === 0,
-        hovertemplate: "%{text}",
-        text: seg.text,
-      }));
-    }
-    const pts = data
-      .map((p) => ({ idx: dateToIndex.get(p.date) ?? dayToIndex.get(p.date.slice(0, 10)) ?? -1, val: p.value }))
-      .filter((p) => p.idx >= 0)
-      .sort((a, b) => a.idx - b.idx);
-    if (pts.length === 0) return [];
-    const count = (trendNameCount.get(line.name) ?? 0) + 1;
-    trendNameCount.set(line.name, count);
-    return [
-      {
-        type: "scatter" as const,
-        x: pts.map((p) => p.idx),
-        y: pts.map((p) => p.val),
-        mode: "lines" as const,
-        line: { color: fallbackColor, width: 2, shape: "linear" },
-        connectgaps: true,
-        name: line.name,
-        legendgroup: line.name,
-        showlegend: count === 1,
-      },
-    ];
-  });
-
-  type RegimeKey = keyof typeof REGIME_HISTOGRAM_COLORS;
-  const dominantRegime = (t: number, c: number, h: number): RegimeKey => {
-    if (t >= c && t >= h) return "trend";
-    if (h >= c) return "high_vol";
-    return "chop";
-  };
-
-  let regimeBarTrace: any = null;
-  if (visibility.lines && regimeHistogramLine && regimeHistogramLine.data.length > 0 && n > 0) {
-    const xs: number[] = [];
-    const ys: number[] = [];
-    const colors: string[] = [];
-    const texts: string[] = [];
-    for (const p of regimeHistogramLine.data) {
-      const idx = mapMarkerToIndex({ date: p.date, type: "high", value: 0 });
-      if (idx < 0) continue;
-      const t = p.trend;
-      const c = p.chop;
-      const h = p.high_vol;
-      const dom = dominantRegime(t, c, h);
-      xs.push(idx);
-      ys.push(Math.max(t, c, h));
-      colors.push(REGIME_HISTOGRAM_COLORS[dom]);
-      const label = dom === "trend" ? "Trend" : dom === "high_vol" ? "High vol" : "Chop";
-      texts.push(
-        `${label}<br>Trend: ${t.toFixed(3)} | Chop: ${c.toFixed(3)} | High vol: ${h.toFixed(3)}<extra></extra>`
-      );
-    }
-    if (xs.length > 0) {
-      regimeBarTrace = {
-        type: "bar",
-        x: xs,
-        y: ys,
-        xaxis: "x2",
-        yaxis: "y2",
-        marker: { color: colors, line: { width: 0 } },
-        width: 0.92,
-        name: regimeHistogramLine.name || "Režim",
-        hovertemplate: "%{text}",
-        text: texts,
-        showlegend: false,
-      };
-    }
-  }
-
-  const showRegimeHistogram = regimeBarTrace != null;
-  const pax = showRegimeHistogram ? { xaxis: "x", yaxis: "y" } : {};
-
-  const isBosZone = (name?: string) => name === "BOS" || name === "BOS (M)";
-  const isDemandSupplyZone = (name?: string) => name === "Demand" || name === "Supply";
-  const isSupportResistanceZone = (name?: string) => name === "Support" || name === "Resistance";
-
-  const zoneShapes: any[] = [];
-  const zoneAnnotations: any[] = [];
-  for (const z of zones) {
-    if (isBosZone(z.name) && !visibility.bos_levels) continue;
-    if (isDemandSupplyZone(z.name) && !visibility.demand_supply_zones) continue;
-    if (isSupportResistanceZone(z.name) && !visibility.support_resistance_zones) continue;
-    if ((z.name === "Discount" || z.name === "Mid" || z.name === "Premium") && !visibility.premium_discount_zones) continue;
-
-    const span = zoneEndpointsToBarIndices(z, ohlc, n);
-    if (!span) continue;
-    const [idxStart, idxEnd] = span;
-    const fill = z.fillcolor ?? "rgba(59, 130, 246, 0.15)";
-    const isLine = z.value_low === z.value_high;
-    const lineColor =
-      z.name === "Demand"
-        ? "#22c55e"
-        : z.name === "Supply"
-          ? "#ef4444"
-          : z.name === "Support"
-            ? "#22c55e"
-            : z.name === "Resistance"
-              ? "#ef4444"
-              : z.name === "BOS" || z.name === "BOS (M)"
-                ? z.name === "BOS (M)"
-                  ? "#fbbf24"
-                  : "#f59e0b"
-                : z.name === "Discount"
-                  ? "#22c55e"
-                  : z.name === "Premium"
-                    ? "#ef4444"
-                    : z.name === "Mid"
-                      ? "#a1a1aa"
-                      : "#3b82f6";
-
-    if (isLine) {
-      zoneShapes.push({
-        type: "line",
-        x0: idxStart - 0.5,
-        x1: idxEnd + 0.5,
-        y0: z.value_low,
-        y1: z.value_high,
-        line: { width: 2, color: lineColor, dash: "solid" },
-        layer: "below",
-      });
-    } else {
-      zoneShapes.push({
-        type: "rect",
-        x0: idxStart - 0.5,
-        x1: idxEnd + 0.5,
-        y0: z.value_low,
-        y1: z.value_high,
-        fillcolor: fill,
-        line: { width: 1, color: lineColor },
-        layer: "below",
-      });
-    }
-
-    if (z.name) {
-      let label =
-        z.name === "Demand"
-          ? "D"
-          : z.name === "Supply"
-            ? "S"
-            : z.name === "Support"
-              ? "Sup"
-              : z.name === "Resistance"
-                ? "Res"
-                : z.name === "BOS (M)"
-                  ? "BOS M"
-                  : z.name === "Discount"
-                    ? "Disc"
-                    : z.name === "Premium"
-                      ? "Prem"
-                      : z.name === "Mid"
-                        ? "Mid"
-                        : z.name;
-      const base = typeof z.base_length === "number" && z.base_length >= 0 ? z.base_length : null;
-      const im = typeof z.impulse_score === "number" && z.impulse_score > 0 ? z.impulse_score : null;
-      const ipCount = Math.max(0, (z as { inducement_count?: number }).inducement_count ?? 0);
-      const ipPoints = Math.max(0, z.inducement_points ?? 0);
-      const hasIp = (ipCount > 0 || ipPoints > 0) && (z.name === "Demand" || z.name === "Supply");
-      const touches = typeof z.touches === "number" && z.touches > 0 ? z.touches : null;
-      const adBelow = Math.max(0, (z as { active_demand_zones_below?: number }).active_demand_zones_below ?? 0);
-      if (base !== null && (z.name === "Demand" || z.name === "Supply")) label += ` B:${base}`;
-      if (im !== null && (z.name === "Demand" || z.name === "Supply")) label += ` IM:${im}`;
-      if (hasIp) label += ` IP:${ipCount},${ipPoints}`;
-      if (z.name === "Demand" && adBelow > 0) label += ` ↓${adBelow}`;
-      if (touches !== null && (z.name === "Support" || z.name === "Resistance")) label += ` (${touches})`;
-      const yCenter = isLine ? z.value_low : (z.value_low + z.value_high) / 2;
-      zoneAnnotations.push({
-        x: (idxStart + idxEnd) / 2,
-        y: yCenter,
-        text: label,
-        showarrow: false,
-        font: { size: 11, color: lineColor },
-        xanchor: "center",
-        yanchor: "middle",
-      });
-    }
-  }
-
-  const histDomain = 0.2;
-  const histGap = 0.035;
-  const mainY0 = showRegimeHistogram ? histDomain + histGap : 0;
-
-  const layout: any = {
-    height,
-    margin: { t: 50, r: 40, b: showRegimeHistogram ? 52 : 60, l: 60 },
-    paper_bgcolor: "#18181b",
-    plot_bgcolor: "#18181b",
-    font: { color: "#a1a1aa", size: 11 },
-    xaxis: {
-      type: "linear",
-      range: [-0.5, n - 0.5],
-      gridcolor: "#27272a",
-      tickvals,
-      ticktext,
-      ...(showRegimeHistogram
-        ? { domain: [0, 1], anchor: "y", showticklabels: false }
-        : { showticklabels: true }),
-      rangeslider: {
-        visible: !showRegimeHistogram,
-        thickness: 0.05,
-        bgcolor: "#27272a",
-      },
-      fixedrange: false,
-    },
-    yaxis: {
-      ...(showRegimeHistogram ? { domain: [mainY0, 1], anchor: "x" } : {}),
-      gridcolor: "#27272a",
-      tickformat: ".2f",
-      fixedrange: false,
-    },
-    ...(showRegimeHistogram
-      ? {
-          xaxis2: {
-            type: "linear",
-            range: [-0.5, n - 0.5],
-            anchor: "y2",
-            overlaying: "x",
-            matches: "x",
-            showticklabels: true,
-            tickvals,
-            ticktext,
-            showgrid: false,
-            zeroline: false,
-            fixedrange: false,
-          },
-          yaxis2: {
-            domain: [0, histDomain],
-            anchor: "x2",
-            range: [0, 1.08],
-            title: { text: "Režim", font: { size: 10, color: "#a1a1aa" } },
-            tickformat: ".0f",
-            tickvals: [0, 0.5, 1],
-            fixedrange: true,
-            showgrid: true,
-            gridcolor: "#27272a",
-            zeroline: false,
-          },
-        }
-      : {}),
-    dragmode: "zoom",
-    legend: { x: 0, y: 1.1, orientation: "h" },
-    shapes: zoneShapes,
-    annotations: zoneAnnotations,
-  };
-
-  const config: any = {
-    responsive: true,
-    displayModeBar: true,
-    displaylogo: false,
-    scrollZoom: true,
-    modeBarButtonsToRemove: ["lasso2d", "select2d"],
-  };
-
-  const traces: any[] = [{ ...candlestickTrace, ...pax }];
-  if (visibility.swing_hl && highMapped.length > 0) traces.push({ ...highTrace, ...pax });
-  if (visibility.swing_hl && lowMapped.length > 0) traces.push({ ...lowTrace, ...pax });
-  if (visibility.major_hl && majorHighTrace) traces.push({ ...majorHighTrace, ...pax });
-  if (visibility.major_hl && majorLowTrace) traces.push({ ...majorLowTrace, ...pax });
-  if (visibility.internal_hl && internalHighTrace) traces.push({ ...internalHighTrace, ...pax });
-  if (visibility.internal_hl && internalLowTrace) traces.push({ ...internalLowTrace, ...pax });
-  if (visibility.swing_hl && bosBullTrace) traces.push({ ...bosBullTrace, ...pax });
-  if (visibility.swing_hl && bosBearTrace) traces.push({ ...bosBearTrace, ...pax });
-  if (otherTrace) traces.push({ ...otherTrace, ...pax });
-  if (visibility.inducement_points) {
-    if (inducementDemandTrace) traces.push({ ...inducementDemandTrace, ...pax });
-    if (inducementSupplyTrace) traces.push({ ...inducementSupplyTrace, ...pax });
-    if (inducementOtherTrace) traces.push({ ...inducementOtherTrace, ...pax });
-  }
-  if (visibility.demand_supply_zones && zoneTouchTrace) {
-    traces.push({ ...zoneTouchTrace, ...pax });
-  }
-  if (visibility.lines) traces.push(...lineTraces.map((t) => ({ ...t, ...pax })));
-  if (showRegimeHistogram && regimeBarTrace) traces.push(regimeBarTrace);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -1951,7 +1454,10 @@ export function StrategyViewChart({
           </select>
         </div>
         <div className="flex items-center gap-1 pb-0.5">
-          <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none max-w-[13rem] leading-snug">
+          <label
+            className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none max-w-[13rem] leading-snug"
+            title="Při zvoleném modulu S/D zón z cache jen zóny (bez swingů/BOS/trend z H/L). Badge Fresh u datasetu může platit z dřívějšího H/L buildu."
+          >
             <input
               type="checkbox"
               className="rounded border-zinc-600 shrink-0"
@@ -2058,17 +1564,16 @@ export function StrategyViewChart({
             <FieldHelpPopover help={backtestFieldHelp.artifactViewDatasetStatus} />
           </span>
           <span
-            className={`text-xs px-2 py-0.5 rounded border shrink-0 ${artifactOverallBadgeClass(artifactStatus?.overall)}`}
-            title={
-              [artifactStatus?.hl?.detail, artifactStatus?.sd?.detail].filter(Boolean).join(" · ") ||
-              undefined
-            }
+            className={`text-xs px-2 py-0.5 rounded border shrink-0 ${artifactOverallBadgeClass(
+              artifactDatasetBadge.pseudoOverall ?? artifactStatus?.overall
+            )}`}
+            title={artifactDatasetBadge.title}
           >
             {artifactStatusLoading
               ? "Načítám stav…"
               : artifactBuilding
                 ? "Building…"
-                : artifactStatus?.overall_label ?? artifactStatus?.overall ?? "—"}
+                : artifactDatasetBadge.label ?? artifactStatus?.overall_label ?? artifactStatus?.overall ?? "—"}
           </span>
           {artifactStatus?.dataset_id ? (
             <code
@@ -2082,11 +1587,16 @@ export function StrategyViewChart({
             <button
               type="button"
               onClick={() => void handleBuildArtifacts()}
-              disabled={artifactBuilding || artifactStatusLoading || !dataFile}
-              title="Precompute H/L + S/D na celý data_file pro zvolené TF; ukládá se do .backtest_artifacts. Období ve View jen zobrazení."
+              disabled={
+                artifactBuilding ||
+                artifactStatusLoading ||
+                !dataFile ||
+                (!artifactBuildIncludeHl && !artifactBuildIncludeSd)
+              }
+              title={artifactBuildButtonTitle}
               className="px-3 py-1.5 rounded bg-violet-700 hover:bg-violet-600 text-xs font-medium disabled:opacity-50"
             >
-              {artifactBuilding ? "Build…" : "Build features"}
+              {artifactBuilding ? "Build…" : artifactBuildButtonLabel}
             </button>
             <FieldHelpPopover help={backtestFieldHelp.artifactViewBuildFeatures} />
           </span>
@@ -2104,8 +1614,47 @@ export function StrategyViewChart({
             </span>
           ) : null}
         </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 border-t border-zinc-800/50 pt-2 mt-0.5">
-          <span className="text-[10px] text-zinc-500 shrink-0">TF precomputu (H/L + S/D):</span>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pl-0.5 border-t border-zinc-800/50 pt-2 mt-0.5">
+          <span className="text-[10px] text-zinc-500 shrink-0">Kroky buildu (multiselect):</span>
+          <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
+              checked={artifactBuildIncludeHl}
+              disabled={artifactBuilding || artifactStatusLoading}
+              onChange={(e) => {
+                const v = e.target.checked;
+                if (!v && !artifactBuildIncludeSd) return;
+                setArtifactBuildIncludeHl(v);
+              }}
+            />
+            H/L
+          </label>
+          <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
+              checked={artifactBuildIncludeSd}
+              disabled={artifactBuilding || artifactStatusLoading}
+              onChange={(e) => {
+                const v = e.target.checked;
+                if (!v && !artifactBuildIncludeHl) return;
+                setArtifactBuildIncludeSd(v);
+              }}
+            />
+            S/D zóny
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 border-t border-zinc-800/40 pt-2 mt-0.5">
+          <span className="text-[10px] text-zinc-500 shrink-0">
+            TF precomputu
+            {!artifactBuildIncludeHl && artifactBuildIncludeSd
+              ? " (S/D)"
+              : artifactBuildIncludeHl && !artifactBuildIncludeSd
+                ? " (H/L)"
+                : " (H/L + S/D)"}
+            :
+          </span>
           <button
             type="button"
             className="text-[10px] text-violet-400 hover:text-violet-300 disabled:opacity-50"
@@ -2253,7 +1802,15 @@ export function StrategyViewChart({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-700 shrink-0">
-              <h3 className="text-lg font-semibold text-zinc-100">Hodnoty z algoritmu</h3>
+              <div className="min-w-0">
+                <h3 className="text-lg font-semibold text-zinc-100">Hodnoty z algoritmu</h3>
+                <div className="text-[11px] text-zinc-500 font-mono truncate">
+                  Zóny {valuesCounts.zones_total} (D/S {valuesCounts.zones_ds}, BOS {valuesCounts.zones_bos}) · touches{" "}
+                  {valuesCounts.touches} · IP {valuesCounts.inducement_points} · markery {valuesCounts.markers_total} (swing{" "}
+                  {valuesCounts.markers_swing}, major {valuesCounts.markers_major}, internal {valuesCounts.markers_internal}, BOS{" "}
+                  {valuesCounts.markers_bos}) · čáry {valuesCounts.lines_total} ({valuesCounts.line_points} bodů)
+                </div>
+              </div>
               <button
                 onClick={() => setValuesModalOpen(false)}
                 className="p-2 rounded-lg hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200"
@@ -2411,7 +1968,7 @@ export function StrategyViewChart({
                 {
                   key: "swing_hl" as const,
                   label: "Swing HL",
-                  hasData: highMapped.length > 0 || lowMapped.length > 0,
+                  hasData: highMarkers.length > 0 || lowMarkers.length > 0,
                 },
                 {
                   key: "internal_hl" as const,
@@ -2639,32 +2196,15 @@ export function StrategyViewChart({
           </div>
         ) : (
           <div className="relative w-full flex-1 min-h-0 flex flex-col">
-            <Plot
-              data={traces}
-              layout={layout}
-              config={config}
+            <ViewLikeChart
+              ohlc={ohlc}
+              markers={markers}
+              lines={lines}
+              zones={zones as any}
+              height={height}
+              visibility={visibility}
               revision={plotRevision}
-              style={{ width: "100%" }}
-              useResizeHandler
             />
-            {showRegimeHistogram && (
-              <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-1 pt-1 pb-0.5 text-[11px] text-zinc-400 border-t border-zinc-800/80 shrink-0">
-                <span className="text-zinc-500 mr-1">Režim (barva sloupce = dominantní stav):</span>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="inline-block w-3 h-3 rounded-sm" style={{ background: REGIME_HISTOGRAM_COLORS.trend }} />
-                  Trend (0–1 = pravděpodobnost)
-                </span>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="inline-block w-3 h-3 rounded-sm" style={{ background: REGIME_HISTOGRAM_COLORS.chop }} />
-                  Chop / konsolidace
-                </span>
-                <span className="inline-flex items-center gap-1.5">
-                  <span className="inline-block w-3 h-3 rounded-sm" style={{ background: REGIME_HISTOGRAM_COLORS.high_vol }} />
-                  High vol
-                </span>
-                <span className="text-zinc-600">Výška sloupce = max(trend, chop, high_vol)</span>
-              </div>
-            )}
             {loading && (
               <div
                 className="absolute inset-0 z-10 flex items-center justify-center rounded bg-zinc-950/75 backdrop-blur-[1px]"

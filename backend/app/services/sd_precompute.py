@@ -9,6 +9,7 @@ z předpočítaného ``{tf}_trend.parquet``.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -166,6 +167,16 @@ def _zone_row_from_module_dict(
         born_iso=born_at,
     )
 
+    tev = z.get("touch_events")
+    touch_events_json: str | None
+    if isinstance(tev, list) and tev:
+        try:
+            touch_events_json = json.dumps(tev, default=str)
+        except (TypeError, ValueError):
+            touch_events_json = "[]"
+    else:
+        touch_events_json = "[]"
+
     return {
         "zone_id": zid,
         "kind": kind,
@@ -189,6 +200,7 @@ def _zone_row_from_module_dict(
         "pivot_idx": pivot_idx,
         "start_idx": int(z.get("start_idx", pivot_idx)),
         "end_idx": end_idx,
+        "touch_events_json": touch_events_json,
     }
 
 

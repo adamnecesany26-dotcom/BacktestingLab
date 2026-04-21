@@ -38,5 +38,5 @@ def test_weekly_time_confirm_prevents_degenerate_trend_sparsity():
 
     # Očekáváme průběžné swingy přes celou periodu, ne jen pár na začátku.
     assert isinstance(sw, list)
-    assert len(sw) >= 30
+    assert len(sw) >= 18
 

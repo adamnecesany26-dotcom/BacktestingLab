@@ -38,9 +38,13 @@ Interface pro strategii/indikator:
 TREND_PARAMS – doporučené parametry pro strategie (merge do PARAMS při doladění po runu):
   trend_min_long, trend_max_short, trend_filter_enabled, trend_require_strong, ...
 
-BOS (Break of Structure): close nad nejnovějším ještě nevyčerpaným swing high (resp. pod low);
-  po BOS se pivot označí jako vyčerpaný, takže se další BOS bere z dalšího nejnovějšího nevyčerpaného.
-Následující acceptance_bars svíček nesmí uzavřít zpět pod/přes level.
+BOS (Break of Structure): close nad swing high (bull) / pod swing low (bear), které je skutečně proraženo.
+  Volitelně jen posledních ``bos_max_lookback_swings`` pivotů před barem (0 = bez limitu), volitelně jen
+  swing po posledním opačném typu (``bos_require_swing_after_opposite``). Jako úroveň BOS se bere pivot
+  podle ``bos_pivot_pick``: ``extreme`` = nejvyšší proražené high / nejnižší proražené low (často hlavní
+  struktura), ``newest`` = nejnovější index mezi proraženými. Následující ``acceptance_bars`` close nesmí
+  uzavřít zpět přes level. Sloučení kaskády stejného BOS (``bos_cascade_merge_max_bars``) je ve výchozím interním
+  nastavení vypnuto (0), aby se do View neztrácely průrazy close; na 1m–15m bylo vypnuto už dřív.
 
 Algoritmus swingu: candidate -> replacement -> confirmation (ATR) -> locked.
 """
@@ -150,12 +154,12 @@ TF_CONFIG = {
     "30m": {"atr_period": 24, "min_bars_between_swings": 6, "window_bars": 360, "max_bars": 360},
     "30m_internal": {"atr_period": 18, "min_bars_between_swings": 3, "window_bars": 360, "max_bars": 360},
     "1h": {"atr_period": 17, "min_bars_between_swings": 5, "window_bars": 360, "max_bars": 520, "time_confirm_bars": 6},
-    "4h": {"atr_period": 13, "min_bars_between_swings": 4, "window_bars": 240, "max_bars": 400, "time_confirm_bars": 5},
-    # 1D musí být strukturálně čistší (méně, ale validnější pivoty) než 4H.
+    "4h": {"atr_period": 13, "min_bars_between_swings": 6, "min_pullback_atr_ratio": 0.45, "window_bars": 240, "max_bars": 400, "time_confirm_bars": 5},
+    # 1D: o něco hustší než dřív (stále opatrněji než 4H kvůli šumu jedné svíčky).
     "1d": {
         "atr_period": 10,
-        "min_bars_between_swings": 3,
-        "min_pullback_atr_ratio": 0.18,
+        "min_bars_between_swings": 4,
+        "min_pullback_atr_ratio": 0.40,
         "window_bars": 240,
         "max_bars": 500,
         "time_confirm_bars": 4,
@@ -167,22 +171,26 @@ TF_CONFIG = {
 VIEW_PARAMS = {
     "timeframe": "1d",
     "data_timeframe": "",
-    "sensitivity": 1.0,
-    "atr_multiplier": 1.38,
+    "sensitivity": 0.93,
+    "atr_multiplier": 1.44,
     "include_internals": False,
     "acceptance_bars": 1,
     "max_bars": 180,
     "bos_include_internal_pivots": 0,
+    "bos_max_lookback_swings": 20,
+    "bos_pivot_pick": "extreme",
+    "bos_require_swing_after_opposite": 0,
 }
 
 # Internal defaults – not exposed in UI but still respected if passed by strategy/other module.
 _VIEW_PARAMS_INTERNAL = {
     "max_candidate_bars": 0,
     "allow_unconfirmed_last_swing": True,
-    "min_pullback_atr_ratio": 0.32,
-    "swing_sparsity": 1.25,
+    "min_pullback_atr_ratio": 0.58,
+    "swing_sparsity": 1.22,
+    "bos_cascade_merge_max_bars": 0,
     "bos_pivot_cluster_max_bars": 6,
-    "bos_pivot_cluster_atr_mult": 0.35,
+    "bos_pivot_cluster_atr_mult": 0.25,
     "bos_range_merge_atr_mult": 2.5,
     "bos_range_merge_max_swing_bars": 20,
     "ema_fast": 9,
@@ -595,6 +603,21 @@ def _get_swings_core(
                     return False
                 return (int(current_idx) - int(candidate_idx)) >= max(min_bars, time_confirm_bars)
 
+            def _time_confirm_requires_some_pullback(is_high: bool) -> bool:
+                """
+                Time-confirm není náhrada za pullback: povolit ho jen pokud se po pivotu objevil aspoň
+                minimální oponentní pohyb (min_pullback), jinak by se potvrzovalo i pouhé „flákání se“.
+                """
+                if is_high:
+                    if cand_high is None or cand_high_idx is None:
+                        return False
+                    # Kandidát HIGH: chceme vidět low <= cand_high - min_pullback
+                    return low[i] <= float(cand_high) - float(min_pullback)
+                if cand_low is None or cand_low_idx is None:
+                    return False
+                # Kandidát LOW: chceme vidět high >= cand_low + min_pullback
+                return high[i] >= float(cand_low) + float(min_pullback)
+
             if require_hl_alternation:
                 lf_hi = last_swing_type is None or last_swing_type == "low"
                 lf_lo = last_swing_type is None or last_swing_type == "high"
@@ -620,7 +643,8 @@ def _get_swings_core(
                     and (i - int(cand_high_idx)) >= alt_confirm_after
                 ):
                     confirmed_by_pullback = low[i] <= cand_high - threshold * alt_confirm_frac
-                confirmed = confirmed_by_pullback or _confirmed_by_time_only(i, cand_high_idx)
+                confirmed_by_time = _confirmed_by_time_only(i, cand_high_idx) and _time_confirm_requires_some_pullback(True)
+                confirmed = confirmed_by_pullback or confirmed_by_time
                 if confirmed:
                     # Dříve se vyžadovalo, aby pivot byl absolutní extrém od posledního swingu (all highs <= cand_high).
                     # To dává na HTF v trendu extrémně řídké swingy (prakticky jen makro top/bottom).
@@ -642,7 +666,8 @@ def _get_swings_core(
                     and (i - int(cand_low_idx)) >= alt_confirm_after
                 ):
                     confirmed_by_pullback = high[i] >= cand_low + threshold * alt_confirm_frac
-                confirmed = confirmed_by_pullback or _confirmed_by_time_only(i, cand_low_idx)
+                confirmed_by_time = _confirmed_by_time_only(i, cand_low_idx) and _time_confirm_requires_some_pullback(False)
+                confirmed = confirmed_by_pullback or confirmed_by_time
                 if confirmed:
                     lo_ok = True
 
@@ -1017,8 +1042,8 @@ def _apply_daily_swing_policy(params: dict, swing_core_params: dict) -> None:
     Veškeré úpravy specifické pro denní TF na jednom místě (max_bars, ATR/prahy,
     alternativní potvrzení jádra, výchozí force_extremes).
 
-    Cíl: konzervativní, konzistentní denní pivoty (čistší než 4H).
-    Denní politika nesmí vyrábět „kosmetické“ swingy (žádné forced-extremes) ani drasticky snižovat prahy.
+    Cíl: denní pivoty stabilní, ale ne extrémně řídké (mírně volněji než dřív oproti 4H).
+    Denní politika nesmí vyrábět „kosmetické“ swingy (žádné forced-extremes).
     """
     try:
         mb = int(params.get("max_bars", 0) or 0)
@@ -1028,27 +1053,18 @@ def _apply_daily_swing_policy(params: dict, swing_core_params: dict) -> None:
         params["max_bars"] = 500
     try:
         am = float(swing_core_params.get("atr_multiplier", 1.5))
-        swing_core_params["atr_multiplier"] = max(1.05, am * 0.82)
+        swing_core_params["atr_multiplier"] = max(1.05, am * 0.88)
     except (TypeError, ValueError):
         swing_core_params["atr_multiplier"] = 1.15
     try:
         mp = float(swing_core_params.get("min_pullback_atr_ratio", 0.42))
-        swing_core_params["min_pullback_atr_ratio"] = max(0.18, mp * 0.85)
+        swing_core_params["min_pullback_atr_ratio"] = max(0.18, mp * 0.90)
     except (TypeError, ValueError):
         swing_core_params["min_pullback_atr_ratio"] = 0.22
-    swing_core_params.setdefault("alt_confirm_after_bars", 3)
-    swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.4)
+    swing_core_params.setdefault("alt_confirm_after_bars", 5)
+    swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.70)
     swing_core_params.setdefault("time_confirm_bars", 4)
     swing_core_params.setdefault("force_extremes_between_same_swings", False)
-
-
-def _view_relax_swing_denominator(work_tf: str) -> int:
-    """Minimální počet swingů ∝ len/bohatost řady při view auto-relax (nižší = častější uvolnění)."""
-    return {
-        "1h": 44,
-        "4h": 36,
-        "1d": 36,
-    }.get(work_tf, 100)
 
 
 def get_swings(
@@ -1066,7 +1082,7 @@ def get_swings(
     Swing H/L: min. 5m – pri jemnejsim TF nez 5m se data nejdriv resampluji na 5m.
     params["max_bars"]: max. baru v jednom okne (pro 1d doporuceno 180 = 6M).
     params["require_hl_alternation"]: default True – striktní střídání H/L. False = hustší swingy v trendu (oba směry současně).
-        Precompute (hl_precompute) a ``detect`` / ``get_bos`` typicky předávají ``False`` — jiné výchozí chování než syrové volání strategie.
+        Pozn.: backtest/View by měly používat stejné nastavení; netlačit jiné defaulty jen pro UI.
     params["force_extremes_between_same_swings"]: default False — nedoplňovat umělé swingy mezi HH/LL.
     params["alt_confirm_after_bars"] / ``alt_confirm_threshold_fraction``: volitelně; u 1d nastaví politika slabší potvrzení po prodlevě.
 
@@ -1095,8 +1111,6 @@ def get_swings(
         data_tf = None
     params.pop("include_internals", None)
     params.pop("omit_swings_overlapping_major", None)
-    is_view_mode = vct is not None
-
     original_ohlc = ohlc
     tf = _chart_tf_for_hierarchy(original_ohlc, tf, data_tf, vct)
     base_ohlc = _ensure_min_tf(ohlc, MIN_TF_SWING, tf, data_tf)
@@ -1141,11 +1155,11 @@ def get_swings(
     else:
         swing_core_params.setdefault("force_extremes_between_same_swings", False)
         if work_tf == "1h":
-            swing_core_params.setdefault("alt_confirm_after_bars", 7)
-            swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.52)
+            swing_core_params.setdefault("alt_confirm_after_bars", 10)
+            swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.80)
         elif work_tf == "4h":
-            swing_core_params.setdefault("alt_confirm_after_bars", 4)
-            swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.36)
+            swing_core_params.setdefault("alt_confirm_after_bars", 6)
+            swing_core_params.setdefault("alt_confirm_threshold_fraction", 0.75)
 
     max_bars = int(params.get("max_bars", 0))
     atr_period = int(params.get("atr_period", 10))
@@ -1177,9 +1191,18 @@ def get_swings(
             return sws
         out = []
         orig_idx = original_ohlc.index
+        high_col = "high" if "high" in original_ohlc.columns else "High"
+        low_col = "low" if "low" in original_ohlc.columns else "Low"
         for s in sws:
             s = dict(s)
-            s["index"] = _map_swing_index_to_original(s, orig_idx)
+            idx = _map_swing_index_to_original(s, orig_idx)
+            idx = min(max(0, int(idx)), len(original_ohlc) - 1)
+            s["index"] = idx
+            s["timestamp"] = orig_idx[idx]
+            if s.get("type") == "high":
+                s["price"] = float(original_ohlc[high_col].iloc[idx])
+            else:
+                s["price"] = float(original_ohlc[low_col].iloc[idx])
             out.append(s)
         return out
 
@@ -1591,38 +1614,6 @@ def _get_last_swing_low(swings: list[dict], up_to_index: int) -> tuple[float | N
     return s["price"], s["index"]
 
 
-def _get_last_unconsumed_swing_high(
-    swings: list[dict], up_to_index: int, consumed: set[int]
-) -> tuple[float | None, int | None]:
-    """Nejnovější swing high před up_to_index, který ještě nemá uzavřený BOS (ne v consumed)."""
-    before = [
-        s for s in swings
-        if s["type"] == "high"
-        and int(s["index"]) < up_to_index
-        and int(s["index"]) not in consumed
-    ]
-    if not before:
-        return None, None
-    s = max(before, key=lambda x: int(x["index"]))
-    return float(s["price"]), int(s["index"])
-
-
-def _get_last_unconsumed_swing_low(
-    swings: list[dict], up_to_index: int, consumed: set[int]
-) -> tuple[float | None, int | None]:
-    """Nejnovější swing low před up_to_index, který ještě nemá uzavřený BOS."""
-    before = [
-        s for s in swings
-        if s["type"] == "low"
-        and int(s["index"]) < up_to_index
-        and int(s["index"]) not in consumed
-    ]
-    if not before:
-        return None, None
-    s = max(before, key=lambda x: int(x["index"]))
-    return float(s["price"]), int(s["index"])
-
-
 def _collapse_bos_pivot_clusters(
     swings: list[dict],
     ohlc: pd.DataFrame,
@@ -1644,9 +1635,9 @@ def _collapse_bos_pivot_clusters(
     except (TypeError, ValueError):
         max_gap = 6
     try:
-        atr_mult = float(p.get("bos_pivot_cluster_atr_mult", 0.35))
+        atr_mult = float(p.get("bos_pivot_cluster_atr_mult", 0.25))
     except (TypeError, ValueError):
-        atr_mult = 0.35
+        atr_mult = 0.25
     if max_gap <= 0 and atr_mult <= 0:
         return [dict(s) for s in swings]
 
@@ -1703,6 +1694,42 @@ def _collapse_bos_pivot_clusters(
     return sorted(out, key=lambda s: (int(s["index"]), 0 if s.get("type") in highs_t else 1))
 
 
+def _bos_pivot_index_window(swings: list[dict], bar_i: int, max_swings: int) -> frozenset[int] | None:
+    """Časově posledních ``max_swings`` pivotů s indexem ``< bar_i``. ``max_swings`` ≤ 0 → bez omezení (None)."""
+    if max_swings <= 0:
+        return None
+    before: list[dict] = []
+    for s in swings:
+        try:
+            si = int(s.get("index", -1))
+        except (TypeError, ValueError):
+            continue
+        if si < int(bar_i):
+            before.append(s)
+    if not before:
+        return frozenset()
+    before.sort(key=lambda s: int(s["index"]))
+    tail = before[-max_swings:]
+    return frozenset(int(s["index"]) for s in tail)
+
+
+def _bos_last_opposite_index(swings: list[dict], bar_i: int, typ: str) -> int | None:
+    """Poslední swing daného typu (``high`` / ``low``) před ``bar_i``; None pokud žádný."""
+    best: int | None = None
+    for s in swings:
+        if s.get("type") != typ:
+            continue
+        try:
+            si = int(s["index"])
+        except (TypeError, ValueError):
+            continue
+        if si >= int(bar_i):
+            continue
+        if best is None or si > best:
+            best = si
+    return best
+
+
 def _find_bos_from_swings(
     ohlc: pd.DataFrame,
     swings: list[dict],
@@ -1711,13 +1738,32 @@ def _find_bos_from_swings(
     bos_swing_kind: str = "swing",
 ) -> list[dict]:
     """
-    BOS = Break of Structure – close nad posledním swing high nebo pod posledním swing low.
-    Následující acceptance_bars svíček nesmí uzavřít zpět.
+    BOS = Break of Structure – uzavření **nad** (bull) / **pod** (bear) relevantním aktivním swingem,
+    který je tímto close skutečně proražen.
+
+    Nezkonzumované swingy, jejichž cena je u bull BOS **pod** close (resp. u bear **nad** close), tvoří
+    množinu průrazů. Volitelně se omezí na posledních ``bos_max_lookback_swings`` pivotů před barem a
+    na swingy za posledním opačným typem (``bos_require_swing_after_opposite``). Referenční pivot BOS
+    vybere ``bos_pivot_pick``: ``extreme`` (nejvyšší proražené high / nejnižší low) nebo ``newest``
+    (největší index). Současně se zkonzumují všechny proražené kandidáty v dané množině.
+
+    Následující acceptance_bars svíček nesmí uzavřít zpět přes hlášenou úroveň.
     Vrací: swing_index, swing_date, bos_index, bos_date, level, type (is_major vždy False pro kompatibilitu).
     """
     is_major = False
     params = params or {}
-    accept_bars = int(params.get("acceptance_bars", 1))
+    accept_bars = max(0, int(params.get("acceptance_bars", 1)))
+    try:
+        max_lkb = int(params.get("bos_max_lookback_swings", 20))
+    except (TypeError, ValueError):
+        max_lkb = 20
+    try:
+        require_opp = bool(int(params.get("bos_require_swing_after_opposite", 0)))
+    except (TypeError, ValueError):
+        require_opp = False
+    pick = str(params.get("bos_pivot_pick", "extreme")).strip().lower()
+    if pick not in ("extreme", "newest"):
+        pick = "extreme"
 
     close_col = ohlc["close"] if "close" in ohlc.columns else ohlc["Close"]
     index = ohlc.index
@@ -1728,9 +1774,39 @@ def _find_bos_from_swings(
 
     for i in range(1, len(ohlc) - accept_bars):
         close = float(close_col.iloc[i])
+        pivot_window = _bos_pivot_index_window(swings, i, max_lkb)
+        last_low_before = _bos_last_opposite_index(swings, i, "low") if require_opp else None
+        last_high_before = _bos_last_opposite_index(swings, i, "high") if require_opp else None
 
-        level_high, swing_idx_high = _get_last_unconsumed_swing_high(swings, i, consumed_swing_highs)
-        if level_high is not None and swing_idx_high is not None and close > level_high:
+        # Bullish: swing high pod close, v okně, volitelně až po posledním low
+        highs_broken: list[dict] = []
+        for s in swings:
+            if s.get("type") != "high":
+                continue
+            try:
+                si = int(s["index"])
+            except (TypeError, ValueError):
+                continue
+            if si >= i or si in consumed_swing_highs:
+                continue
+            try:
+                px = float(s["price"])
+            except (TypeError, ValueError):
+                continue
+            if not (px < close):
+                continue
+            if pivot_window is not None and si not in pivot_window:
+                continue
+            if require_opp and last_low_before is not None and si <= last_low_before:
+                continue
+            highs_broken.append(s)
+        if highs_broken:
+            if pick == "newest":
+                s_star = max(highs_broken, key=lambda x: int(x["index"]))
+            else:
+                s_star = max(highs_broken, key=lambda x: (float(x["price"]), int(x["index"])))
+            level_high = float(s_star["price"])
+            swing_idx_high = int(s_star["index"])
             ok = True
             for j in range(1, accept_bars + 1):
                 if i + j >= len(ohlc):
@@ -1750,10 +1826,38 @@ def _find_bos_from_swings(
                     "is_major": is_major,
                     "bos_swing_kind": bos_swing_kind,
                 })
-                consumed_swing_highs.add(swing_idx_high)
+                for s in highs_broken:
+                    consumed_swing_highs.add(int(s["index"]))
 
-        level_low, swing_idx_low = _get_last_unconsumed_swing_low(swings, i, consumed_swing_lows)
-        if level_low is not None and swing_idx_low is not None and close < level_low:
+        # Bearish: swing low nad close; průlom = close pod úrovní low
+        lows_broken: list[dict] = []
+        for s in swings:
+            if s.get("type") != "low":
+                continue
+            try:
+                si = int(s["index"])
+            except (TypeError, ValueError):
+                continue
+            if si >= i or si in consumed_swing_lows:
+                continue
+            try:
+                px = float(s["price"])
+            except (TypeError, ValueError):
+                continue
+            if not (px > close):
+                continue
+            if pivot_window is not None and si not in pivot_window:
+                continue
+            if require_opp and last_high_before is not None and si <= last_high_before:
+                continue
+            lows_broken.append(s)
+        if lows_broken:
+            if pick == "newest":
+                s_star = max(lows_broken, key=lambda x: int(x["index"]))
+            else:
+                s_star = min(lows_broken, key=lambda x: (float(x["price"]), -int(x["index"])))
+            level_low = float(s_star["price"])
+            swing_idx_low = int(s_star["index"])
             ok = True
             for j in range(1, accept_bars + 1):
                 if i + j >= len(ohlc):
@@ -1773,7 +1877,8 @@ def _find_bos_from_swings(
                     "is_major": is_major,
                     "bos_swing_kind": bos_swing_kind,
                 })
-                consumed_swing_lows.add(swing_idx_low)
+                for s in lows_broken:
+                    consumed_swing_lows.add(int(s["index"]))
 
     return sorted(results, key=lambda x: x["bos_index"])
 
@@ -1876,14 +1981,12 @@ def _merge_bos_events_in_consolidation_ranges(
 
 
 def _default_bos_cascade_merge_max_bars(chart_tf: str) -> int:
-    """Na hrubších TF sloučí sérii BOS v jedné cenové kaskádě (méně trojúhelníků vedle sebe)."""
+    """Na vybraných TF sloučí sérii BOS v jedné cenové kaskádě (méně trojúhelníků). Jinak 0 = každý průraz zvlášť."""
     c = _canonical_chart_tf(chart_tf)
     if c == "1w":
         return 6
     if c == "1M":
         return 4
-    if c == "1d":
-        return 5
     return 0
 
 
@@ -2210,6 +2313,9 @@ def _structure_score_series(
     if not swings or n <= 1:
         return [0.0] * max(0, int(n))
     lookback = max(1, int(params.get("structure_lookback_swings", 4)))
+    tf_c = _canonical_chart_tf(str(params.get("timeframe", "1d") or "1d"))
+    if tf_c in ("1m", "5m", "15m", "30m", "1h"):
+        lookback = min(lookback, 3)
     eq_ratio = float(params.get("structure_eq_ratio", 0.35) or 0.35)
 
     # Seřadit a normalizovat indexy; get_swings typicky už vrací ordered, ale nespoléhejme na to.
@@ -2360,6 +2466,8 @@ def _compute_trend_scores(ohlc: pd.DataFrame, params: dict) -> list[tuple[int, f
             float(ema_slow.iloc[i]),
         )
         sl = _score_slope(ema_med, i, slope_lookback)
+        if abs(sl) < 5.0:
+            a *= 0.7
         pos = _score_position(c, float(ema_med.iloc[i]), atr_val)
         st = float(st_series[i]) if i < len(st_series) else 0.0
         score = max(-100.0, min(100.0, a + sl + pos + st))

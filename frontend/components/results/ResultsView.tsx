@@ -24,6 +24,7 @@ import {
   filterModuleOutputToOhlcWindow,
   type DetailedViewMode,
 } from "@/lib/detailedTradesWindow";
+import { PriceContextChart } from "@/components/charts/PriceContextChart";
 import { getChartTfSelectOptions, resampleOhlcForChartChoice } from "@/lib/chartOhlcResample";
 import { getViewData } from "@/lib/api";
 import { viewDataResponseToModuleOutput } from "@/lib/viewArtifactAdapter";
@@ -172,6 +173,30 @@ export function ResultsView({
     if (!detailedWindow?.windowOhlc.length) return mergedOutput;
     return filterModuleOutputToOhlcWindow(mergedOutput, detailedWindow.windowOhlc);
   }, [mergedOutput, detailedWindow]);
+
+  const contextChartOhlc = useMemo(() => {
+    const w = detailedWindow?.windowOhlc ?? [];
+    if (!baseOhlc.length || w.length < 2) return [];
+    const loMs = Date.parse(w[0]!.date);
+    const hiMs = Date.parse(w[w.length - 1]!.date);
+    if (!Number.isFinite(loMs) || !Number.isFinite(hiMs)) return [];
+    const span = Math.max(hiMs - loMs, 24 * 3600 * 1000);
+    const lo2 = loMs - span;
+    const hi2 = hiMs + span;
+    const win = baseOhlc.filter((b) => {
+      const t = Date.parse(b.date);
+      return Number.isFinite(t) && t >= lo2 && t <= hi2;
+    });
+    return win.length ? win : baseOhlc;
+  }, [baseOhlc, detailedWindow?.windowOhlc]);
+
+  const contextTrade = useMemo(() => {
+    const v = detailedWindow?.visibleTrades ?? [];
+    if (!v.length) return null;
+    // Prefer trades that carry zoneMeta (S/D), since the user wants "zone + simulated R trade" context.
+    const withMeta = v.find((t) => t.zoneMeta != null);
+    return withMeta ?? v[0]!;
+  }, [detailedWindow?.visibleTrades]);
 
   const detailedChartOutputEffective = useMemo(() => {
     if (useArtifactLayersDetailed && artifactDetailedOut) return artifactDetailedOut;
@@ -634,6 +659,21 @@ export function ResultsView({
         <div className="px-4 py-3 border-t border-zinc-800/40">
           <StatBlocks results={viewResults} batchAggregates={batchRunCount > 1 ? batchAggregates : null} />
         </div>
+        {contextTrade && contextChartOhlc.length > 0 && (
+          <div className="px-4 pb-4">
+            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">
+                Price context (LW chart) — 2× historie · marker: entry
+              </div>
+              <PriceContextChart
+                ohlc={contextChartOhlc}
+                entryIso={String(contextTrade.entryDate ?? contextTrade.date ?? "")}
+                side={contextTrade.type === "sell" ? "short" : "long"}
+                height={300}
+              />
+            </div>
+          </div>
+        )}
       </details>
 
       <div

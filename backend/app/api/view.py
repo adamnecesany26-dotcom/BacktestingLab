@@ -416,7 +416,9 @@ def _series_as_float(df: pd.DataFrame, primary: str, fallback: str) -> pd.Series
         base = df[fallback]
     else:
         return pd.Series(0.0, index=df.index, dtype="float64")
-    return pd.to_numeric(base, errors="coerce").fillna(0.0).astype(float)
+    # Do NOT fill NaN with 0 — it breaks Y-axis autoscale (can snap to zero).
+    # Downstream JSON sanitizer converts NaN/inf -> null.
+    return pd.to_numeric(base, errors="coerce").astype(float)
 
 
 def _resolve_view_worker_timeout_seconds() -> int:
@@ -844,6 +846,8 @@ class ViewRequest(BaseModel):
     end_iso: str | None = None
     # Fáze 5: číst H/L + S/D z .backtest_artifacts (bez view_engine / přepočtu modulů)
     use_artifacts: bool = False
+    # Při zvoleném S/D modulu ve View posílá klient false — jen zóny z cache, bez swingů/BOS/trendu z H/L.
+    artifact_include_hl: bool = True
     artifact_include_sd: bool = True
     artifact_dataset_id: str | None = None
 
@@ -967,6 +971,7 @@ async def get_view_data(req: ViewRequest, request: Request):
             end_iso=req.end_iso,
             df_chart=df_chart,
             chart_tf_normalized=_normalize_chart_tf_key(req.chart_timeframe),
+            include_hl=req.artifact_include_hl,
             include_sd=req.artifact_include_sd,
             dataset_id_override=(req.artifact_dataset_id or "").strip() or None,
         )

@@ -31,7 +31,7 @@ describe("remapViewMarkersBarIndexForWindow", () => {
 
   it("passes through markers without bar_index", () => {
     const out = remapViewMarkersBarIndexForWindow(
-      [{ date: "x", type: "high", value: 1 }],
+      [{ date: "x", type: "high", value: 1 }] as any,
       5,
       10
     );

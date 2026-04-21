@@ -199,6 +199,16 @@ export interface ModuleZone {
   inducement_count?: number;
   inducement_points?: number;
   has_touch?: boolean;
+  /** BOS / major zóny = true; swing_fallback bez BOS kontextu = false (strategie nemusí brát jako vstup). */
+  tradable?: boolean;
+  /** Počet záznamů v touch_events (návštěvy + invalidace / retest). */
+  touches?: number;
+  touch_events?: {
+    bar_index: number;
+    touch_date: string;
+    price: number;
+    after_departure: boolean;
+  }[];
   touch_bar_index?: number;
   touch_marker_price?: number;
   touch_date?: string;
