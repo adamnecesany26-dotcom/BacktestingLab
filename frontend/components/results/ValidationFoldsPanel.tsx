@@ -246,6 +246,10 @@ export interface ValidationFoldsPanelProps {
   foldsMissingPayload: boolean;
   foldsMissingUnknown: boolean;
   manifestFoldCount: number | null;
+  /** `oos_split` vs `walk_forward` — mění nadpisy a krátký popis metodiky ve UI */
+  validationMode?: string;
+  /** When true, hide the horizontal „test P/L per fold“ strip (e.g. walk-forward dashboard has its own). */
+  hideFoldOverviewBars?: boolean;
 }
 
 export function ValidationFoldsPanel({
@@ -254,18 +258,30 @@ export function ValidationFoldsPanel({
   foldsMissingPayload,
   foldsMissingUnknown,
   manifestFoldCount,
+  validationMode = "walk_forward",
+  hideFoldOverviewBars = false,
 }: ValidationFoldsPanelProps) {
   const [openId, setOpenId] = useState<string | null>(() => {
     const first = folds[0];
     return first ? String(first.id ?? "") || null : null;
   });
 
+  const isOos = validationMode === "oos_split";
+  const modeLabel = isOos ? "OOS split" : "Walk-forward";
+
   return (
     <div className="rounded-xl border border-zinc-700/50 bg-gradient-to-br from-zinc-900/50 via-zinc-900/30 to-zinc-950/50 p-4 shadow-lg shadow-black/20">
       <div className="flex flex-wrap items-end justify-between gap-2 mb-4">
         <div>
-          <div className="text-[11px] uppercase tracking-wider text-zinc-500">Walk-forward / OOS</div>
-          <h3 className="text-base font-semibold text-zinc-100">Foldy a výkon mimo vzorek</h3>
+          <div className="text-[11px] uppercase tracking-wider text-zinc-500">{modeLabel}</div>
+          <h3 className="text-base font-semibold text-zinc-100">
+            {isOos ? "Foldy — statické řezy in-sample vs. out-of-sample" : "Foldy — posuvná okna (IS → OOS)"}
+          </h3>
+          <p className="text-[11px] text-zinc-500 mt-1 max-w-3xl leading-relaxed">
+            {isOos
+              ? "Každý fold dělí data na train a test bez posunu v čase napříč celým datasetem dle enginu. Sleduj zejména test P/L a konzistenci přes foldy."
+              : "Každý fold rozšiřuje nebo posouvá train okno a má vlastní následné test (OOS) okno. Dobrá strategie drží rozumný výkon na sérii OOS segmentů, ne jen na jednom řezu."}
+          </p>
         </div>
         <div className="text-[11px] text-zinc-500">
           {folds.length} fold{folds.length === 1 ? "" : "ů"} · klíčové metriky z <span className="text-zinc-400">test</span> okna
@@ -303,7 +319,7 @@ export function ValidationFoldsPanel({
         </div>
       )}
 
-      {folds.length > 0 ? <FoldOverviewBars folds={folds} /> : null}
+      {folds.length > 0 && !hideFoldOverviewBars ? <FoldOverviewBars folds={folds} /> : null}
 
       <div className="space-y-3">
         {folds.map((f) => {

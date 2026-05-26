@@ -3,6 +3,23 @@
  * IDs match backend /api/view `chart_timeframe` (1Mo = 1 calendar month).
  */
 
+/** View / graf: minutové TF, u kterých dává smysl zobrazit kratší okna než 1 měsíc. */
+export function isFineChartCandleTf(chartTfId: string): boolean {
+  const t = (chartTfId || "").trim();
+  if (!t || t === "native") return false;
+  return t === "1m" || t === "5m" || t === "15m";
+}
+
+/** Strategy View / Graf detail: zvolený TF nebo nativní soubor = 1m / 5m / 15m (`native` / `source` = instrument TF). */
+export function isFineOrNativeMinuteTf(chartTfId: string, nativeInstrumentTf: string | undefined | null): boolean {
+  const id = (chartTfId || "").trim();
+  if (id === "native" || id === "source") {
+    const m = instrumentTimeframeToMinutes(nativeInstrumentTf);
+    return m === 1 || m === 5 || m === 15;
+  }
+  return isFineChartCandleTf(id);
+}
+
 export const VIEW_CHART_TF_LADDER: { id: string; label: string; minutes: number }[] = [
   { id: "1m", label: "1m", minutes: 1 },
   { id: "5m", label: "5m", minutes: 5 },

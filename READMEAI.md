@@ -129,7 +129,8 @@ Backtesting_app/
 │   ├── components/
 │   │   ├── Sidebar.tsx           # Left panel: type selector, items, files
 │   │   ├── MainView.tsx          # List of strategies/indicators/modules
-│   │   ├── BacktestSettings.tsx  # Right panel: collapsible Basic/Instrument config/Simulation/Indicators&Modules/Parameters/Run; Edge finding presets (Safe/Balanced/Explore/Prop conservative); stress multiplier input in Execution Model
+│   │   ├── BacktestSettings.tsx  # Right panel: Basic/Instrument/Simulation/Indicators&Modules/Parameters/Run; Edge finding (no MC/regime/portfolio/batch from client)
+│   │   ├── monteCarlo/MonteCarloWorkspace.tsx  # Main-tab Monte Carlo on saved runs
 │   │   ├── editor/StrategyEditor.tsx
 │   │   ├── results/ResultsView (trust banner from propRedFlags), StatBlocks (DD Duration, Recovery, Top 5 PnL %, Payoff Ratio, Kelly %), TradeHighlight, RunHistory, AnalyticsView (DD analysis, PnL distribution, Bootstrap CI cards, Edge decomposition, Multiple testing strip, regime PnL/PF table, portfolio honest labeling, Sharpe freq strip, **prop red flags section**, **"Not a broker" disclaimer**), SdZoneAnalytics, ParamTestAnalytics (+ holdout display), QualityGateBanner
 │   │   ├── charts/ModuleOutputChart (Detailed + výsledky), EquityChart, DetailedChart, ...
@@ -238,7 +239,8 @@ Backtesting_app/
 
 ### 5.1 POST /api/run
 
-**Request (RunRequest):**
+**Request (RunRequest)** — full shape below. **Desktop UI** sends one strategy + one instrument and omits `monte_carlo`, `regime_config`, `portfolio_config`, and `batch_config` (Monte Carlo analyses use the **Monte Carlo** tab on saved runs).
+
 ```json
 {
   "files": { "main.py": "...", "indicators/EMA.py": "...", "modules/Swing_HL.py": "..." },
@@ -286,9 +288,11 @@ Backtesting_app/
 
 **`validation_mode`:** `single` \| `oos_split` \| `walk_forward` \| **`param_test`**. For `param_test`, put budget and per-parameter ranges under `validation_config.param_test` (see `BacktestSettings` / `engine._run_param_test`); response includes `validation.paramTest` and UI shows `ParamTestAnalytics`. **Train-only mode:** set `validation_config.param_test.train_only: true` to run OAT sweep only on the training portion of data; the best parameter is then evaluated on the holdout set. Response includes `validation.paramTest.holdout` with holdout metrics. UI shows holdout results in `ParamTestAnalytics`.
 
-**`experiment.seed`:** optional integer; `runner.py` passes it as env `RUN_SEED` so `engine.py` can `random.seed(...)` for Monte Carlo, sweep sampling, and block-bootstrap starts. UI toggle *Fixní run seed* sets this; if omitted, runner generates a random seed. Batch sub-runs inherit the same parent seed (each subprocess still deterministic for that seed).
+**`experiment.seed`:** optional integer; `runner.py` passes it as env `RUN_SEED` so `engine.py` can `random.seed(...)` for sweep sampling and block-bootstrap / server-side Monte Carlo if those are enabled in the request. UI toggle *Fixní run seed* sets this; if omitted, runner generates a random seed. When `batch_config` is used (API/scripts), sub-runs inherit the same parent seed.
 
-**`batch_config`:** when present with non-empty `items`, `run.py` runs sequential or parallel `run_strategy` calls (`BATCH_PARALLEL_WORKERS`, default 1). Each call uses subprocess **or** in-process engine per `RUN_INPROCESS_ENGINE`. With in-process, a **global lock** serializes engine runs — parallel batch workers do not speed up wall time (see architecture plan Phase 6). `_merge_batch_sub_request` merges each item into a copy of the base request, clears nested `batch_config` on sub-requests. Final streamed/non-stream response includes **`batchSummary`** (`batchId`, `runCount`, `runs[]`, `multipleTestingWarning`). Do not combine with `portfolio_config` in UI (client warns).
+**Optional fields (scripts / legacy clients):** `monte_carlo`, `regime_config`, `portfolio_config`, `batch_config` remain valid on **`POST /api/run`**. The **desktop app** (`page.tsx`) does not send them; users run trade-sequence / prop-firm Monte Carlo in the **Monte Carlo** main tab after saving a run.
+
+**`batch_config`:** when present with non-empty `items`, `run.py` runs sequential or parallel `run_strategy` calls (`BATCH_PARALLEL_WORKERS`, default 1). Each call uses subprocess **or** in-process engine per `RUN_INPROCESS_ENGINE`. With in-process, a **global lock** serializes engine runs — parallel batch workers do not speed up wall time (see architecture plan Phase 6). `_merge_batch_sub_request` merges each item into a copy of the base request, clears nested `batch_config` on sub-requests. Final streamed/non-stream response includes **`batchSummary`** (`batchId`, `runCount`, `runs[]`, `multipleTestingWarning`). Do not combine with `portfolio_config` in one request (legacy rule).
 
 **Runner env (subset):** `HOST_DATASET_FINGERPRINT` (dataset cache key for `sd_zone_strategy` disk cache), `SD_ZONE_DISK_CACHE`, `RUN_INPROCESS_ENGINE`, optional `INPROCESS_ENGINE_DIGESTS` (whitelist of `CODE_DIGEST` hex values). Manifest after normalize may include `runnerHostPrepareMs`, `runnerEngineWallMs`, `engineExecutionMode` = `inprocess`.
 
@@ -400,7 +404,7 @@ Intraday futures live under `data/futures_30m/*.txt` (one row per bar: `MM/DD/YY
 - **Trade PnL distribution (`tradePnlDistribution`):** histogram of closed PnL, percentiles (p5–p95), skewness, kurtosis, `tailRiskCVaR` (conditional value-at-risk at 5th percentile), `concentration.top5PnlPct` = share of total profit from top 5 trades. High concentration = profit depends on few outlier trades.
 - **Bootstrap CI (`bootstrapCI`):** 95 % confidence intervals for mean PnL, total return, and trade-level Sharpe via **trade-level resampling** (1 000 bootstraps). `adjustedAlpha` = 0.05 / `trialCount` (naive Bonferroni for multiple testing). Assumes IID trades; serial correlation weakens coverage.
 - **Payoff decomposition (`payoffDecomposition`):** edge = WR × AvgWin − LR × AvgLoss; `payoffRatio` = avg win / avg loss; `kellyFraction` = Kelly criterion for optimal bet size (assumes known probabilities and independent bets — in practice use half-Kelly or less).
-- **Trial count / multiple testing (`overfittingSignals`):** `trialCount` K = sweep_samples × batch_runs × folds (≥ 1). Naive Bonferroni adjusted α = 0.05 / K. Conservative upper bound; correlated trials (similar params) have weaker true correction. UI displays awareness strip.
+- **Trial count / multiple testing (`overfittingSignals`):** `trialCount` K = sweep_samples × batch_runs × folds (batch_runs = 1 without `batch_config`; ≥ 1). Naive Bonferroni adjusted α = 0.05 / K. Conservative upper bound; correlated trials (similar params) have weaker true correction. UI displays awareness strip.
 - **Stress multiplier (`execution_model.stress_multiplier`):** multiplies slippage/spread penalty; default 1.0; values > 1 simulate worse fill conditions (e.g. 1.5 = 50 % surcharge on friction).
 - **Portfolio model (`portfolio.model`):** response includes model name (e.g. `independent_isolated_capital_per_instrument`) and `disclaimer`; UI shows honest labeling banner explaining that portfolio metrics are weighted averages, not a single multi-asset equity path.
 - **Prop red flags (`propRedFlags`):** engine function `_compute_prop_red_flags` automatically scans results for patterns suspicious from a prop-firm evaluation perspective. Returns `trustLevel` (not_trustworthy / low_trust / cautious / acceptable) and `flags[]` with `severity` (critical / warning). Checked patterns: high Sharpe + few trades, trade count < 10 (critical) / < 30 (warning), no losses / win rate > 95 %, undefined PF, single run without validation, execution disabled, single + no execution, suspiciously low DD, too-smooth equity (> 92 % bars rising), bootstrap CI spanning zero, concentrated PnL (top 5 > 80 %). UI: trust banner below export buttons in ResultsView + color-coded flags section in AnalyticsView.
@@ -492,16 +496,16 @@ Strategy passes `params.module_params["Swing HL"]` to module functions.
 5. Record equity per bar, trades via notify_trade/notify_order
 6. `_compute_drawdown_analysis(equity_curve)`: compute detailed drawdown metrics — max/avg duration (bars + days), time to recovery, underwater %, periods count → populates `drawdownAnalysis` in response and DD metrics in `metrics`
 7. `_compute_trade_pnl_distribution(trades)`: histogram, percentiles (p5–p95), skewness, kurtosis, tail risk CVaR, top-5 PnL concentration → populates `tradePnlDistribution` in response
-8. `_compute_bootstrap_ci(trades)`: bootstrap 95% confidence intervals for mean PnL, total return, and trade-level Sharpe ratio. Uses **trade-level resampling** with 1 000 bootstrap iterations. Returns `bootstrapCI` dict with `lo`/`hi`/`alpha` per metric, plus `adjustedAlpha` = 0.05 / `trialCount` (naive Bonferroni). `trialCount` is read from manifest (sweep × batch × folds).
+8. `_compute_bootstrap_ci(trades)`: bootstrap 95% confidence intervals for mean PnL, total return, and trade-level Sharpe ratio. Uses **trade-level resampling** with 1 000 bootstrap iterations. Returns `bootstrapCI` dict with `lo`/`hi`/`alpha` per metric, plus `adjustedAlpha` = 0.05 / `trialCount` (naive Bonferroni). `trialCount` is read from manifest (sweep samples × batch item count when `batch_config` exists × folds).
 9. `_compute_payoff_decomposition(trades, metrics)`: decomposes edge into win rate, loss rate, avg win, avg loss, payoff ratio (avg win / avg loss), edge per trade (WR×AvgWin − LR×AvgLoss), and Kelly fraction. Also writes `payoffRatio`, `edgePerTrade`, `kellyFraction` into `metrics` dict. Returns top-level `payoffDecomposition` in response.
-10. **Trial count** (`manifest.trialCount`): calculated as sweep_samples × batch_runs × folds (clamped to ≥ 1). Propagated to `overfittingSignals.trialCount` and `bootstrapCI.trialCount` in response. `overfittingSignals.bonferroniAlpha` = 0.05 / K.
+10. **Trial count** (`manifest.trialCount`): calculated as sweep_samples × batch_runs × folds (clamped to ≥ 1; without `batch_config`, batch_runs = 1). Propagated to `overfittingSignals.trialCount` and `bootstrapCI.trialCount` in response. `overfittingSignals.bonferroniAlpha` = 0.05 / K.
 11. **Param test train-only mode** (`validation_config.param_test.train_only`): when `true`, `_run_param_test` performs OAT sweep **only on the training portion** of data (split by `oos_ratio` or default 0.25). The best parameter from the sweep is then evaluated on the **holdout** portion. Response includes `validation.paramTest.holdout` with holdout metrics.
 12. If `execution_model.stress_multiplier` > 1: slippage/spread penalty is multiplied by that factor
 13. `_compute_prop_red_flags(metrics, trades, equity, manifest, bootstrapCI, tradePnlDistribution)`: scans results for prop-firm red flags. Returns `propRedFlags` dict with `trustLevel` (not_trustworthy / low_trust / cautious / acceptable), `flags[]` (each with `key`, `severity` = critical/warning, `label`, `detail`), `criticalCount`, `warningCount`, `tip`. Checked patterns: extremely high Sharpe with few trades, trade count < 10 (critical) / < 30 (warning), no losing trades / win rate > 95 %, undefined PF (sentinel), single run without validation, execution model disabled, single + no execution = minimum credibility, suspiciously low DD, too-smooth equity curve (> 92 % bars rising), bootstrap CI spanning zero, concentrated PnL (top 5 > 80 %). `trustLevel` is derived from flag counts: any critical → not_trustworthy or low_trust; warnings only → cautious; zero flags → acceptable.
 14. Print JSON to stdout, PROGRESS:100 to stderr
 
 **Performance layer (2026-03):**
-- `run_backtest(lightweight=True)`: sub-runs (param test, sweep, WF folds, portfolio) skip heavy post-processing (bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition, OHLC export, equity curve with dates). Returns only core ranking metrics.
+- `run_backtest(lightweight=True)`: sub-runs (param test, sweep, WF folds, and portfolio arms when `portfolio_config` is used) skip heavy post-processing (bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition, OHLC export, equity curve with dates). Returns only core ranking metrics.
 - `_RESULT_CACHE`: in-memory dict (max 256 entries) keyed by `(CODE_DIGEST, strategy_params, data_fingerprint, n_bars, lightweight)`. Checked before Cerebro setup; populated after successful run.
 - `_load_file` uses fast fingerprint (`mtime_ns + size` SHA-256, 24 chars) for `datasetFingerprint` instead of full file SHA-256.
 - OHLC export: vectorized pandas `.tolist()` + server-side bar cap (`MAX_OHLC_EXPORT_BARS`, default 8000 bars, uniform downsampling).
@@ -526,6 +530,7 @@ Used in `createItem` when creating new strategy/indicator/module.
 | Add new API endpoint | `backend/app/main.py`, new file in `api/` |
 | Change Run request/response | `shared/types/index.ts`, `backend/app/models/run.py` |
 | Change View logic | `backend/app/api/view.py` |
+| Massive Forex (Real time tab), rate limit, env `MASSIVE_API_KEY` | `backend/app/api/massive_forex.py`, `backend/app/services/massive_client.py`, `backend/app/services/massive_rate_limit.py`, inline OHLC v `backend/docker/view_engine.py`, `frontend/components/RealTimeForexView.tsx` |
 | Change auth/rate limiting | `backend/app/security.py`, `backend/app/main.py` |
 | Change audit events | `backend/app/services/audit.py`, `backend/app/api/run.py`, `backend/app/api/view.py` |
 | Change module output format | `backend/app/services/runner.py` `_run_module_outputs`, `view.py` |

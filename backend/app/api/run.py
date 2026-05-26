@@ -75,10 +75,6 @@ def _streaming_kwargs(
         "instrument_type": r.instrument_type,
         "tick_size": r.tick_size,
         "value_per_tick": r.value_per_tick,
-        "share_size": r.share_size,
-        "lot_size": r.lot_size,
-        "pip_size": r.pip_size,
-        "pip_value": r.pip_value,
         "strategy_params": r.params,
         "applied_modules": r.applied_modules,
         "run_id": run_id,
@@ -96,6 +92,7 @@ def _streaming_kwargs(
         "is_client_connected": is_client_connected,
         "run_timeout_sec": r.run_timeout_sec,
         "stream_idle_timeout_sec": r.stream_idle_timeout_sec,
+        "prop_firm_backtest": r.prop_firm_backtest,
         "disallow_inprocess_engine": disallow_inprocess_engine,
         "sse_stream": sse_stream,
     }

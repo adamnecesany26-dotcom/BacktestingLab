@@ -468,22 +468,18 @@ async def _run_view_code_in_subprocess(
         req_path = run_dir / "request.json"
         main_abs = str((run_dir / "main.py").resolve())
         deps_abs = str(modules_dir.resolve())
-        req_path.write_text(
-            json.dumps(
-                {
-                    "data_file": data_file,
-                    "years": years,
-                    "params": params or {},
-                    "chart_timeframe": chart_timeframe,
-                    "start_iso": start_iso,
-                    "end_iso": end_iso,
-                    "main_path": main_abs,
-                    "deps_dir": deps_abs,
-                    "actor_id": actor_id,
-                }
-            ),
-            encoding="utf-8",
-        )
+        req_body: dict[str, Any] = {
+            "data_file": data_file,
+            "years": years,
+            "params": params or {},
+            "chart_timeframe": chart_timeframe,
+            "start_iso": start_iso,
+            "end_iso": end_iso,
+            "main_path": main_abs,
+            "deps_dir": deps_abs,
+            "actor_id": actor_id,
+        }
+        req_path.write_text(json.dumps(req_body), encoding="utf-8")
 
         data_path_abs = str(data_dir.resolve())
         req_path_abs = str(req_path.resolve())

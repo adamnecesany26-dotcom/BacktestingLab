@@ -354,6 +354,12 @@ def zone_dict_from_artifact_row(zoh: pd.DataFrame, row: Any) -> dict[str, Any] |
             zd["touch_marker_price"] = float(row.get("touch1_price"))
         except (TypeError, ValueError):
             pass
+    raw_te = row.get("touch_events_json")
+    if raw_te is not None and str(raw_te).strip():
+        zd["touch_events_json"] = raw_te
+    zid = row.get("zone_id")
+    if zid is not None and str(zid).strip():
+        zd["zone_id"] = str(zid).strip()
     if row.get("with_trend") is True:
         zd["_artifact_with_trend"] = True
     return zd

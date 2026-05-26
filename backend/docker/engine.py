@@ -32,6 +32,7 @@ print(
     flush=True,
 )
 import backtrader as bt
+import numpy as np
 import pandas as pd
 print("[engine] Libraries loaded.", file=sys.stderr, flush=True)
 
@@ -1122,6 +1123,7 @@ def _is_strategy_numeric_scalar(v: object) -> bool:
 
 _PARAM_TEST_METRIC_KEYS = (
     "finalEquity",
+    "totalReturn",
     "totalReturnUsd",
     "sharpeRatio",
     "sortinoRatio",
@@ -1167,6 +1169,7 @@ def _param_test_best_in_series(series: list[dict], metric: str, *, maximize: boo
 
 
 _PARAM_TEST_MAX_METRICS = (
+    "totalReturn",
     "totalReturnUsd",
     "sharpeRatio",
     "sortinoRatio",
@@ -1176,6 +1179,50 @@ _PARAM_TEST_MAX_METRICS = (
     "tradeCount",
 )
 _PARAM_TEST_MIN_METRICS = ("maxDrawdownPct",)
+
+_MAX_OAT_STEP_POINTS = 500
+
+
+def _param_range_step(rcfg: object) -> float | None:
+    if not isinstance(rcfg, dict):
+        return None
+    raw = rcfg.get("step")
+    if raw is None:
+        return None
+    try:
+        s = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return s if s > 0 and math.isfinite(s) else None
+
+
+def _oat_step_values(lo: float, hi: float, step: float, *, is_int: bool) -> list:
+    """Inclusive grid from lo to hi. Caps length at _MAX_OAT_STEP_POINTS."""
+    if step <= 0 or not math.isfinite(step) or not math.isfinite(lo) or not math.isfinite(hi):
+        return []
+    if hi < lo:
+        lo, hi = hi, lo
+    span = hi - lo
+    if span < 0:
+        return []
+    nmax = int(math.floor(span / step + 1e-12)) + 1
+    nmax = max(1, min(nmax, _MAX_OAT_STEP_POINTS))
+    out: list = []
+    seen: set[int] = set()
+    for i in range(nmax):
+        raw = lo + i * step
+        if raw > hi + 1e-9 * max(1.0, abs(hi)):
+            break
+        if is_int:
+            iv = int(round(raw))
+            if iv in seen:
+                continue
+            seen.add(iv)
+            out.append(iv)
+        else:
+            out.append(round(float(raw), 10))
+    return out
+
 
 _PARAM_TEST_METHODOLOGY = {
     "optimizesParametersOnTrainSegment": False,
@@ -1272,6 +1319,46 @@ def _run_param_test(
     if n_params * samples > max_runs:
         samples = max(1, max_runs // n_params)
 
+    def _interp_series_values(lo: float, hi: float, is_int: bool) -> list:
+        vals = []
+        for j in range(samples):
+            if samples <= 1:
+                alpha = 0.5
+            else:
+                alpha = j / (samples - 1)
+            v = lo + (hi - lo) * alpha
+            if is_int:
+                v = int(round(v))
+            else:
+                v = float(v)
+            vals.append(v)
+        return vals
+
+    run_jobs: list[tuple[str, list]] = []
+    for key, lo, hi, orig in enabled:
+        rcfg = raw_ranges.get(key) if isinstance(raw_ranges.get(key), dict) else {}
+        is_int = type(orig) is int
+        st = _param_range_step(rcfg)
+        if st is not None:
+            grid = _oat_step_values(lo, hi, st, is_int=is_int)
+            if not grid:
+                continue
+            run_jobs.append((key, grid))
+        else:
+            run_jobs.append((key, _interp_series_values(lo, hi, is_int)))
+
+    if not run_jobs:
+        bad = dict(empty)
+        bad["guardrails"] = {
+            "possibleLeakageHints": [
+                "Param test: pro zadaný krok (step) nešlo sestavit žádnou platnou hodnotu — zkontroluj min, max a step.",
+            ],
+            "flags": {},
+        }
+        return bad
+
+    samples_per_out = max(len(vs) for _, vs in run_jobs)
+
     data_explore = data
     data_holdout = None
     actually_split = False
@@ -1283,23 +1370,13 @@ def _run_param_test(
             data_holdout = data.iloc[split_idx:].copy()
             actually_split = True
 
-    total_steps = n_params * samples
+    total_steps = sum(len(vs) for _, vs in run_jobs)
     step_i = 0
     runs_out: list[dict] = []
-    by_series: dict[str, list[dict]] = {t[0]: [] for t in enabled}
+    by_series: dict[str, list[dict]] = {k: [] for k, _ in run_jobs}
 
-    for key, lo, hi, orig in enabled:
-        is_int_param = type(orig) is int
-        for j in range(samples):
-            if samples <= 1:
-                alpha = 0.5
-            else:
-                alpha = j / (samples - 1)
-            v = lo + (hi - lo) * alpha
-            if is_int_param:
-                v = int(round(v))
-            else:
-                v = float(v)
+    for key, values in run_jobs:
+        for v in values:
             merged = dict(base)
             merged[key] = v
             if module_blob is not None:
@@ -1393,7 +1470,7 @@ def _run_param_test(
             "avgDegradation": 0.0,
             "medianDegradation": 0.0,
             "paramTestTotalRuns": total_steps,
-            "paramKeysTested": [t[0] for t in enabled],
+            "paramKeysTested": [t[0] for t in run_jobs],
         },
         "guardrails": {
             "possibleLeakageHints": hints,
@@ -1402,7 +1479,7 @@ def _run_param_test(
         "methodology": methodology,
         "paramTest": {
             "maxRunsBudget": max_runs,
-            "samplesPerParam": samples,
+            "samplesPerParam": samples_per_out,
             "trainOnly": actually_split,
             "trainBars": len(data_explore) if actually_split else len(data),
             "holdoutBars": len(data_holdout) if data_holdout is not None else 0,
@@ -1472,6 +1549,51 @@ def _build_param_candidates(
     return candidates
 
 
+def _sweep_hist_bucket_counts(vals: list[float], nbin: int = 18) -> dict:
+    """Histogram of all sweep scores or PnL for Results UI (full sample, not ranking export)."""
+    if not vals:
+        return {"low": 0.0, "high": 1.0, "nbin": nbin, "counts": [0] * nbin}
+    lo, hi = min(vals), max(vals)
+    if hi <= lo:
+        out = [0] * nbin
+        out[min(nbin - 1, nbin // 2)] = len(vals)
+        return {"low": float(lo), "high": float(hi), "nbin": nbin, "counts": out}
+    counts = [0] * nbin
+    denom = hi - lo
+    for v in vals:
+        fv = float(v)
+        t = (fv - lo) / denom
+        idx = int(t * nbin)
+        if idx >= nbin:
+            idx = nbin - 1
+        if idx < 0:
+            idx = 0
+        counts[idx] += 1
+    return {"low": float(lo), "high": float(hi), "nbin": nbin, "counts": counts}
+
+
+def _sweep_param_sensitivity(rows_all: list[dict], param_keys: list[str], max_keys: int = 8) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {}
+    for k in param_keys[:max_keys]:
+        buckets: dict[float, list[float]] = {}
+        for r in rows_all:
+            p = r.get("params", {})
+            if not isinstance(p, dict) or k not in p:
+                continue
+            v = p.get(k)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            fv = float(v)
+            buckets.setdefault(fv, []).append(float(r.get("score", 0.0) or 0.0))
+        pts = [
+            {"value": float(bk), "meanScore": float(sum(sv) / len(sv)), "n": int(len(sv))}
+            for bk, sv in sorted(buckets.items(), key=lambda x: x[0])
+        ]
+        if pts:
+            out[str(k)] = pts
+    return out
+
+
 def _run_sweep_robustness(
     strategy_cls,
     data: pd.DataFrame,
@@ -1483,7 +1605,14 @@ def _run_sweep_robustness(
 ) -> dict:
     candidates = _build_param_candidates(dict(base_params or {}), sweep_mode, sweep_cfg)
     if not candidates:
-        return {"mode": sweep_mode, "tested": 0, "results": [], "stabilityScore": 0.0}
+        return {
+            "mode": sweep_mode,
+            "candidatesAttempted": 0,
+            "sweepFailures": 0,
+            "tested": 0,
+            "results": [],
+            "stabilityScore": 0.0,
+        }
     sweep_cfg = sweep_cfg or {}
     holdout_ratio = float(sweep_cfg.get("holdout_ratio", 0.2) or 0.0)
     holdout_ratio = min(max(holdout_ratio, 0.0), 0.45)
@@ -1568,6 +1697,55 @@ def _run_sweep_robustness(
             return 0.0
         idx = int((len(values) - 1) * p)
         return float(values[idx])
+
+    pnls: list[float] = []
+    param_keys_sorted: list[str] = []
+    if rows:
+        for r in rows:
+            m = r.get("metrics", {})
+            if isinstance(m, dict):
+                pnls.append(float(m.get("totalReturnUsd", 0.0) or 0.0))
+            else:
+                pnls.append(0.0)
+        fp0 = rows[0].get("params", {})
+        if isinstance(fp0, dict):
+            for k, v in fp0.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    param_keys_sorted.append(str(k))
+
+    k_dec = max(1, int(math.ceil(len(score_values_sorted) * 0.1))) if score_values_sorted else 0
+    top_decile_mean_score = (
+        float(sum(score_values_sorted[-k_dec:]) / k_dec) if score_values_sorted and k_dec else 0.0
+    )
+    pnls_sorted = sorted(pnls) if pnls else []
+    k_dec_pnl = max(1, int(math.ceil(len(pnls_sorted) * 0.1))) if pnls_sorted else 0
+    top_decile_mean_pnl = (
+        float(sum(pnls_sorted[-k_dec_pnl:]) / k_dec_pnl) if pnls_sorted and k_dec_pnl else 0.0
+    )
+    profitable_n = sum(1 for p in pnls if p > 0.0)
+    sweep_histograms = {
+        "score": _sweep_hist_bucket_counts(score_values, 18),
+        "totalReturnUsd": _sweep_hist_bucket_counts(pnls, 18),
+    }
+    param_sensitivity = _sweep_param_sensitivity(rows, param_keys_sorted, 8)
+    outlier_thr = float(pctile(score_values_sorted, 0.99)) if len(score_values_sorted) >= 10 else None
+    pnl_percentiles = None
+    if pnls_sorted:
+        pnl_percentiles = {
+            "p10": float(round(pctile(pnls_sorted, 0.10), 4)),
+            "p50": float(round(pctile(pnls_sorted, 0.50), 4)),
+            "p90": float(round(pctile(pnls_sorted, 0.90), 4)),
+        }
+    sweep_summary_extra = {
+        "medianTotalReturnUsd": float(round(pctile(pnls_sorted, 0.5), 4)) if pnls_sorted else 0.0,
+        "topDecileMeanTotalReturnUsd": float(round(top_decile_mean_pnl, 4)),
+        "topDecileMeanScore": float(round(top_decile_mean_score, 6)),
+        "profitableFraction": float(round(profitable_n / len(pnls), 6)) if pnls else 0.0,
+        "bestTotalReturnUsd": float(round(max(pnls), 4)) if pnls else 0.0,
+        "bestScore": float(rows[0]["score"]) if rows else 0.0,
+        "outlierScoreThreshold": round(outlier_thr, 6) if outlier_thr is not None else None,
+        "pnlPercentiles": pnl_percentiles,
+    }
 
     heatmap = None
     if rows:
@@ -1701,6 +1879,8 @@ def _run_sweep_robustness(
 
     return {
         "mode": sweep_mode,
+        "candidatesAttempted": len(candidates),
+        "sweepFailures": max(0, len(candidates) - len(rows)),
         "tested": len(rows),
         "results": top,
         "stabilityScore": float(round(stability, 6)),
@@ -1720,6 +1900,9 @@ def _run_sweep_robustness(
         "multipleTestingPenaltyScale": penalty_scale,
         "rankingSample": ranking_sample,
         "scoreFieldNote": "Primary ranking uses scoreRawHoldoutOrFull (holdout segment when enabled, else full sample).",
+        "histograms": sweep_histograms,
+        "paramSensitivity": param_sensitivity,
+        "sweepSummary": sweep_summary_extra,
     }
 
 
@@ -1935,53 +2118,189 @@ def _run_monte_carlo(
     }
 
 
+def _max_drawdown_pct_from_equity_path(equity: list[float]) -> float:
+    """Peak-to-trough drawdown % on a precomputed equity path (first value = starting equity)."""
+    if len(equity) < 2:
+        return 0.0
+    peak = float(equity[0])
+    max_dd = 0.0
+    for v in equity[1:]:
+        fv = float(v)
+        if fv > peak:
+            peak = fv
+        if peak > 1e-12:
+            dd = (peak - fv) / peak * 100.0
+            if dd > max_dd:
+                max_dd = dd
+    return round(max_dd, 4)
+
+
 def _run_regime_analysis(ohlc: list[dict], trades: list[dict], cfg: dict | None = None) -> dict:
+    """
+    Per-regime segmentation on the backtest timeframe (HTF-style trend vs chop).
+
+    - Uptrend / Downtrend: EMA(fast) vs EMA(slow) when not classified as range.
+    - Range: small |EMAf − EMAs| / close AND ATR/close at or below a multiple of the series median
+      (quiet + flat = consolidation).
+    """
     cfg = cfg or {}
+    base_empty = {
+        "segmentation": None,
+        "enabled": False,
+        "regimes": {},
+        "sessions": {},
+        "byRegime": {},
+        "tradeRegimes": [],
+        "timelineSample": [],
+        "regimeShare": {},
+        "currentRegime": None,
+        "params": {},
+        "explain": {},
+    }
     if not ohlc or not trades:
-        return {"regimes": {}, "sessions": {}}
+        return base_empty
     df = pd.DataFrame(ohlc)
     if "date" not in df.columns:
-        return {"regimes": {}, "sessions": {}}
+        return base_empty
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).set_index("date").sort_index()
     if df.empty:
-        return {"regimes": {}, "sessions": {}}
-    close = pd.to_numeric(df.get("close"), errors="coerce").ffill()
-    ret = close.pct_change().fillna(0.0)
-    vol = ret.rolling(32, min_periods=8).std().fillna(0.0)
-    vol_med = float(vol.median()) if len(vol) else 0.0
-    sma_fast = close.rolling(20, min_periods=5).mean()
-    sma_slow = close.rolling(80, min_periods=10).mean()
-    trend = (sma_fast - sma_slow).fillna(0.0)
+        return base_empty
 
-    def classify(ts: pd.Timestamp) -> str:
-        if ts not in df.index:
-            idx = df.index.searchsorted(ts)
-            if idx >= len(df.index):
-                idx = len(df.index) - 1
-            ts = df.index[idx]
-        vol_state = "highVol" if float(vol.loc[ts]) > vol_med else "lowVol"
-        tr = float(trend.loc[ts])
-        trend_state = "trend" if abs(tr) > max(1e-9, float(close.loc[ts]) * 0.001) else "range"
-        return f"{trend_state}_{vol_state}"
+    close = pd.to_numeric(df["close"], errors="coerce").ffill()
+    high = pd.to_numeric(df.get("high"), errors="coerce").ffill()
+    low = pd.to_numeric(df.get("low"), errors="coerce").ffill()
 
-    reg_map: dict[str, list[float]] = {}
+    ema_fast_n = int(cfg.get("ema_fast", 50) or 50)
+    ema_slow_n = int(cfg.get("ema_slow", 200) or 200)
+    atr_period = int(cfg.get("atr_period", 14) or 14)
+    range_ema_rel_max = float(cfg.get("range_ema_rel_max", 0.00085) or 0.00085)
+    range_atr_mult = float(cfg.get("range_atr_mult", 0.7) or 0.7)
+    initial_capital = float(cfg.get("initial_capital", 100000.0) or 100000.0)
+
+    ema_f = close.ewm(span=max(2, ema_fast_n), adjust=False).mean()
+    ema_s = close.ewm(span=max(3, ema_slow_n), adjust=False).mean()
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(span=max(2, atr_period), adjust=False).mean()
+    atr_rel = (atr / close.replace(0, np.nan)).fillna(0.0).clip(lower=0.0)
+    med_ar = float(atr_rel.median()) if len(atr_rel) else 0.0
+    low_vol = atr_rel <= max(1e-12, med_ar * range_atr_mult)
+    diff_rel = ((ema_f - ema_s).abs() / close.replace(0, np.nan)).fillna(999.0)
+    is_range = (diff_rel <= range_ema_rel_max) & low_vol.fillna(False)
+    up_m = ~is_range & (ema_f > ema_s)
+    down_m = ~is_range & ~(ema_f > ema_s)
+    reg_arr = np.where(is_range.to_numpy(), "range", np.where(up_m.to_numpy(), "up", "down"))
+    regime_series = pd.Series(reg_arr, index=df.index)
+
+    def regime_for_ts(ts: pd.Timestamp) -> str:
+        try:
+            if not isinstance(ts, pd.Timestamp):
+                ts = pd.Timestamp(ts)
+        except Exception:
+            return "range"
+        idx = int(df.index.searchsorted(ts, side="right") - 1)
+        idx = max(0, min(idx, len(df.index) - 1))
+        try:
+            return str(regime_series.iloc[idx])
+        except Exception:
+            return "range"
+
+    n_bars = len(regime_series)
+    step = max(1, n_bars // 400)
+    timeline_sample: list[dict] = []
+    for i in range(0, n_bars, step):
+        d = regime_series.index[i]
+        timeline_sample.append({"date": d.isoformat(), "regime": str(regime_series.iloc[i])})
+    if n_bars > 0:
+        last_d = regime_series.index[-1]
+        if not timeline_sample or timeline_sample[-1]["date"] != last_d.isoformat():
+            timeline_sample.append({"date": last_d.isoformat(), "regime": str(regime_series.iloc[-1])})
+
+    vc = regime_series.value_counts(normalize=True)
+    regime_share = {str(k): round(float(v), 4) for k, v in vc.items()}
+    current = str(regime_series.iloc[-1]) if n_bars else None
+
+    reg_map: dict[str, list[float]] = {"up": [], "down": [], "range": []}
+    entry_by_regime: dict[str, list[tuple[str, float]]] = {"up": [], "down": [], "range": []}
+    trade_regimes: list[str] = []
     ses_map: dict[str, list[float]] = {"asia": [], "europe": [], "us": []}
+
     for t in trades:
         entry = t.get("entryDate") or t.get("date")
+        pnl = float(t.get("pnl", 0.0) or 0.0)
         if not entry:
+            trade_regimes.append("range")
             continue
         try:
             ts = pd.Timestamp(entry)
         except Exception:
+            trade_regimes.append("range")
             continue
-        key = classify(ts)
-        reg_map.setdefault(key, []).append(float(t.get("pnl", 0.0) or 0.0))
+        key = regime_for_ts(ts)
+        trade_regimes.append(key)
+        reg_map.setdefault(key, []).append(pnl)
+        entry_by_regime.setdefault(key, []).append((ts.isoformat(), pnl))
         h = ts.hour
         ses_key = "asia" if 0 <= h < 8 else ("europe" if 8 <= h < 14 else "us")
-        ses_map.setdefault(ses_key, []).append(float(t.get("pnl", 0.0) or 0.0))
+        ses_map.setdefault(ses_key, []).append(pnl)
 
-    def summarize(pnls: list[float]) -> dict:
+    def summarize(pnls: list[float], dated: list[tuple[str, float]]) -> dict:
+        wins = [x for x in pnls if x > 0]
+        losses = [x for x in pnls if x < 0]
+        gross_p = sum(wins)
+        gross_l = abs(sum(losses))
+        bd = _profit_factor_detailed(gross_p, gross_l)
+        pairs_sorted = sorted(dated, key=lambda x: x[0])
+        pnls_ord = [p for _, p in pairs_sorted]
+        eq_path = [initial_capital]
+        for p in pnls_ord:
+            eq_path.append(eq_path[-1] + p)
+        max_dd_pct = _max_drawdown_pct_from_equity_path(eq_path)
+        equity_curve = [{"date": pairs_sorted[i][0], "value": round(eq_path[i + 1], 4)} for i in range(len(pairs_sorted))]
+        return {
+            "trades": len(pnls),
+            "expectancyUsd": round(sum(pnls) / len(pnls), 4) if pnls else 0.0,
+            "winRate": round((len(wins) / len(pnls) * 100.0), 4) if pnls else 0.0,
+            "profitFactor": bd["value"],
+            "profitFactorStatus": bd["status"],
+            "totalPnl": round(sum(pnls), 4),
+            "maxDrawdownPct": max_dd_pct,
+            "equityCurve": equity_curve,
+        }
+
+    by_regime: dict[str, dict] = {}
+    for rk in ("up", "down", "range"):
+        pnls = reg_map.get(rk, [])
+        dated = entry_by_regime.get(rk, [])
+        by_regime[rk] = summarize(pnls, dated)
+
+    display_regimes = {
+        "Uptrend": {k: v for k, v in by_regime["up"].items() if k != "equityCurve"},
+        "Downtrend": {k: v for k, v in by_regime["down"].items() if k != "equityCurve"},
+        "Range": {k: v for k, v in by_regime["range"].items() if k != "equityCurve"},
+    }
+
+    params_out = {
+        "ema_fast": ema_fast_n,
+        "ema_slow": ema_slow_n,
+        "atr_period": atr_period,
+        "range_ema_rel_max": range_ema_rel_max,
+        "range_atr_mult": range_atr_mult,
+    }
+    explain = {
+        "uptrendRule": f"EMA({ema_fast_n}) > EMA({ema_slow_n}) a zároveň nesplněna podmínka range (nízký poměr |EMAf−EMAs|/close a nízký ATR/close).",
+        "downtrendRule": f"EMA({ema_fast_n}) < EMA({ema_slow_n}) a zároveň nesplněna podmínka range.",
+        "rangeRule": (
+            f"|EMAf−EMAs|/close ≤ {range_ema_rel_max} a ATR/close ≤ median(ATR/close)×{range_atr_mult} "
+            "(konsolidace + potlačená volatilita)."
+        ),
+    }
+
+    def summarize_flat(pnls: list[float]) -> dict:
         wins = [x for x in pnls if x > 0]
         losses = [x for x in pnls if x < 0]
         gross_p = sum(wins)
@@ -1997,8 +2316,17 @@ def _run_regime_analysis(ohlc: list[dict], trades: list[dict], cfg: dict | None 
         }
 
     return {
-        "regimes": {k: summarize(v) for k, v in reg_map.items()},
-        "sessions": {k: summarize(v) for k, v in ses_map.items()},
+        "segmentation": "per_regime_ema_atr_v1",
+        "enabled": True,
+        "params": params_out,
+        "explain": explain,
+        "currentRegime": current,
+        "regimeShare": regime_share,
+        "timelineSample": timeline_sample,
+        "byRegime": by_regime,
+        "tradeRegimes": trade_regimes,
+        "regimes": display_regimes,
+        "sessions": {k: summarize_flat(v) for k, v in ses_map.items()},
     }
 
 
@@ -2501,6 +2829,112 @@ def _call_with_params(fn, df: pd.DataFrame, params: dict):
     except (ValueError, TypeError):
         pass
     return fn(df)
+
+
+def _aggregate_ohlc_for_export(data: pd.DataFrame, max_bars: int) -> pd.DataFrame:
+    """Merge consecutive rows into at most ``max_bars`` buckets so high/low are true extrema (unlike iloc stride)."""
+    n = len(data)
+    if n <= max_bars or max_bars < 2 or not isinstance(data.index, pd.DatetimeIndex):
+        return data
+    o_col = "open" if "open" in data.columns else ("Open" if "Open" in data.columns else None)
+    h_col = "high" if "high" in data.columns else ("High" if "High" in data.columns else None)
+    l_col = "low" if "low" in data.columns else ("Low" if "Low" in data.columns else None)
+    c_col = "close" if "close" in data.columns else ("Close" if "Close" in data.columns else None)
+    if not o_col or not h_col or not l_col or not c_col:
+        return data
+    bin_idx = (np.arange(n, dtype=np.int64) * max_bars) // n
+    bin_idx = np.minimum(bin_idx, max_bars - 1)
+    tmp = pd.DataFrame(
+        {
+            "_o": data[o_col].to_numpy(),
+            "_h": data[h_col].to_numpy(),
+            "_l": data[l_col].to_numpy(),
+            "_c": data[c_col].to_numpy(),
+            "_bin": bin_idx,
+        },
+        index=data.index,
+    )
+    g = tmp.groupby("_bin", sort=True)
+    agg_o = g["_o"].first()
+    agg_h = g["_h"].max()
+    agg_l = g["_l"].min()
+    agg_c = g["_c"].last()
+    wr = tmp.reset_index()
+    ts_col = wr.columns[0]
+    first_ix = wr.groupby("_bin", sort=True)[ts_col].first()
+    out = pd.DataFrame(
+        {
+            "open": agg_o.to_numpy(),
+            "high": agg_h.to_numpy(),
+            "low": agg_l.to_numpy(),
+            "close": agg_c.to_numpy(),
+        },
+        index=pd.DatetimeIndex(first_ix.to_numpy()),
+    )
+    out = out.sort_index()
+    if {o_col, h_col, l_col, c_col} == {"open", "high", "low", "close"}:
+        return out
+    return out.rename(columns={"open": o_col, "high": h_col, "low": l_col, "close": c_col})
+
+
+def _run_strategy_chart_overlays(
+    strategy_path: str,
+    df: pd.DataFrame,
+    strategy_params: dict | None,
+) -> dict[str, dict]:
+    """Call strategy ``main.py`` ``get_zones`` / ``detect`` on **full** bars (ORB / markers for Detailed chart)."""
+    path = Path(strategy_path)
+    if not path.is_file():
+        return {}
+    mod_name = f"_strat_chart_{abs(hash(str(path.resolve()))) & 0xFFFFFFFF:08x}"
+    try:
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            return {}
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        print(f"[engine] strategy chart overlay import failed: {e}", file=sys.stderr, flush=True)
+        return {}
+    sp_flat = strategy_params if isinstance(strategy_params, dict) else {}
+    markers: list[dict] = []
+    zones: list[dict] = []
+
+    def _zones_from(raw: object) -> None:
+        if not isinstance(raw, list):
+            return
+        for item in raw:
+            zd = _module_zone_dict_for_chart(item) if isinstance(item, dict) else None
+            if zd:
+                zones.append(zd)
+
+    if getattr(mod, "get_zones", None):
+        try:
+            rz = _call_with_params(mod.get_zones, df, sp_flat)
+        except Exception as e:
+            print(f"[engine] strategy get_zones (overlay): {e}", file=sys.stderr, flush=True)
+        else:
+            _zones_from(rz)
+
+    if getattr(mod, "detect", None):
+        try:
+            rd = _call_with_params(mod.detect, df, sp_flat)
+        except Exception as e:
+            print(f"[engine] strategy detect (overlay): {e}", file=sys.stderr, flush=True)
+        else:
+            if isinstance(rd, list):
+                for item in rd:
+                    if isinstance(item, dict) and "date" in item and "type" in item and "value" in item:
+                        markers.append({
+                            "date": _iso_or_str(item["date"]),
+                            "type": str(item["type"]).lower(),
+                            "value": float(item["value"]),
+                        })
+
+    if not markers and not zones:
+        return {}
+    return {"strategy": {"markers": markers, "lines": [], "zones": zones}}
 
 
 def _module_zone_dict_for_chart(item: dict) -> dict | None:
@@ -3157,7 +3591,34 @@ def run_backtest(
     time_context: dict | None = None,
     lightweight: bool = False,
 ) -> dict:
-    """Run Backtrader backtest and return results dict. lightweight=True skips heavy analytics."""
+    """Run Backtrader backtest and return results dict. lightweight=True skips heavy analytics.
+
+    **Order execution (Backtrader ``BackBroker`` — audit / credibility)**
+
+    The simulator is *not* a live exchange matching engine. Assumptions below apply to all
+    strategies using the default broker:
+
+    - **Market**: Fills on the **open** of the *next* bar after submission, unless
+      ``strategy_params["process_orders_on_close"]`` is set → ``set_coc(True)`` matches at the
+      **close** of the signal bar (TradingView ``process_orders_on_close`` parity). Slippage
+      uses ``set_slippage_perc`` (see below).
+    - **Limit**: Fills when the bar’s range shows trade-through vs limit; fill price is the
+      limit or better, with optional slippage capped to high/low when ``slip_match`` /
+      ``slip_limit`` are enabled.
+    - **Stop**: When triggered, behaves like a **market-style** execution at the stop (with
+      slippage and gap-through-open logic in ``bbroker._try_exec_stop``).
+    - **StopLimit**: Supported by Backtrader (stop triggers, then limit leg). No repo strategy
+      relies on it today; use only with explicit tests.
+
+    **OCO / same bar TP+SL**: In one OHLC bar you do not know whether SL or TP was hit first.
+    Backtrader walks ``pending`` **FIFO**. For bracket exits, prefer submitting **stop before
+      limit** so both simultaneously touched → **stop is evaluated first** (conservative).
+    ``sd_zone_strategy`` does this; ``orb_prop_firm_killer`` resolves exits explicitly with
+    **SL before TP** in ``orb_core.step_orb``.
+
+    **Slippage**: ``set_slippage_perc`` is called with explicit defaults aligned to
+    ``BackBroker.set_slippage_perc`` (slip_open/limit/match) so behavior is stable and auditable.
+    """
     equity_list = []
     trades_list = []
     total_bars = len(data)
@@ -3287,6 +3748,14 @@ def run_backtest(
                 entry_price=float(entry_price),
                 is_long=bool(is_long),
             )
+            try:
+                sz_f = abs(float(size))
+                mult_f = float(mult)
+                mfe_usd = round(float(mfe) * sz_f * mult_f, 6)
+                mae_usd = round(float(mae) * sz_f * mult_f, 6)
+            except (TypeError, ValueError):
+                mfe_usd = 0.0
+                mae_usd = 0.0
 
             d = {
                 "date": _safe_iso(dt_close),
@@ -3300,6 +3769,8 @@ def run_backtest(
                 "exitPrice": float(exit_price),
                 "mfe": round(mfe, 6),
                 "mae": round(mae, 6),
+                "mfeUsd": mfe_usd,
+                "maeUsd": mae_usd,
                 "mfePct": round(mfe_pct, 6),
                 "maePct": round(mae_pct, 6),
                 "fees": float(getattr(trade, "commission", 0.0) or 0.0),
@@ -3332,6 +3803,12 @@ def run_backtest(
             pass
 
     cerebro = bt.Cerebro()
+    try:
+        sp0 = strategy_params if isinstance(strategy_params, dict) else {}
+        if bool(sp0.get("process_orders_on_close")):
+            cerebro.broker.set_coc(True)
+    except Exception:
+        pass
 
     # Ensure datetime index
     if not isinstance(data.index, pd.DatetimeIndex):
@@ -3388,11 +3865,11 @@ def run_backtest(
             execution_cfg_early = {}
     except Exception:
         execution_cfg_early = {}
-    comm_mode = str(execution_cfg_early.get("commission_mode") or "percentage").strip().lower()
+    comm_mode = str(execution_cfg_early.get("commission_mode") or "per_contract").strip().lower()
     try:
-        per_contract_usd = float(execution_cfg_early.get("commission_per_contract", 2.25) or 0.0)
+        per_contract_usd = float(execution_cfg_early.get("commission_per_contract", 0.0) or 0.0)
     except (TypeError, ValueError):
-        per_contract_usd = 2.25
+        per_contract_usd = 0.0
     use_per_contract = comm_mode == "per_contract" and instrument_type == "futures" and per_contract_usd >= 0.0
     commission_mode_saved = "per_contract" if use_per_contract else "percentage"
 
@@ -3454,7 +3931,14 @@ def run_backtest(
         execution_cfg["latencyModel"] = "adds_to_slippage_perc_not_order_delay"
 
     cerebro.broker.setcash(initial_capital)
-    cerebro.broker.set_slippage_perc(slippage_perc)
+    # Explicit kwargs = same defaults as BackBroker.set_slippage_perc, but documented in run_backtest.
+    cerebro.broker.set_slippage_perc(
+        slippage_perc,
+        slip_open=True,
+        slip_limit=True,
+        slip_match=True,
+        slip_out=False,
+    )
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name="sharpe")
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name="trades")
@@ -3622,13 +4106,10 @@ def run_backtest(
     max_ohlc_bars = int(_eget("MAX_OHLC_EXPORT_BARS", "8000") or 8000)
     ohlc = []
     if isinstance(data.index, pd.DatetimeIndex) and len(data) > 0:
-        export_df = data
         if len(data) > max_ohlc_bars:
-            step = len(data) / max_ohlc_bars
-            indices = [int(i * step) for i in range(max_ohlc_bars)]
-            if indices[-1] != len(data) - 1:
-                indices[-1] = len(data) - 1
-            export_df = data.iloc[indices]
+            export_df = _aggregate_ohlc_for_export(data, max_ohlc_bars)
+        else:
+            export_df = data
         dates_str = export_df.index.strftime("%Y-%m-%dT%H:%M:%S").tolist()
         o_col = "open" if "open" in export_df.columns else "Open"
         h_col = "high" if "high" in export_df.columns else "High"
@@ -3801,12 +4282,20 @@ def _execute_backtest_from_environ_body(*, strategy_path: str, strategy_dir: str
                 data_timeframe=timeframe,
             )
 
-        if regime_cfg:
-            result["regimeAnalysis"] = _run_regime_analysis(
+        if isinstance(regime_cfg, dict) and regime_cfg.get("enabled"):
+            rc = dict(regime_cfg)
+            rc["initial_capital"] = float(_eget("INITIAL_CAPITAL", "100000"))
+            ra = _run_regime_analysis(
                 ohlc=result.get("ohlc", []),
                 trades=result.get("trades", []),
-                cfg=regime_cfg,
+                cfg=rc,
             )
+            result["regimeAnalysis"] = ra
+            tregs = ra.get("tradeRegimes")
+            if isinstance(tregs, list):
+                for i, tr in enumerate(result.get("trades", [])):
+                    if isinstance(tr, dict) and i < len(tregs):
+                        tr["marketRegime"] = tregs[i]
 
         if portfolio_cfg:
             result["portfolio"] = _run_portfolio_analysis(
@@ -3883,8 +4372,9 @@ def _execute_backtest_from_environ_body(*, strategy_path: str, strategy_dir: str
                 "costAttribution": _ca,
             }
 
+        module_outputs_merged: dict[str, dict] = {}
         if applied_modules:
-            result["moduleOutputs"] = _run_module_outputs_in_engine(
+            module_outputs_merged = _run_module_outputs_in_engine(
                 strategy_dir=strategy_dir,
                 ohlc=result.get("ohlc", []),
                 applied_modules=applied_modules,
@@ -3892,6 +4382,14 @@ def _execute_backtest_from_environ_body(*, strategy_path: str, strategy_dir: str
                 work_timeframe=data_meta.get("workTimeframe"),
                 strategy_params=strategy_params,
             )
+        try:
+            so = _run_strategy_chart_overlays(strategy_path, data, strategy_params)
+            for k, v in so.items():
+                module_outputs_merged[k] = v
+        except Exception as e:
+            print(f"[engine] strategy chart overlays: {e}", file=sys.stderr, flush=True)
+        if module_outputs_merged:
+            result["moduleOutputs"] = module_outputs_merged
         perf = result.get("perf", {})
         result["runId"] = run_id or None
         manifest: dict = {

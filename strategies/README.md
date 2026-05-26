@@ -4,8 +4,10 @@ Každá složka je jedna strategie (`main.py`). U každé je **README.md** jedno
 
 | Složka | Stručně |
 |--------|---------|
-| [sd_zone_strategy](sd_zone_strategy/) | Supply/Demand zóny; **bez modulu S/D zón neobchoduje** (legacy), nebo režim **`use_sd_artifacts`** se zónami z **`.backtest_artifacts/`** (shoda s View po Build). Swing HL nutný pro trend filtr; jinak u legacy oba moduly v běhu — viz `sd_zone_strategy/README.md`, `examples/sd_zones/README.md`, `docs/BACKTEST_PIPELINE_REFACTOR.md`. |
+| [orb_prop_firm_killer](orb_prop_firm_killer/) | ORB Prop Firm Killer v2 (Pine port); MNQ 1m ``data/futures_mnq/``; ``process_orders_on_close`` + broker ``set_coc`` pro TV paritu. |
 | [rsi_gbp](rsi_gbp/) | RSI pásma + TP/SL v USD; forex, **bez** modulů. |
 | [test](test/) | EMA křížení – **test enginu**, ne reálný edge. |
+
+Supply/Demand **zóny** pro graf (View / precompute) zůstávají v modulu [`examples/sd_zones.py`](../examples/sd_zones.py) a „repo“ swing modul v [`strategies/modules/Swing_HL.py`](modules/Swing_HL.py) — bez samostatné S/D **backtest** strategie v tomto repu.
 
 Jak spustit backtest a co kde kliknout: **[READMEADAM.md](../READMEADAM.md)**.

@@ -2,7 +2,7 @@
 
 Tento dokument uzavírá přípravnou fázi: logika oproti Pythonu, vizuál (Plotly), timeframe, multi-instrument, limity Pine a alerty.
 
-**Reference kód:** `strategies/sd_zone_strategy/modules/Swing_HL.py`, `examples/sd_zones.py`, `frontend/components/charts/ModuleOutputChart.tsx`.
+**Reference kód:** `strategies/modules/Swing_HL.py`, `examples/sd_zones.py`, `frontend/components/charts/ModuleOutputChart.tsx`.
 
 ---
 

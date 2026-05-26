@@ -1,7 +1,10 @@
 import type { EquityPoint, Trade } from "@shared/types";
 
-/** Initial risk v USD (nebo měně účtu) z entry vs stop ze zoneMeta. */
+/** Initial risk v měně účtu: preferuje engine (`initialRiskUsd` = cena × mult × velikost). */
 export function getTradeInitialRiskUsd(trade: Trade): number | null {
+  if (trade.initialRiskUsd != null && Number.isFinite(trade.initialRiskUsd) && trade.initialRiskUsd > 0) {
+    return trade.initialRiskUsd;
+  }
   const zm = trade.zoneMeta as Record<string, unknown> | undefined;
   const stop = zm != null && zm.stopPrice != null ? Number(zm.stopPrice) : NaN;
   const entry = trade.entryPrice ?? trade.price;

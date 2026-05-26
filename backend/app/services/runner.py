@@ -17,7 +17,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Awaitable, Callable, Union
+from typing import Any, AsyncGenerator, Awaitable, Callable, Union
 
 from app.models.run import RunResponse, BacktestMetrics, Trade, OhlcBar, EquityPoint
 from app.services import artifact_store
@@ -33,8 +33,9 @@ from app.services.ohlc_timeframe import (
     resample_ohlcv,
     should_resample,
 )
+from app.services.prop_firm_backtest import attach_prop_firm_to_normalized_result
 
-RUN_TIMEOUT = 3600  # seconds — wall-clock cap for engine subprocess (override RUN_TIMEOUT_SEC or request run_timeout_sec)
+RUN_TIMEOUT = 7200  # seconds — wall-clock cap for engine subprocess (override RUN_TIMEOUT_SEC or request run_timeout_sec)
 # Importing pandas/backtrader in the engine child can be silent on stdout for a long time; keep this generous.
 RUN_STREAM_IDLE_TIMEOUT = 1800  # seconds — no SSE/log/progress events (override RUN_STREAM_IDLE_TIMEOUT_SEC)
 RUN_TIMEOUT_MAX_SEC = 86400  # hard cap when set from API request
@@ -258,28 +259,6 @@ def _to_module_name(name: str) -> str:
     return (name or "module").replace(" ", "_").replace("-", "_").replace(".", "_") or "module"
 
 
-def _merge_strategy_params(
-    strategy_params: dict | None,
-    instrument_type: str,
-    share_size: int | None,
-    lot_size: float | None,
-    pip_size: float | None,
-    pip_value: float | None,
-) -> dict:
-    """Merge backtest params (share_size, lot_size, etc.) into strategy params for use in strategy."""
-    merged = dict(strategy_params or {})
-    if instrument_type == "stocks" and share_size is not None:
-        merged["share_size"] = share_size
-    if instrument_type == "forex":
-        if lot_size is not None:
-            merged["lot_size"] = lot_size
-        if pip_size is not None:
-            merged["pip_size"] = pip_size
-        if pip_value is not None:
-            merged["pip_value"] = pip_value
-    return merged
-
-
 def _resolve_run_timeout_seconds(request_override: int | None = None) -> int:
     """
     Wall-clock timeout for the backtest engine subprocess.
@@ -400,6 +379,7 @@ def _normalize_result_payload(
     host_dataset_fingerprint: str | None = None,
     host_dataset_parquet_column_count: int | None = None,
     runner_engine_notes: list[str] | None = None,
+    prop_firm_backtest: dict[str, Any] | None = None,
 ) -> dict:
     normalized = dict(result_data or {})
     normalized.setdefault("equity", [])
@@ -470,6 +450,13 @@ def _normalize_result_payload(
             )
             if v is not None
         }
+    attach_prop_firm_to_normalized_result(
+        normalized,
+        prop_firm_raw=prop_firm_backtest,
+        initial_capital=initial_capital,
+        validation_mode=validation_mode,
+        sweep_mode=sweep_mode,
+    )
     return normalized
 
 
@@ -724,10 +711,6 @@ async def run_strategy_streaming(
     instrument_type: str = "futures",
     tick_size: float | None = None,
     value_per_tick: float | None = None,
-    share_size: int | None = None,
-    lot_size: float | None = None,
-    pip_size: float | None = None,
-    pip_value: float | None = None,
     strategy_params: dict | None = None,
     applied_modules: list | None = None,
     run_id: str | None = None,
@@ -747,6 +730,7 @@ async def run_strategy_streaming(
     stream_idle_timeout_sec: int | None = None,
     disallow_inprocess_engine: bool = False,
     sse_stream: bool = False,
+    prop_firm_backtest: dict[str, Any] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Execute strategy in a host Python subprocess (backtest engine), yield events for streaming.
@@ -848,15 +832,9 @@ async def run_strategy_streaming(
         env["INSTRUMENT_TYPE"] = str(instrument_type)
         env["TICK_SIZE"] = str(tick_size if tick_size is not None else "")
         env["VALUE_PER_TICK"] = str(value_per_tick if value_per_tick is not None else "")
-        env["SHARE_SIZE"] = str(share_size if share_size is not None else "")
-        env["LOT_SIZE"] = str(lot_size if lot_size is not None else "")
-        env["PIP_SIZE"] = str(pip_size if pip_size is not None else "")
-        env["PIP_VALUE"] = str(pip_value if pip_value is not None else "")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["RUN_ID"] = str(resolved_run_id)
-        merged_strategy_params = _merge_strategy_params(
-            filtered_params, instrument_type, share_size, lot_size, pip_size, pip_value
-        )
+        merged_strategy_params = dict(filtered_params or {})
         env["STRATEGY_PARAMS"] = json.dumps(merged_strategy_params)
         env["APPLIED_MODULES"] = json.dumps(applied_modules_payload)
         env["ANALYSIS_CONFIG"] = json.dumps(analysis_payload)
@@ -876,36 +854,8 @@ async def run_strategy_streaming(
             print(f"[runner] host_dataset_fingerprint={host_ds_fp} data_file={data_file}", flush=True)
         env["HOST_DATASET_FINGERPRINT"] = host_ds_fp or ""
 
-        try:
-            use_sd_art = bool(int(merged_strategy_params.get("use_sd_artifacts", 0)))
-        except (TypeError, ValueError):
-            use_sd_art = False
-        if use_sd_art:
-            # Jednotný klíč s UI Build / View: artefakty jsou vždy pro celý soubor (years v ID nefigurují).
-            did = artifact_store.compute_dataset_id(
-                str(data_file or ""),
-                str(host_ds_fp or ""),
-                years=None,
-                start_iso=None,
-                end_iso=None,
-            )
-            zpath = artifact_store.artifacts_root(Path(_project_root)) / did / "sd" / "v1" / "zones.parquet"
-            if not zpath.is_file():
-                yield {
-                    "type": "error",
-                    "message": (
-                        "S/D artefakt pro tento backtest chybí — spusť Build features pro stejný data_file (precompute na celý soubor), "
-                        "nebo nastav use_sd_artifacts na 0. Očekávaná cesta: "
-                        + str(zpath.resolve())
-                    ),
-                }
-                return
-            env["USE_SD_ARTIFACTS"] = "1"
-            env["SD_ARTIFACT_ZONES_PATH"] = str(zpath.resolve())
-        else:
-            # Fáze 8 / 8.3: legacy get_zones — nesmí zůstat host/env hodnoty z jiného runu nebo shellu.
-            env["USE_SD_ARTIFACTS"] = "0"
-            env.pop("SD_ARTIFACT_ZONES_PATH", None)
+        env["USE_SD_ARTIFACTS"] = "0"
+        env.pop("SD_ARTIFACT_ZONES_PATH", None)
 
         t_before_popen = time.perf_counter()
         runner_host_prepare_ms = int((t_before_popen - prep_started) * 1000)
@@ -1026,6 +976,7 @@ async def run_strategy_streaming(
                 host_dataset_fingerprint=host_ds_fp,
                 host_dataset_parquet_column_count=pq_cols,
                 runner_engine_notes=notes_for_normalize,
+                prop_firm_backtest=prop_firm_backtest,
             )
             if isinstance(result_data.get("manifest"), dict):
                 result_data["manifest"]["engineExecutionMode"] = "inprocess"
@@ -1147,6 +1098,7 @@ async def run_strategy_streaming(
                         host_dataset_fingerprint=host_ds_fp,
                         host_dataset_parquet_column_count=pq_cols,
                         runner_engine_notes=notes_for_normalize,
+                        prop_firm_backtest=prop_firm_backtest,
                     )
                     ev = {"type": "result", "data": result_data}
             if ev.get("type") == "error":
@@ -1215,10 +1167,6 @@ async def run_strategy(
     instrument_type: str = "futures",
     tick_size: float | None = None,
     value_per_tick: float | None = None,
-    share_size: int | None = None,
-    lot_size: float | None = None,
-    pip_size: float | None = None,
-    pip_value: float | None = None,
     strategy_params: dict | None = None,
     applied_modules: list | None = None,
     run_id: str | None = None,
@@ -1237,6 +1185,7 @@ async def run_strategy(
     stream_idle_timeout_sec: int | None = None,
     disallow_inprocess_engine: bool = False,
     sse_stream: bool = False,
+    prop_firm_backtest: dict[str, Any] | None = None,
 ) -> RunResponse:
     """Non-streaming version - for backward compatibility."""
     result_data = None
@@ -1253,10 +1202,6 @@ async def run_strategy(
         instrument_type=instrument_type,
         tick_size=tick_size,
         value_per_tick=value_per_tick,
-        share_size=share_size,
-        lot_size=lot_size,
-        pip_size=pip_size,
-        pip_value=pip_value,
         strategy_params=strategy_params,
         applied_modules=applied_modules,
         run_id=run_id,
@@ -1275,6 +1220,7 @@ async def run_strategy(
         stream_idle_timeout_sec=stream_idle_timeout_sec,
         disallow_inprocess_engine=disallow_inprocess_engine,
         sse_stream=sse_stream,
+        prop_firm_backtest=prop_firm_backtest,
     ):
         if ev.get("type") == "result":
             result_data = ev.get("data")
@@ -1306,4 +1252,5 @@ async def run_strategy(
         qualityGate=result_data.get("qualityGate"),
         experiment=result_data.get("experiment"),
         batchSummary=result_data.get("batchSummary"),
+        propFirmBacktest=result_data.get("propFirmBacktest"),
     )

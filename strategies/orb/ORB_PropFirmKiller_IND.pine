@@ -1,0 +1,811 @@
+//@version=6
+// =============================================================================
+// ORB PROP FIRM KILLER v2 — INDICATOR REPLICA (manual / deep-history replay)
+//
+// Mirrors ORB_PropFirmKiller.pine signals & inputs without strategy.*
+// Planned bracket from OR finalize → session end: stop entry price, SL, TP,
+// ladder partial guides. Boxes freeze at session close (TradingView bars limit).
+//
+// DIFF vs strategy :
+// - No brokerage fills — levels are PLAN from boundary stop + your SL mode.
+// - Daily PnL% / day-loss gate ≈ %(close − session first open); not account equity.
+// - % sizing uses “proxy equity” input (no broker equity).
+// - Ladder BE (after partials) needs live strategy; here SL line stays initial stop.
+// - Stop-entry X timing: default = backtest parity; user can choose earlier bars for live prep.
+// - Keep inputs (ATR % SL, gates) aligned with strategy defaults for 1:1 level parity.
+// =============================================================================
+
+indicator("ORB PFK v2 [Indicator / Manual]", shorttitle="ORB PFK ind", overlay=true,
+     max_boxes_count=300, max_lines_count=320, max_labels_count=80)
+
+// ──  INPUTS — keep groups aligned with strategy script ─────────────────────
+
+G_BT         = "0) Cross-instrument backtest"
+i_relaxedBt  = input.bool(true, "Relaxed instrument test (recommended for futures)",
+     group = G_BT,
+     tooltip = "Same as strategy: skips universe, DoW, daily-loss gate; RelVol only if its switch is ON.\n"
+             + "Proxy equity only for % sizing.")
+
+G_ORB        = "1) Opening Range"
+i_orbMinutes = input.int(5, "ORB Length (minutes)", options=[5, 15, 30], group=G_ORB)
+i_session    = input.session("0930-1600", "Trading Session", group=G_ORB)
+i_tz         = input.string("America/New_York", "Session Timezone",
+     options=["America/New_York", "Europe/London", "Europe/Berlin", "Asia/Tokyo",
+         "Asia/Hong_Kong", "exchange"], group=G_ORB)
+
+G_UNI        = "2) Universe Filters (Studie 3)"
+i_useUni     = input.bool(false, "Apply Universe Filters", group=G_UNI)
+i_minPrice   = input.float(5.0, "Min Price ($)", step=1.0, group=G_UNI)
+i_minAvgVol  = input.float(1000000, "Min 14d Avg Volume (sh)", step=100000, group=G_UNI)
+i_minAtr     = input.float(0.50, "Min 14d ATR ($)", step=0.10, group=G_UNI)
+
+G_VOL        = "3) Relative Volume Filter"
+i_useRelVol  = input.bool(false, "Require Above-Average OR Volume", group=G_VOL,
+     tooltip = "When ON: OR volume vs trail average must be ≥ Min %. "
+             + "Enforced in BOTH relaxed and strict instrument modes.")
+i_relVolMin  = input.float(1.0, "Min Relative Volume", minval=0.5, step=0.1, group=G_VOL)
+i_relVolBack = input.int(14, "RelVol Lookback (sessions)", minval=5, group=G_VOL)
+
+G_SL         = "4) Stop Loss"
+i_slMode     = input.string("ATR % (Daily)", "SL Mode",
+     options=[
+         "ATR % (Daily)", "OR Opposite Boundary",
+         "Opposite OR Price (orbHigh/orbLow)", "First OR bar High/Low"],
+     group=G_SL)
+i_atrLen     = input.int(14, "ATR Length (Daily)", group=G_SL)
+i_atrSlPct   = input.float(30.0, "ATR % for SL", minval=1.0, step=1.0, group=G_SL,
+     tooltip = "Must match strategy script for identical SL distance. "
+             + "Studie 3 paper = 10%; strategy default 30%.")
+i_slMult     = input.float(1.0, "SL Distance Multiplier", minval=0.25, maxval=3.0,
+     step=0.05, group=G_SL)
+
+G_EX         = "5) Exit Style"
+i_tradeMode  = input.string("Ladder Partials + Runner", "Trade Style",
+     options=["Full Position (TP / EoD only)", "Ladder Partials + Runner"], group=G_EX)
+i_exitMode   = input.string("EoD", "Runner / Full Exit Mode", options=["EoD", "Fixed RR"],
+     group=G_EX)
+i_fixedRR    = input.float(2.0, "Fixed Risk-Reward (runner/full)", minval=0.5,
+     step=0.5, group=G_EX)
+
+G_POS        = "5b) Position Size (% mode proxy)"
+i_posMode    = input.string("Fixed Contracts", "Sizing Mode",
+     options=["Fixed Contracts", "% Equity Risk"], group=G_POS)
+i_contracts  = input.float(2.0, "Contracts / Shares (Fixed)", minval=1.0, step=1.0,
+     group=G_POS)
+i_riskPct    = input.float(0.5, "Risk %  [% mode]", minval=0.1, maxval=2.0,
+     step=0.1, group=G_POS)
+i_proxyEquity= input.float(100000.0, "Proxy account equity [% mode]",
+     tooltip="Indicators have no equity — approximate size display / gates.",
+     minval=1000.0, step=1000.0, group=G_POS)
+
+G_LAD        = "5c) Ladder partials"
+i_p1_use     = input.bool(true, "P1", inline="p1", group=G_LAD)
+i_p1_qty     = input.int(1, "#Ct", inline="p1", minval=0, group=G_LAD)
+i_p1_R       = input.float(1.0, "@R", inline="p1", minval=0.25, step=0.25, group=G_LAD)
+i_p2_use     = input.bool(false, "P2", inline="p2", group=G_LAD)
+i_p2_qty     = input.int(0, "#Ct", inline="p2", minval=0, group=G_LAD)
+i_p2_R       = input.float(2.0, "@R", inline="p2", minval=0.25, step=0.25, group=G_LAD)
+i_p3_use     = input.bool(false, "P3", inline="p3", group=G_LAD)
+i_p3_qty     = input.int(0, "#Ct", inline="p3", minval=0, group=G_LAD)
+i_p3_R       = input.float(3.0, "@R", inline="p3", minval=0.25, step=0.25, group=G_LAD)
+i_useBE      = input.bool(true, "(Info) BE ladder — strategy only",
+     tooltip="Breakeven after partial fills is simulated only in strategy script.",
+     group=G_LAD)
+
+G_RISK       = "6) Risk Management"
+i_maxTrades  = input.int(1, "Max setups per Day", minval=1, maxval=4, group=G_RISK)
+i_useDayStop = input.bool(false, "Daily loss gate (approx)", group=G_RISK,
+     tooltip="Uses %(close/sessionOpen) − 1 vs limit; NOT broker equity DD.")
+i_dayLossPct = input.float(2.0, "Daily Loss Limit (%)", minval=0.5, step=0.1,
+     group=G_RISK)
+
+G_OPT        = "7) Optional Filters"
+i_useHtf     = input.bool(false, "HTF Trend Filter", group=G_OPT)
+i_htfTf      = input.timeframe("60", "HTF", group=G_OPT)
+i_htfEmaLen  = input.int(50, "HTF EMA Len", minval=5, group=G_OPT)
+i_useDow     = input.bool(false, "Day-of-Week Filter", group=G_OPT)
+i_mon        = input.bool(true, "Mo", inline="d", group=G_OPT)
+i_tue        = input.bool(false, "Tu", inline="d", group=G_OPT)
+i_wed        = input.bool(true, "We", inline="d", group=G_OPT)
+i_thu        = input.bool(false, "Th", inline="d", group=G_OPT)
+i_fri        = input.bool(true, "Fr", inline="d", group=G_OPT)
+
+G_VIS        = "8) Visuals"
+i_showOrb    = input.bool(true, "Show ORB Box (exact window; no phantom bar)", group=G_VIS)
+i_showLevels = input.bool(true, "Thin SL / TP plot lines when PnL off", group=G_VIS)
+i_showEntryX = input.bool(true, "Draw stop-entry X marker", group=G_VIS,
+     tooltip = "When ON, draws the first-touch marker (timing = next input). "
+             + "Arm triangle + alerts still fire on OR finalize — use those to place "
+             + "working stop orders early.")
+i_entryXMode = input.string("Strategy tester (backtest parity)", "Stop-entry X — bar timing",
+     options = [
+         "Off",
+         "Strategy tester (backtest parity)",
+         "One bar after OR arm (earlier)",
+         "Immediate incl. arm bar (wick can tag)"
+         ],
+     group = G_VIS,
+     tooltip = "Backtest parity ≈ process_orders_on_close deferral (no X for 2 bars after arm). "
+             + "Earlier modes help manual traders see the first wick through the stop level; "
+             + "they may NOT match the exact Strategy Tester fill bar.")
+i_showPnl    = input.bool(true, "Show Planned Bracket PnL zones", group=G_VIS)
+i_pnlRiskTr  = input.int(76, "PnL risk transp", minval=60, maxval=98, group=G_VIS)
+i_pnlRewTr   = input.int(76, "PnL reward transp", minval=60, maxval=98, group=G_VIS)
+i_showInfo   = input.bool(true, "Info table", group=G_VIS)
+
+c_long       = color.new(color.green,  0)
+c_short      = color.new(color.red,    0)
+c_orb        = color.new(color.yellow, 80)
+c_orbBorder  = color.new(color.yellow, 30)
+c_pnlRiskBg  = color.new(#c4c4c4, 0)
+c_pnlRewBg   = color.new(#b8e8d0, 0)
+c_pnlEntryLn = color.new(color.black, 5)
+c_sl         = color.new(color.red,    20)
+c_tp         = color.new(color.lime,   20)
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SESSION / OR — copy of strategy
+// ═══════════════════════════════════════════════════════════════════════════
+
+f_sessionTime() => time(timeframe.period, i_session, i_tz)
+
+inSession      = not na(f_sessionTime())
+inSessionPrev  = not na(f_sessionTime()[1])
+newSession     = inSession and not inSessionPrev
+sessionEnd     = not inSession and inSessionPrev
+
+var float orbHigh = na
+var float orbLow  = na
+var int   orbStartTime = na
+var bool  orbBuilding = false
+var bool  orbBuildingPrev = false
+var bool  orbReady = false
+// Right edge (time) = close of last bar inside ORB window → exact range rectangle
+var int   orbEndClose = na
+var int   firstCandleDir = 0
+var float firstOpen = na
+var float orFirstBarHi = na
+var float orFirstBarLo = na
+
+if newSession
+    orbHigh := high
+    orbLow := low
+    orbEndClose := na
+    orbStartTime := time
+    orbReady := false
+    firstCandleDir := 0
+    firstOpen := open
+    orFirstBarHi := high
+    orFirstBarLo := low
+
+chartTfMin = timeframe.in_seconds(timeframe.period) / 60.0
+tfTooLarge = chartTfMin > i_orbMinutes
+var label tfWarn = na
+if barstate.islast and tfTooLarge and na(tfWarn)
+    tfWarn := label.new(bar_index, high,
+         "TF " + str.tostring(chartTfMin, "#.#") + "m > ORB "
+            + str.tostring(i_orbMinutes) + "m",
+         color=color.red, style=label.style_label_down)
+
+orbBuilding := inSession and not na(orbStartTime)
+     and (time - orbStartTime < i_orbMinutes * 60000)
+
+if orbBuilding
+    orbHigh := math.max(orbHigh, high)
+    orbLow  := math.min(orbLow,  low)
+    orbEndClose := time_close
+
+orbJustFinalized = orbBuildingPrev and not orbBuilding
+if orbJustFinalized
+    orbReady := true
+    float orCloseEnd = close[1]
+    firstCandleDir := orCloseEnd > firstOpen ? 1 : orCloseEnd < firstOpen ? -1 : 0
+
+orbBuildingPrev := orbBuilding
+
+dailyAtr = request.security(syminfo.tickerid, "D", ta.atr(i_atrLen)[1],
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+dailyAvgVol = request.security(syminfo.tickerid, "D", ta.sma(volume, 14)[1],
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+dailyOpen = request.security(syminfo.tickerid, "D", open,
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+htfEma = request.security(syminfo.tickerid, i_htfTf, ta.ema(close, i_htfEmaLen)[1],
+     lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+var float orVolToday = 0.0
+var array<float> orVolHist = array.new<float>()
+var float relVol = na
+
+if newSession
+    orVolToday := 0.0
+
+if orbBuilding
+    orVolToday += volume
+
+if orbJustFinalized
+    if array.size(orVolHist) > 0
+        float avgOv = array.avg(orVolHist)
+        relVol := avgOv > 0 ? orVolToday / avgOv : 1.0
+    else
+        relVol := 1.0
+    array.push(orVolHist, orVolToday)
+    if array.size(orVolHist) > i_relVolBack
+        array.shift(orVolHist)
+
+var float sessOpenRef = na
+if newSession
+    sessOpenRef := open
+
+dailyPnLPct = not na(sessOpenRef) and sessOpenRef > 0
+     ? (close / sessOpenRef - 1.0) * 100.0
+     : 0.0
+dailyLossHit = i_useDayStop and dailyPnLPct <= -i_dayLossPct
+
+var int setupsArmCount = 0
+if newSession
+    setupsArmCount := 0
+
+priceOk  = not i_useUni or (not na(dailyOpen) and dailyOpen >= i_minPrice)
+volOk    = not i_useUni or (not na(dailyAvgVol) and dailyAvgVol >= i_minAvgVol)
+atrOk    = not i_useUni or (not na(dailyAtr) and dailyAtr >= i_minAtr)
+universeOk = priceOk and volOk and atrOk
+
+relVolOk = not i_useRelVol or (not na(relVol) and relVol >= i_relVolMin)
+
+isMon = dayofweek == dayofweek.monday
+isTue = dayofweek == dayofweek.tuesday
+isWed = dayofweek == dayofweek.wednesday
+isThu = dayofweek == dayofweek.thursday
+isFri = dayofweek == dayofweek.friday
+dowOk = not i_useDow or (i_mon and isMon) or (i_tue and isTue)
+     or (i_wed and isWed) or (i_thu and isThu) or (i_fri and isFri)
+
+htfBullOk = not i_useHtf or (not na(htfEma) and close > htfEma)
+htfBearOk = not i_useHtf or (not na(htfEma) and close < htfEma)
+
+tradeCountOk = setupsArmCount < i_maxTrades
+
+sumLadderQty = i_tradeMode == "Ladder Partials + Runner"
+     ? (i_p1_use ? i_p1_qty : 0) + (i_p2_use ? i_p2_qty : 0) + (i_p3_use ? i_p3_qty : 0)
+     : 0
+
+gateStrict = orbReady and inSession and universeOk and relVolOk and dowOk
+     and not dailyLossHit and tradeCountOk
+gateLoose  = orbReady and inSession and tradeCountOk
+     and (not i_useRelVol or relVolOk)
+gate       = i_relaxedBt ? gateLoose : gateStrict
+
+f_stopPrice(_isLong, _entry) =>
+    float minD = syminfo.mintick
+    float orW = math.abs(orbHigh - orbLow)
+    float sOut = na
+    if i_slMode == "ATR % (Daily)"
+        float atrD = na(dailyAtr) ? na : dailyAtr * i_atrSlPct / 100.0
+        float baseDist = na(atrD) ? orW : atrD
+        float adjDist = math.max(nz(baseDist, orW) * i_slMult, minD)
+        sOut := _isLong ? _entry - adjDist : _entry + adjDist
+    else if i_slMode == "OR Opposite Boundary"
+        float adjDist = math.max(orW * i_slMult, minD)
+        sOut := _isLong ? _entry - adjDist : _entry + adjDist
+    else if i_slMode == "Opposite OR Price (orbHigh/orbLow)"
+        float anc = _isLong ? orbLow : orbHigh
+        if not na(anc)
+            float adjA = math.max(math.abs(_entry - anc) * i_slMult, minD)
+            sOut := _isLong ? _entry - adjA : _entry + adjA
+        else
+            float adjF = math.max(orW * i_slMult, minD)
+            sOut := _isLong ? _entry - adjF : _entry + adjF
+    else if i_slMode == "First OR bar High/Low"
+        float anc = _isLong ? orFirstBarLo : orFirstBarHi
+        if not na(anc)
+            float adjA = math.max(math.abs(_entry - anc) * i_slMult, minD)
+            sOut := _isLong ? _entry - adjA : _entry + adjA
+        else
+            float adjF = math.max(orW * i_slMult, minD)
+            sOut := _isLong ? _entry - adjF : _entry + adjF
+    else
+        float adjD = math.max(orW * i_slMult, minD)
+        sOut := _isLong ? _entry - adjD : _entry + adjD
+    sOut
+
+f_tpPrice(_isLong, _entry, _stop) =>
+    rDist = math.abs(_entry - _stop)
+    _isLong ? _entry + rDist * i_fixedRR : _entry - rDist * i_fixedRR
+
+f_limAtR(_isLong, _entry, _stop, _rMult) =>
+    rDist = math.abs(_entry - _stop)
+    _isLong ? _entry + rDist * _rMult : _entry - rDist * _rMult
+
+f_qty(_entry, _stop) =>
+    float perSh = math.abs(_entry - _stop)
+    float q0 = i_posMode == "Fixed Contracts" ? i_contracts
+         : (perSh > 0 ? i_proxyEquity * i_riskPct / 100.0 / perSh : 0.0)
+    i_relaxedBt ? math.max(q0, 1.0) : q0
+
+f_entryQty(_entry, _stop) =>
+    float qb = f_qty(_entry, _stop)
+    i_relaxedBt and i_tradeMode == "Ladder Partials + Runner"
+         ? math.max(math.max(qb, sumLadderQty), 1.0)
+         : qb
+
+// Armed bracket plan (strategy: one stop entry per orb finalize)
+var bool  orderArmed = false
+var bool  bracketActive = false
+var float pendEntry = na
+var float pendStop = na
+var float pendTp = na
+var float pendQty = na
+var float pendRunnerQty = na
+var int   pendLeftT = na
+var bool  pendLong = false
+var int   bracketArmBar = na // bar_index when stop-entry plan is armed (finalize bar)
+
+if newSession
+    orderArmed := false
+    bracketActive := false
+    pendEntry := na
+    pendStop := na
+    pendTp := na
+    pendQty := na
+    pendRunnerQty := na
+    pendLeftT := na
+    bracketArmBar := na
+
+// Pre-scan for plots/alerts (must not depend on mutated orderArmed)
+float preEL = orbHigh
+float preSLng = orbJustFinalized and gate and firstCandleDir == 1 and htfBullOk
+     ? f_stopPrice(true, preEL) : na
+float preQLng = orbJustFinalized and gate and firstCandleDir == 1 and htfBullOk
+     and not na(preSLng) ? f_entryQty(preEL, preSLng) : na
+bool preLdLng = i_tradeMode != "Ladder Partials + Runner"
+     or (not na(preQLng) and sumLadderQty <= preQLng)
+
+sigLongShown =
+     orbJustFinalized and gate and not orderArmed and firstCandleDir == 1
+     and htfBullOk and not na(preSLng) and preSLng < preEL and preQLng > 0
+     and preLdLng
+
+float preES = orbLow
+float preSShort = orbJustFinalized and gate and firstCandleDir == -1 and htfBearOk
+     ? f_stopPrice(false, preES) : na
+float preQShr = orbJustFinalized and gate and firstCandleDir == -1 and htfBearOk
+     and not na(preSShort) ? f_entryQty(preES, preSShort) : na
+bool preLdShr = i_tradeMode != "Ladder Partials + Runner"
+     or (not na(preQShr) and sumLadderQty <= preQShr)
+
+sigShortShown =
+     orbJustFinalized and gate and not orderArmed and firstCandleDir == -1
+     and htfBearOk and not na(preSShort) and preSShort > preES and preQShr > 0
+     and preLdShr
+
+if orbJustFinalized and gate and not orderArmed
+    if firstCandleDir == 1 and htfBullOk
+        float eP = orbHigh
+        float sP = f_stopPrice(true, eP)
+        float q  = f_entryQty(eP, sP)
+        bool ladOk = i_tradeMode != "Ladder Partials + Runner" or sumLadderQty <= q
+        if not na(sP) and sP < eP and q > 0 and ladOk
+            pendEntry := eP
+            pendStop := sP
+            pendTp := f_tpPrice(true, eP, sP)
+            pendQty := q
+            pendRunnerQty := i_tradeMode == "Ladder Partials + Runner" ? q - sumLadderQty : q
+            pendLeftT := time
+            pendLong := true
+            orderArmed := true
+            bracketActive := true
+            bracketArmBar := bar_index
+            setupsArmCount += 1
+    else if firstCandleDir == -1 and htfBearOk
+        float eP = orbLow
+        float sP = f_stopPrice(false, eP)
+        float q  = f_entryQty(eP, sP)
+        bool ladOk = i_tradeMode != "Ladder Partials + Runner" or sumLadderQty <= q
+        if not na(sP) and sP > eP and q > 0 and ladOk
+            pendEntry := eP
+            pendStop := sP
+            pendTp := f_tpPrice(false, eP, sP)
+            pendQty := q
+            pendRunnerQty := i_tradeMode == "Ladder Partials + Runner" ? q - sumLadderQty : q
+            pendLeftT := time
+            pendLong := false
+            orderArmed := true
+            bracketActive := true
+            bracketArmBar := bar_index
+            setupsArmCount += 1
+
+if dailyLossHit or sessionEnd
+    orderArmed := false
+
+// First bar whose range trades the planned stop-entry (timing depends on i_entryXMode)
+var int bracketArmStamp = na
+var bool bracketTouchedEntry = false
+bool firstTouchStopEntry = false
+bool entryXBarOk = i_entryXMode == "Strategy tester (backtest parity)"
+     ? not na(bracketArmBar) and bar_index > bracketArmBar + 1
+     : i_entryXMode == "One bar after OR arm (earlier)"
+     ? not na(bracketArmBar) and bar_index > bracketArmBar
+     : i_entryXMode == "Immediate incl. arm bar (wick can tag)"
+     ? not na(bracketArmBar) and bar_index >= bracketArmBar
+     : false
+
+if bracketActive and not na(pendLeftT) and not na(pendEntry)
+    if na(bracketArmStamp) or bracketArmStamp != pendLeftT
+        bracketArmStamp := pendLeftT
+        bracketTouchedEntry := false
+    if i_entryXMode != "Off" and not bracketTouchedEntry and entryXBarOk
+        touched = pendLong ? high >= pendEntry : low <= pendEntry
+        if touched
+            bracketTouchedEntry := true
+            firstTouchStopEntry := true
+
+var int   pnlLeftTime = na
+var box   pnlRiskBox = na
+var box   pnlRewBox = na
+var line  pnlEntryLn = na
+var line  pnlLp1 = na
+var line  pnlLp2 = na
+var line  pnlLp3 = na
+var float pSnapE = na
+var float pSnapS = na
+var float pSnapT = na
+var float pSnapSl = na
+var bool  pSnapLng = false
+
+if bracketActive and not na(pendEntry)
+    pnlLeftTime := pendLeftT
+    pSnapE := pendEntry
+    pSnapS := pendStop
+    pSnapT := pendTp
+    pSnapLng := pendLong
+    pSnapSl := pendStop
+
+colRf = color.new(c_pnlRiskBg, i_pnlRiskTr)
+colWf = color.new(c_pnlRewBg, i_pnlRewTr)
+bdR = color.new(color.red, 15)
+bdW = color.new(color.lime, 15)
+
+// Session end → freeze planned bracket visuals
+sessClosePlan = sessionEnd and bracketActive and i_showPnl and not na(pSnapE)
+     and not na(pnlLeftTime)
+
+if sessClosePlan
+    int    tL = pnlLeftTime
+    int    tR = time
+    float  en = pSnapE
+    float  slV = pSnapSl
+    float  tpV = pSnapT
+    bool   iL = pSnapLng
+    float  st0 = pSnapS
+    bool   hv = i_exitMode == "Fixed RR" and not na(tpV)
+    float  rTp = na
+    float  rBt = na
+    float  wTp = na
+    float  wBt = na
+    if iL
+        rTp := en
+        rBt := slV
+        if hv
+            wTp := tpV
+            wBt := en
+    else
+        rTp := slV
+        rBt := en
+        if hv
+            wTp := en
+            wBt := tpV
+    float rHz = na(rTp) or na(rBt) ? na : math.abs(rTp - rBt)
+    bool  okR = not na(rHz) and rHz >= syminfo.mintick
+    ladF = i_tradeMode == "Ladder Partials + Runner"
+    y1f = ladF and i_p1_use and i_p1_qty > 0 ? f_limAtR(iL, en, st0, i_p1_R) : na
+    y2f = ladF and i_p2_use and i_p2_qty > 0 ? f_limAtR(iL, en, st0, i_p2_R) : na
+    y3f = ladF and i_p3_use and i_p3_qty > 0 ? f_limAtR(iL, en, st0, i_p3_R) : na
+    if not na(pnlRiskBox)
+        if okR
+            box.set_lefttop(pnlRiskBox, tL, rTp)
+            box.set_rightbottom(pnlRiskBox, tR, rBt)
+            box.set_border_color(pnlRiskBox, bdR)
+            box.set_bgcolor(pnlRiskBox, colRf)
+        else
+            box.delete(pnlRiskBox)
+    if not na(pnlRewBox)
+        if hv and not na(wTp) and math.abs(wTp - wBt) >= syminfo.mintick
+            box.set_lefttop(pnlRewBox, tL, wTp)
+            box.set_rightbottom(pnlRewBox, tR, wBt)
+            box.set_border_color(pnlRewBox, bdW)
+            box.set_bgcolor(pnlRewBox, colWf)
+        else
+            box.delete(pnlRewBox)
+    if not na(pnlEntryLn)
+        line.set_xy1(pnlEntryLn, tL, en)
+        line.set_xy2(pnlEntryLn, tR, en)
+    if not na(y1f) and not na(pnlLp1)
+        line.set_xy1(pnlLp1, tL, y1f)
+        line.set_xy2(pnlLp1, tR, y1f)
+    else if not na(pnlLp1)
+        line.delete(pnlLp1)
+    if not na(y2f) and not na(pnlLp2)
+        line.set_xy1(pnlLp2, tL, y2f)
+        line.set_xy2(pnlLp2, tR, y2f)
+    else if not na(pnlLp2)
+        line.delete(pnlLp2)
+    if not na(y3f) and not na(pnlLp3)
+        line.set_xy1(pnlLp3, tL, y3f)
+        line.set_xy2(pnlLp3, tR, y3f)
+    else if not na(pnlLp3)
+        line.delete(pnlLp3)
+
+    pnlRiskBox := na
+    pnlRewBox := na
+    pnlEntryLn := na
+    pnlLp1 := na
+    pnlLp2 := na
+    pnlLp3 := na
+    pnlLeftTime := na
+
+if sessionEnd
+    bracketActive := false
+    pendEntry := na
+    pendStop := na
+    pendTp := na
+
+if not i_showPnl
+    if not na(pnlRiskBox)
+        box.delete(pnlRiskBox)
+        pnlRiskBox := na
+    if not na(pnlRewBox)
+        box.delete(pnlRewBox)
+        pnlRewBox := na
+    if not na(pnlEntryLn)
+        line.delete(pnlEntryLn)
+        pnlEntryLn := na
+    if not na(pnlLp1)
+        line.delete(pnlLp1)
+        pnlLp1 := na
+    if not na(pnlLp2)
+        line.delete(pnlLp2)
+        pnlLp2 := na
+    if not na(pnlLp3)
+        line.delete(pnlLp3)
+        pnlLp3 := na
+
+pnlDraw = bracketActive and not na(pendEntry) and not na(pendStop) and i_showPnl
+
+if pnlDraw
+    float slV = pendStop
+    bool  iLP = pendLong
+    bool  hv  = i_exitMode == "Fixed RR" ? not na(pendTp) : false
+    float en = pendEntry
+    float tpPx = pendTp
+
+    float rTop = na
+    float rBot = na
+    float wTop = na
+    float wBot = na
+    if iLP
+        rTop := en
+        rBot := slV
+        if hv
+            wTop := tpPx
+            wBot := en
+    else
+        rTop := slV
+        rBot := en
+        if hv
+            wTop := en
+            wBot := tpPx
+    float rH = na(rTop) or na(rBot) ? na : math.abs(rTop - rBot)
+    bool  sr = not na(rH) and rH >= syminfo.mintick
+    lt = pendLeftT
+    int curT = time
+
+    if na(pnlRiskBox) and sr
+        pnlRiskBox := box.new(lt, rTop, curT, rBot, xloc=xloc.bar_time,
+             border_width=2, border_color=bdR, bgcolor=colRf)
+    else if not na(pnlRiskBox)
+        if sr
+            box.set_lefttop(pnlRiskBox, lt, rTop)
+            box.set_rightbottom(pnlRiskBox, curT, rBot)
+        else
+            box.delete(pnlRiskBox)
+            pnlRiskBox := na
+
+    if hv and na(pnlRewBox) and not na(wTop) and math.abs(wTop - wBot) >= syminfo.mintick
+        pnlRewBox := box.new(lt, wTop, curT, wBot, xloc=xloc.bar_time,
+             border_width=2, border_color=bdW, bgcolor=colWf)
+    else if not na(pnlRewBox)
+        if hv and not na(wTop) and math.abs(wTop - wBot) >= syminfo.mintick
+            box.set_lefttop(pnlRewBox, lt, wTop)
+            box.set_rightbottom(pnlRewBox, curT, wBot)
+        else
+            box.delete(pnlRewBox)
+            pnlRewBox := na
+
+    if na(pnlEntryLn)
+        pnlEntryLn := line.new(lt, en, curT, en, xloc=xloc.bar_time,
+             color=c_pnlEntryLn, width=2)
+    else
+        line.set_xy1(pnlEntryLn, lt, en)
+        line.set_xy2(pnlEntryLn, curT, en)
+
+    ldc = color.new(#2a8f6f, 45)
+    ld = i_tradeMode == "Ladder Partials + Runner"
+    zz1 = ld and i_p1_use and i_p1_qty > 0 ? f_limAtR(iLP, pendEntry, pendStop, i_p1_R) : na
+    zz2 = ld and i_p2_use and i_p2_qty > 0 ? f_limAtR(iLP, pendEntry, pendStop, i_p2_R) : na
+    zz3 = ld and i_p3_use and i_p3_qty > 0 ? f_limAtR(iLP, pendEntry, pendStop, i_p3_R) : na
+
+    if not na(zz1)
+        if na(pnlLp1)
+            pnlLp1 := line.new(lt, zz1, curT, zz1, xloc=xloc.bar_time,
+                 color=ldc, width=1, style=line.style_dashed)
+        else
+            line.set_xy1(pnlLp1, lt, zz1)
+            line.set_xy2(pnlLp1, curT, zz1)
+    else if not na(pnlLp1)
+        line.delete(pnlLp1)
+        pnlLp1 := na
+    if not na(zz2)
+        if na(pnlLp2)
+            pnlLp2 := line.new(lt, zz2, curT, zz2, xloc=xloc.bar_time,
+                 color=ldc, width=1, style=line.style_dashed)
+        else
+            line.set_xy1(pnlLp2, lt, zz2)
+            line.set_xy2(pnlLp2, curT, zz2)
+    else if not na(pnlLp2)
+        line.delete(pnlLp2)
+        pnlLp2 := na
+    if not na(zz3)
+        if na(pnlLp3)
+            pnlLp3 := line.new(lt, zz3, curT, zz3, xloc=xloc.bar_time,
+                 color=ldc, width=1, style=line.style_dashed)
+        else
+            line.set_xy1(pnlLp3, lt, zz3)
+            line.set_xy2(pnlLp3, curT, zz3)
+    else if not na(pnlLp3)
+        line.delete(pnlLp3)
+        pnlLp3 := na
+
+var box orbBox = na
+
+if i_showOrb and orbJustFinalized and not na(orbStartTime) and not na(orbEndClose)
+    if not na(orbBox)
+        box.delete(orbBox)
+    orbBox := box.new(orbStartTime, orbHigh, orbEndClose, orbLow,
+         border_color = c_orbBorder,
+         bgcolor      = c_orb,
+         xloc         = xloc.bar_time,
+         extend       = extend.none)
+
+plot(i_showPnl and bracketActive and not na(pendEntry) ? pendEntry : na,
+     "Bracket — Entry (stop)",
+     color     = c_pnlEntryLn,
+     linewidth = 2,
+     style     = plot.style_linebr)
+
+plot(i_showPnl and bracketActive and not na(pendStop) ? pendStop : na,
+     "Bracket — SL", color=c_sl, linewidth=2, style=plot.style_linebr)
+
+plot(i_showPnl and bracketActive and i_exitMode == "Fixed RR"
+     and not na(pendTp) ? pendTp : na,
+     "Bracket — TP", color=c_tp, linewidth=2, style=plot.style_linebr)
+
+plot(i_showLevels and not i_showPnl and bracketActive ? pendStop : na,
+     "SL(plan)", color=c_sl, linewidth=2, style=plot.style_linebr)
+
+plot(i_showLevels and not i_showPnl and bracketActive and i_exitMode == "Fixed RR"
+          and not na(pendTp)
+     ? pendTp : na,
+     "TP(plan)", color=c_tp, linewidth=2, style=plot.style_linebr)
+
+pDirLng = pendLong
+
+// Ladder partial guides: show whenever bracket is live AND (PnL bands OR thin levels)
+showLadPlans = bracketActive and (i_showPnl or i_showLevels)
+     and i_tradeMode == "Ladder Partials + Runner"
+
+lim1 =
+     showLadPlans and i_p1_use and i_p1_qty > 0
+     ? f_limAtR(pDirLng, pendEntry, pendStop, i_p1_R) : na
+lim2 =
+     showLadPlans and i_p2_use and i_p2_qty > 0
+     ? f_limAtR(pDirLng, pendEntry, pendStop, i_p2_R) : na
+lim3 =
+     showLadPlans and i_p3_use and i_p3_qty > 0
+     ? f_limAtR(pDirLng, pendEntry, pendStop, i_p3_R) : na
+
+plot(lim1, "P1 plan", color=color.new(color.aqua, 20), linewidth=1,
+     style=plot.style_linebr)
+plot(lim2, "P2 plan", color=color.new(color.teal, 20), linewidth=1,
+     style=plot.style_linebr)
+plot(lim3, "P3 plan", color=color.new(color.blue, 40), linewidth=1,
+     style=plot.style_linebr)
+
+plotshape(sigLongShown, title="ORB Long setup", style=shape.triangleup,
+     location=location.belowbar, color=c_long, size=size.small)
+
+plotshape(sigShortShown, title="ORB Short setup", style=shape.triangledown,
+     location=location.abovebar, color=c_short, size=size.small)
+
+plotshape(firstTouchStopEntry and i_showEntryX and pendLong,
+     title      = "Stop-entry fill (long)",
+     style      = shape.xcross,
+     location   = location.belowbar,
+     color      = color.new(color.black, 0),
+     size       = size.small)
+
+plotshape(firstTouchStopEntry and i_showEntryX and not pendLong,
+     title      = "Stop-entry fill (short)",
+     style      = shape.xcross,
+     location   = location.abovebar,
+     color      = color.new(color.black, 0),
+     size       = size.small)
+
+plot(i_useHtf ? htfEma : na, "HTF EMA", color=color.new(color.orange, 30),
+     linewidth=1)
+
+alertcondition(sigLongShown, "ORB PFK • Long bracket armed",
+     "Long stop-entry plan at OR high (see SL/TP on chart)")
+
+alertcondition(sigShortShown, "ORB PFK • Short bracket armed",
+     "Short stop-entry plan at OR low (see SL/TP on chart)")
+
+alertcondition(firstTouchStopEntry and i_entryXMode != "Off", "ORB PFK • Planned stop-entry touched",
+     "Stop level traded through — see bracket timing mode in indicator settings")
+
+var table info = table.new(position.top_right, 2, 17,
+     bgcolor=color.new(color.black, 82), border_width=1)
+
+f_row(_r, _k, _v, _c) =>
+    table.cell(info, 0, _r, _k,
+         text_color=color.silver, text_size=size.tiny)
+    table.cell(info, 1, _r, _v,
+         text_color=_c,         text_size=size.tiny)
+
+if i_showInfo and barstate.islast
+    table.clear(info, 0, 0, 1, 16)
+    table.cell(info, 0, 0, "ORB PFK ind", text_color=color.yellow)
+    table.cell(info, 1, 0, str.format("{0}m ORB", i_orbMinutes),
+         text_color=color.yellow)
+    f_row(1, "Mode", i_relaxedBt ? "RELAXED" : "STRICT",
+         i_relaxedBt ? color.orange : color.silver)
+    f_row(2, "ORB H",
+         na(orbHigh) ? "—" : str.tostring(orbHigh, format.mintick), color.white)
+    f_row(3, "ORB L",
+         na(orbLow) ? "—" : str.tostring(orbLow, format.mintick), color.white)
+    f_row(4, "1st candle",
+         firstCandleDir == 1 ? "Bull Only" :
+         firstCandleDir == -1 ? "Bear Only" : "Doji",
+         firstCandleDir == 1 ? c_long :
+         firstCandleDir == -1 ? c_short : color.gray)
+    f_row(5, "SL mode", i_slMode, color.white)
+    szTxtInd = i_posMode == "Fixed Contracts"
+         ? str.format("{0} lot", str.tostring(pendQty))
+         : "% risk / proxy $" + str.tostring(i_proxyEquity / 1000.0, "#.#") + "k"
+    f_row(6, "Size ref", bracketActive ? szTxtInd : "—",
+         bracketActive ? color.white : color.gray)
+    runnerTxt =
+         bracketActive and i_tradeMode == "Ladder Partials + Runner"
+         ? str.format("Σ={0} | run={1}", str.tostring(sumLadderQty),
+              str.tostring(pendRunnerQty))
+         : (bracketActive ? "full" : "—")
+    f_row(7, "Ladder", runnerTxt, color.white)
+    f_row(8, "Sess Δ%",
+         str.tostring(dailyPnLPct, "#.#") + " %",
+         dailyPnLPct >= 0 ? c_long : c_short)
+    f_row(9, "Setups today",
+         str.tostring(setupsArmCount) + "/" + str.tostring(i_maxTrades),
+         setupsArmCount >= i_maxTrades ? c_short : color.white)
+    planE = bracketActive and not na(pendEntry)
+         ? str.tostring(pendEntry, format.mintick) : "—"
+    planS = bracketActive and not na(pendStop)
+         ? str.tostring(pendStop, format.mintick) : "—"
+    planT = bracketActive and i_exitMode == "Fixed RR" and not na(pendTp)
+         ? str.tostring(pendTp, format.mintick)
+         : bracketActive ? "EoD (no fixed TP)" : "—"
+    f_row(10, "Stop entry", planE, bracketActive ? c_pnlEntryLn : color.gray)
+    f_row(11, "Stop loss", planS, bracketActive ? c_sl : color.gray)
+    f_row(12, "TP / exit", planT, bracketActive ? c_tp : color.gray)
+    f_row(13, "X timing", i_entryXMode, color.silver)

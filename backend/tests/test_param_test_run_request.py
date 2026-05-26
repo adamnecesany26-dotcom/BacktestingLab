@@ -1,9 +1,9 @@
-"""RunRequest accepts param_test validation mode and param_test config shape."""
+"""RunRequest validation_mode: single | walk_forward | param_test | oos_split."""
 
 from app.models.run import RunRequest
 
 
-def test_run_request_param_test_validation_mode():
+def test_run_request_param_test_ok():
     r = RunRequest(
         instrument="NQ",
         timeframe="1d",
@@ -12,14 +12,31 @@ def test_run_request_param_test_validation_mode():
         validation_config={
             "param_test": {
                 "max_runs": 24,
-                "param_ranges": {
-                    "target_rr": {"enabled": True, "min": 1.0, "max": 3.0},
-                },
+                "param_ranges": {"atr_pct": {"enabled": True, "min": 0.1, "max": 0.5, "step": 0.1}},
             }
         },
     )
     assert r.validation_mode == "param_test"
-    assert isinstance(r.validation_config, dict)
-    pt = r.validation_config.get("param_test")
-    assert isinstance(pt, dict)
-    assert pt.get("max_runs") == 24
+
+
+def test_run_request_oos_split_ok():
+    r = RunRequest(
+        instrument="NQ",
+        timeframe="1d",
+        code="x",
+        validation_mode="oos_split",
+        validation_config={"oos_ratio": 0.25},
+    )
+    assert r.validation_mode == "oos_split"
+
+
+def test_run_request_walk_forward_ok():
+    r = RunRequest(
+        instrument="NQ",
+        timeframe="1d",
+        code="x",
+        validation_mode="walk_forward",
+        validation_config={"folds": 4, "test_ratio": 0.2},
+    )
+    assert r.validation_mode == "walk_forward"
+    assert r.validation_config == {"folds": 4, "test_ratio": 0.2}

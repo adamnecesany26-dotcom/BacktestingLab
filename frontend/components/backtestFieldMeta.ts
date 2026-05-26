@@ -10,219 +10,128 @@ export interface BacktestFieldHelp {
 }
 
 export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
-  instrumentType: {
-    id: "instrumentType",
-    title: "Instrument Type",
-    whatItMeans: "Volba trzniho segmentu, pro ktery se maji nacist data a pravidla vypoctu PnL.",
-    whyItMatters: "Kazdy trh ma jinou mikrostrukturu a odlisny model nakladu.",
-    howToUse: [
-      "Pro index futures pouzij `futures`.",
-      "Pro jednotlive akcie pouzij `stocks`.",
-      "Pro FX pary pouzij `forex` a nastav lot/pip parametry.",
-    ],
-    recommendedDefault: "Zacni na trhu, ktery opravdu obchodujes (typicky futures).",
-    withoutIt: "Muzes pouzivat spatny cenovy model a dostat nerealne vysledky.",
-    bestPractices: ["Nemixuj typy trhu v jednom baseline runu.", "Pri zmene typu zkontroluj instrument config."],
-  },
   instrument: {
     id: "instrument",
     title: "Instrument",
-    whatItMeans: "Konretni symbol s historickymi daty (napr. NQ, ES).",
-    whyItMatters: "Strategie muze fungovat na jednom trhu a selhavat na jinem.",
+    whatItMeans:
+      "Konkrétní futures symbol a datový soubor (např. NQ, MNQ). Jeden Run cílí na jeden instrument — v tomto UI neposíláš portfolio vícero nástrojů najednou.",
+    whyItMatters: "Strategie může na jednom trhu fungovat a na jiném selhat.",
     howToUse: [
-      "Vyber symbol, pro ktery mas realistickou obchodni hypotezu.",
-      "Over, ze delka dostupnych dat pokryva tvoje testovaci obdobi.",
+      "Vyber symbol odpovídající hypotéze.",
+      "Ověř, že dostupná historie pokrývá období, které testuješ.",
     ],
-    recommendedDefault: "Pouzij hlavni trh strategie, ne nahodny symbol.",
-    withoutIt: "Nebudes vedet, jestli edge opravdu patri k zamyslenemu trhu.",
-    bestPractices: ["Pro porovnani trhu del samostatne branche."],
+    recommendedDefault: "Hlavní trh strategie.",
+    withoutIt: "Nevíš, zda edge patří k záměru.",
+    bestPractices: ["Jiný trh = samostatná větev experimentu."],
   },
   years: {
     id: "years",
-    title: "Delka backtestu (roky)",
-    whatItMeans: "Pocet let historie, ktere vstupuji do simulace.",
-    whyItMatters: "Maly vzorek casto nadhodnocuje vykon a podhodnocuje drawdown.",
+    title: "Délka backtestu (roky)",
+    whatItMeans: "Kolik posledních let historie ze souboru vstupuje do simulace.",
+    whyItMatters: "Krátký vzorek často přehání výkon nebo skryje špatné období.",
     howToUse: [
-      "Pouzij minimalne tolik dat, aby strategie prosla vice trznimi rezimy.",
-      "U kratkych intradennich edge je vhodna delsi historie.",
+      "Ber dost dat na více tržních režimů.",
+      "U častých vstupů často potřebuješ delší okno než u řídkých setupů.",
     ],
-    recommendedDefault: "1-3 roky pro prvni iterace, vice pro finalni validaci.",
-    withoutIt: "Hrozi, ze test zachyti jen prizenive obdobi trhu.",
-    bestPractices: ["Pri zaverecnem hodnoceni testuj delsi horizont nez pri rychlem prototypu."],
+    recommendedDefault: "1–3 roky na iterace; déle před finálním verdiktem.",
+    withoutIt: "Výsledek nemusí přežít jiný úsek trhu.",
+    bestPractices: ["Při A/B porovnání drž stejnou délku."],
   },
   tickSize: {
     id: "tickSize",
     title: "Tick Size",
-    whatItMeans: "Minimalni cenovy krok futures kontraktu.",
-    whyItMatters: "PnL i fill logika jsou zavisle na spravne granularite ceny.",
-    howToUse: ["Nastav podle specifikace kontraktu brokera/exchange."],
-    recommendedDefault: "NQ typicky 0.25.",
-    withoutIt: "Backtest muze pocitat neexistujici ceny a zkreslit vysledky.",
-    bestPractices: ["Pri zmene instrumentu tick size vzdy znovu over."],
+    whatItMeans: "Nejmenší cenový krok u futures kontraktu.",
+    whyItMatters: "PnL a zaokrouhlení cen závisí na správné granularitě.",
+    howToUse: ["Doplň podle specifikace burzy/brokera."],
+    recommendedDefault: "NQ typicky 0,25.",
+    withoutIt: "Simulace může používat nereálné ceny.",
+    bestPractices: ["Při změně symbolu tick size znovu ověř."],
   },
   valuePerTick: {
     id: "valuePerTick",
     title: "Value Per Tick (USD)",
-    whatItMeans: "Kolik penez odpovida jednomu ticku pohybu ceny.",
-    whyItMatters: "Primo urcuje velikost zisku/ztraty na obchod.",
-    howToUse: ["Nastav dle kontraktovych specifikaci."],
-    recommendedDefault: "NQ typicky 5 USD na tick.",
-    withoutIt: "PnL bude v nespravne menove skale.",
-    bestPractices: ["Vzdy validuj s realnymi contract specs."],
-  },
-  shareSize: {
-    id: "shareSize",
-    title: "Position Size (stocks)",
-    whatItMeans: "Pocet akcii na obchod.",
-    whyItMatters: "Riziko i navratnost jsou linearne zavisle na velikosti pozice.",
-    howToUse: ["Nastav konzistentni velikost nebo navaz na risk model."],
-    recommendedDefault: "100 akcii pro jednoduchy baseline.",
-    withoutIt: "Srovnani runu bude nepresne kvuli rozdilne expozici.",
-    bestPractices: ["Nemen size pri kazdem runu bez evidovaneho duvodu."],
-  },
-  lotSize: {
-    id: "lotSize",
-    title: "Lot Size (forex)",
-    whatItMeans: "Objem obchodu ve forexe.",
-    whyItMatters: "Urcuje nominalni expozici a citlivost na pip pohyb.",
-    howToUse: ["Nastav podle pravidel risk managementu."],
-    recommendedDefault: "1 lot jen pokud odpovida tvemu kapitalu; jinak mensi.",
-    withoutIt: "Strategie muze vypadat nerealne agresivne nebo naopak prilis slabe.",
-    bestPractices: ["Drz konzistentni risk na obchod napric runy."],
-  },
-  pipSize: {
-    id: "pipSize",
-    title: "Pip Size",
-    whatItMeans: "Minimalni jednotka pohybu ceny pro forex par.",
-    whyItMatters: "Ovlivnuje prepocet z cenoveho pohybu na pips a PnL.",
-    howToUse: ["Nastav podle daneho paru (casto 0.0001, nekdy 0.01)."],
-    recommendedDefault: "0.0001 pro vetsinu major paru.",
-    withoutIt: "PnL metriky budou matematicky posunute.",
-    bestPractices: ["U JPY paru over pip convention separatne."],
-  },
-  pipValue: {
-    id: "pipValue",
-    title: "Pip Value (USD)",
-    whatItMeans: "Hodnota jednoho pipu v dolarech pri zvolenem lotu.",
-    whyItMatters: "Urcuje citlivost equity na pohyb ceny.",
-    howToUse: ["Nastav konzistentne s lotSize a menovym parem."],
-    recommendedDefault: "10 USD je bezny orientacni baseline pro standard lot.",
-    withoutIt: "Risk model nebude odpovidat realite.",
-    bestPractices: ["Po zmene lotSize prepocitej i pipValue."],
+    whatItMeans: "Dolarová hodnota jednoho ticku pohybu ceny.",
+    whyItMatters: "Určuje velikost zisku a ztráty na kontrakt.",
+    howToUse: ["Zadej dle kontraktu (specifikace)."],
+    recommendedDefault: "NQ často 5 USD na tick.",
+    withoutIt: "Equity škála neodpovídá skutečnosti.",
+    bestPractices: ["Shoda s broker dokumentací."],
   },
   initialCapital: {
     id: "initialCapital",
-    title: "Pocatecni kapital",
-    whatItMeans: "Startovni equity pro simulaci.",
-    whyItMatters: "Ovlivnuje relativni metriky i odolnost strategie v drawdownu.",
-    howToUse: ["Nastav realisticky kapital, se kterym bys strategii spoustel."],
-    recommendedDefault: "100000 jako neutralni baseline pro porovnani.",
-    withoutIt: "Srovnani runu bude matouci kvuli jine skale equity.",
-    bestPractices: ["Nemen kapital mezi testy, pokud zrovna netestujes position sizing."],
+    title: "Počáteční kapitál",
+    whatItMeans: "Výchozí hotovost účtu v simulaci.",
+    whyItMatters: "Mění relativní drawdown a škálu equity křivky.",
+    howToUse: ["Zadej částku blízkou reálnému účtu, se kterým počítáš."],
+    recommendedDefault: "100000 jako neutrální srovnávací baseline.",
+    withoutIt: "Porovnání mezi běhy je matoucí.",
+    bestPractices: ["Neměň kapitál mezi runy, když netestuješ sizing."],
   },
   slippagePerc: {
     id: "slippagePerc",
     title: "Slippage (%)",
-    whatItMeans: "Prumerny skluz mezi ocekavanou a skutecnou fill cenou.",
-    whyItMatters: "Bez slippage byva backtest nadhodnoceny oproti live exekuci.",
-    howToUse: ["Nastav konzervativni odhad podle likvidity trhu a stylu vstupu."],
-    recommendedDefault: "0.05%-0.15% podle trhu a timeframe.",
-    withoutIt: "Hrozi optimistic bias, hlavne u rychlych strategii.",
-    bestPractices: ["U volatilnich trhu testuj i horsi variantu slippage."],
-  },
-  runTimeoutSec: {
-    id: "runTimeoutSec",
-    title: "Max. doba běhu backtestu (sekundy)",
     whatItMeans:
-      "Kolik sekund může backend čekat na dokončení engine subprocessu před ukončením běhu (ochrana proti visícím jobům).",
-    whyItMatters:
-      "Pomalý počítač, slabé připojení nebo těžká strategie může překročit krátký limit — run se pak zastaví i když engine ještě počítá.",
-    howToUse: [
-      "Zvyš hodnotu (např. 7200–14400) pokud často vidíš „Run timed out“ kolem určitého % progress.",
-      "0 = bez časového limitu na straně runneru (pokud to nasazení povolí).",
-      "Globální výchozí na serveru lze nastavit i proměnnou RUN_TIMEOUT_SEC.",
-    ],
-    recommendedDefault: "3600 s (1 h) jako rozumný kompromis; náročné runy 7200+.",
-    withoutIt: "Krátký server default může useknout dlouhé backtesty.",
-    bestPractices: ["Na sdíleném serveru nepoužívej neomezeně 0 bez dohody — riziko zahlcení."],
+      "Průměrné zhoršení fill ceny oproti očekávání (v %). Po změně instrumentu se pole předvyplní středem typického rozmezí pro daný kontrakt (např. NQ, MNQ, ES…).",
+    whyItMatters: "Bez skluzu backtest často přestřelí výkon.",
+    howToUse: ["Uprav podle stylu vstupu, likvidity a timeframu, pokud znáš reálné chování."],
+    recommendedDefault: "Automaticky podle symbolu; ručně konzervativnější při agresivních vstupech.",
+    withoutIt: "Příliš optimistické zisky.",
+    bestPractices: ["Při porovnávání runů drž stejný skluz, pokud neladíš právě provádění."],
   },
-  commissionPerc: {
-    id: "commissionPerc",
-    title: "Komise (%)",
-    whatItMeans: "Transakcni naklad za vstup/vystup obchodu.",
-    whyItMatters: "Mala komise muze znicit edge u casto obchodujicich strategii.",
-    howToUse: ["Zadej realnou uroven fee od brokera plus burzovni poplatky."],
-    recommendedDefault: "Konzervativni realna hodnota, ne nula.",
-    withoutIt: "Vyjde ti nerealne vysoky profit factor i cisty zisk.",
-    bestPractices: ["Nejdriv testuj s realnymi fee, az pak optimalizuj logiku."],
+  commissionPerContract: {
+    id: "commissionPerContract",
+    title: "Komise (USD / kontrakt / strana)",
+    whatItMeans:
+      "Pevný poplatek v USD za jednu stranu obchodu (jeden kontrakt). Round-trip = vstup + výstup (2× hodnota při jednom kontraktu).",
+    whyItMatters: "U scalpingu a častých obratů mají procentní chyby na poplatcích velký dopad — pevná částka za kontrakt odpovídá futures účtům.",
+    howToUse: ["Sečti burzu + brokera podle svého tarifu a zadej částku za stranu."],
+    recommendedDefault: "0 jako neutrální výchozí; doplň reálnou hodnotu před závěry o výkonu.",
+    withoutIt: "Čistý výnos může být nadhodnocený.",
+    bestPractices: ["Při srovnávání strategií drž stejnou komisi."],
   },
   selectedIndicatorIds: {
     id: "selectedIndicatorIds",
-    title: "Indikatory",
-    whatItMeans: "Seznam indikatoru, ktere se maji zahrnout do backtestu.",
-    whyItMatters: "Nepotvrzene nebo nevybrane indikatory se do runu nepromitnou.",
+    title: "Indikátory",
+    whatItMeans: "Které indikátory se zkopírují do běhu (`indicators/`).",
+    whyItMatters: "Bez výběru strategie nemusí mít kód, který importuješ.",
     howToUse: [
-      "Zaskrtni indikatory, ktere strategie vyzaduje.",
-      "Po zmene vyberu klikni na Potvrdit.",
+      "Zaškrtni jen to, co `main.py` opravdu importuje.",
+      "Po změně klikni Potvrdit.",
     ],
-    recommendedDefault: "Pouzit jen indikatory, ktere strategie skutecne importuje.",
-    withoutIt: "Backtest muze bezet bez potrebnych vypoctu nebo s jinou logikou.",
-    bestPractices: ["Drz vyber minimalni a transparentni."],
+    recommendedDefault: "Minimalizuj závislosti.",
+    withoutIt: "Import error nebo jiná logika, než čekáš.",
+    bestPractices: ["Drž seznam přehledný."],
   },
   selectedModuleIds: {
     id: "selectedModuleIds",
     title: "Moduly",
-    whatItMeans: "Seznam modulu, jejichz vystupy a parametry se pouziji v runu.",
-    whyItMatters: "Moduly casto nesou kontext (zony, markery), bez ktereho je signal nekompletni.",
+    whatItMeans: "Které moduly (swing, zóny, …) jdou do běhu spolu se strategií.",
+    whyItMatters: "Často nesou zóny a markery bez kterých signál nedává smysl.",
     howToUse: [
-      "Vyber relevantni moduly a potvrd vyber.",
-      "Zkontroluj jejich VIEW_PARAMS v sekci Parameters.",
+      "Vyber moduly a Potvrdit.",
+      "PARAM/VIEW parametry lad na záložkách modulů.",
     ],
-    recommendedDefault: "Zacni 1-2 moduly, ne vsechny najednou.",
-    withoutIt: "Muzes testovat jinou strategii, nez sis myslel.",
-    bestPractices: ["Pri pridani noveho modulu over nejdriv View mode."],
+    recommendedDefault: "1–2 moduly na začátek.",
+    withoutIt: "Backtest nemusí odpovídat tomu, co vidíš ve View.",
+    bestPractices: ["Nový modul nejdřív ověř ve View."],
   },
   validationMode: {
     id: "validationMode",
     title: "Validation mode (režim ověření)",
     whatItMeans:
-      "Říká aplikaci, jestli má strategii zkoušet jen „jako na jednom listu papíru“, nebo jestli si z dat vyhradí skrytou část, na které ji nikdy předtím neladíš — podobně jako když se učíš z učebnice a až pak dostaneš **test z kapitoly, kterou sis doma neprohlížel**. " +
-      "**Single run** = celá historie najednou; strategie vidí všechna data „najednou“ a snadno se stane, že výsledek vypadá skvěle jen proto, že jsi (nevědomky) přizpůsobil logiku právě těm datům. " +
-      "**OOS split** (out-of-sample) = data se rozdělí: větší kus použiješ jako „učení“ a menší kus je **záložní zkouška** — na tom druhém kusu engine spočítá výsledek zvlášť. " +
-      "**Walk-forward** = opakuje se to víckrát za sebou: jako kdyby ses pořád posouval v čase — nejdřív trénuješ na starších datech a testuješ na kousek dopředu, pak okno posuneš a znovu; zjistíš, jestli strategie drží i když se mění období trhu.",
+      "**Single run** = celá zvolená historie najednou — rychlá kontrola logiky a metrik. " +
+      "**Walk-forward** = posuvná okna v čase (trénink → test v každém kole). " +
+      "Statický OOS split a OAT param test z tohoto menu zmizely; out-of-sample si lze řešit ručně (jiný rozsah dat / mimo aplikaci).",
     whyItMatters:
-      "Bez OOS nebo walk-forward je velmi snadné **přeladit strategii na minulost** (overfitting): graf vypadá krásně, ale v reálném obchodování selže. Tohle nastavení je nejjednodušší způsob, jak si říct: „opravdu to není jen náhoda na jednom úseku?“",
+      "Single run neodděluje automaticky „trénink“ a „zkoušku“ — výsledek je výkon na jednom souvislém úseku.",
     howToUse: [
-      "**Single** zapínej jen když chceš zkontrolovat, že kód vůbec běží, nebo když ladíš něco technického (ne finální rozhodnutí o penězích).",
-      "Jakmile chceš věřit výsledku o trochu víc, přejdi na **OOS split** — je to rozumný kompromis mezi přísností a rychlostí.",
-      "**Walk-forward** použij, když chceš nejpřísnější pohled: strategie musí obstát ve více „fázích“ času, ne jen jednou.",
-      "Čím přísnější režim, tím déle může běh trvat — to je normální.",
+      "**Single** pro ladění a rychlé srovnání na stejném okně.",
+      "**Walk-forward** pro více testovacích segmentů v jednom běhu.",
     ],
-    recommendedDefault: "Na běžné zkoušení: OOS split. Před tím, než bys strategii „posvětil“: walk-forward.",
-    withoutIt:
-      "Zůstaneš u iluze, že jeden pěkný graf = důkaz. Trh v budoucnu nemusí vypadat jako ten jeden úsek historie, který sis právě prohlížel.",
+    recommendedDefault: "Single pro iterace; walk-forward pro časově náročnější pohled.",
+    withoutIt: "—",
     bestPractices: [
-      "Když zapneš **sweep** (hledání parametrů), vždy k tomu přidej OOS nebo walk-forward — jinak si jen systematicky hledáš „nejlepší číslo“ na stejných datech.",
-    ],
-  },
-  oosRatio: {
-    id: "oosRatio",
-    title: "OOS ratio (kolik dat je „zkouška“)",
-    whatItMeans:
-      "Číslo mezi 0 a 1 (např. 0,25 = 25 %). Říká: **tolik procent nejnovějších dat si engine nechá stranou jako kontrolní test**. Starší část dat použije k běhu strategie na tréninkové části, ale výsledek na tom **vyhrazeném konci** počítá zvlášť — ty jsi na ten konec strategii „netrénoval“ očima ladění v této simulaci. " +
-      "Představ si knihu: většinu kapitol použiješ na pochopení, ale poslední kapitolu si necháš jako **sudí**, který řekne, jestli to doopravdy chápeš.",
-    whyItMatters:
-      "Čím větší podíl OOS, tím **přísnější** je kontrola (méně místa na „nafouknutí“ výsledku na tréninku), ale zároveň **kratší** je část, na které strategie „trénuje“ — musíš balancovat.",
-    howToUse: [
-      "0,20 až 0,30 (20–30 %) bývá rozumný start: kontrolní kus není moc malý (pak by byl hlučný), ani moc velký (pak málo dat na trénink).",
-      "0,25 znamená zhruba: poslední čtvrtina času = zkouška, první tři čtvrtiny = tréninková část simulace.",
-      "Menší OOS (např. 0,10) používej jen když máš málo dat celkově — jinak je kontrola slabá.",
-    ],
-    recommendedDefault: "0,25 (čtvrtina dat jako kontrola).",
-    withoutIt:
-      "Všechno počítáš na stejném pásu dat bez odděleného „sudího“ úseku — snadno uvěříš výsledku, který platí jen pro ten jeden mix dat.",
-    bestPractices: [
-      "Když porovnáváš dva běhy, drž stejné OOS ratio, ať srovnání dává smysl.",
+      "Při robustness sweepu na single runu interpretuj špičky metrik opatrně.",
     ],
   },
   wfFolds: {
@@ -331,14 +240,12 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "runFixedSeed",
     title: "Fixní run seed (pevné „semínko“ náhody)",
     whatItMeans:
-      "Počítačová **náhoda** ve skutečnosti vychází z čísla zvaného **seed** (semínko). Když je seed **stejný** a vstupy (data, kód, parametry) jsou stejné, dostaneš **stejnou sekvenci** „náhodných“ rozhodnutí tam, kde ji engine používá — např. u některých **Monte Carlo** režimů, **náhodného sweepu** parametrů nebo **block bootstrapu**. " +
-      "Analogie: místo pokaždé nové kostky si **označíš startovní hod** — při stejném označení padne stejná série hodů.",
+      "Náhodné části v engine (např. náhodný sweep) vycházejí z čísla seed. Stejný seed + stejný kód a data dá stejné náhodné rozhodnutí.",
     whyItMatters:
       "Bez fixního seedu můžeš spustit „stejný“ test dvakrát a vidět **drobné rozdíly** v číslech — ne nutně proto, že by se změnil tvůj nápad, ale kvůli náhodné složce. Fixní seed je užitečný pro **ladění**, **sdílení výsledků** („u mě to dělá přesně tohle“) a **audit**.",
     howToUse: [
-      "**Zapni** (a zapiš číslo seedu do poznámek), když chceš **opakovatelnost** — např. kontroluješ bug nebo ukazuješ výsledek někomu jinému.",
-      "**Vypni** při čistém průzkumu, když chceš, aby každý běh dostal **jinou náhodu** (typicky podle času).",
-      "U **batch/matrix** běhů: stejný „parent“ seed často znamená **stejný start náhody v každém dílčím runu** — dobře pro srovnání konfigurací „jablko s jablkem“ (záleží na implementaci v manifestu).",
+      "**Zapni** (a zapiš číslo seedu do poznámek), když chceš **opakovatelnost** — ladění bugů, audit, sdílení čísel.",
+      "**Vypni** při čistém průzkumu, když chceš u sweepu jiný náhodný výběr každý run.",
     ],
     recommendedDefault: "Pro běžné zkoušení často vypnuto; pro regresní test nebo dokumentaci zapni a použij např. 42.",
     withoutIt:
@@ -434,7 +341,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     whyItMatters:
       "Strategie často **žije nebo umírá na detailech**: malá změna čísla a z „geniální“ strategie je „náhodná“. Sweep ukáže, jestli je výsledek **stabilní** nebo jestli jsi jen **trefil jedno šťastné číslo**.",
     howToUse: [
-      "**Nikdy** neber nejlepší výsledek ze sweepu jako důkaz samo o sobě — čím víc zkoušíš, tím větší šance, že **něco** náhodou vyjde (viz varování u batch / multiple testing).",
+      "**Nikdy** neber nejlepší výsledek ze sweepu jako důkaz sám o sobě — čím víc kombinací zkusíš, tím větší šance náhodného výskoku (trial count v Analytics).",
       "Kombinuj s **OOS nebo walk-forward** — jinak optimalizuješ jen na jednom kusu historie (jako učení se odpovědí na testu, který už znáš zpaměti).",
       "Začátek: **random** = rychle „pročechrá“ prostor; **grid** = když už víš zhruba úzký rozsah a chceš ho **projít pořádně**.",
     ],
@@ -466,103 +373,74 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
   },
   monteCarloEnabled: {
     id: "monteCarloEnabled",
-    title: "Monte Carlo (náhodné „co kdyby“ scénáře)",
+    title: "Monte Carlo (přesunuto)",
     whatItMeans:
-      "**Jak to u nás přesně běží (pořadí kroků):** " +
-      "1) **Nejdřív** engine **dokončí celý backtest** na datech — projde svíčky, strategie otevře/zavře obchody a vznikne **seznam uzavřených obchodů** s jejich **PnL**. " +
-      "2) **Až potom**, stále **ve stejném jednom Runu** (stejný engine běh), engine z těchto obchodů udělá **Monte Carlo**: mnohokrát **náhodně přeskupí** (bootstrap) jejich zisky/ztráty podle zvoleného režimu a z toho spočítá např. **rozptyl drawdownu**, **konečné equity** a odhad **risk of ruin**. " +
-      "**Neběží to „vedle sebe“ jako druhý paralelní backtest** — je to **druhá fáze** hned po tom hlavním: nejdřív simulace strategie, pak statistika z výsledných obchodů. " +
-      "**Kde to uvidíš:** po doběhnutí běhu v **výsledcích** — v přehledu metrik / **Analytics** je sekce typu **Robustness & Monte Carlo** (počet simulací, metoda, režim, risk of ruin, poznámka). Ve struktuře výsledku je to pole **`monteCarlo`**. **Žádný samostatný progress bar jen pro MC** — prodlouží se celkový čas jednoho Run; loading pořád kryje celý výpočet. " +
-      "Když strategie **neuzavře ani jeden obchod**, Monte Carlo **nemá z čeho počítat** a engine ho v podstatě přeskočí / vrátí hlášku, že MC nebylo možné.",
+      "Monte Carlo už **nespouštíš z backtest konfigurace**. Shuffle simulace a prop-firm challenge běží v hlavní záložce **Monte Carlo** na uložených výsledcích runu.",
     whyItMatters:
-      "Jedna historická křivka je **jeden příběh**. Trh v budoucnu **neopakuje** minulost řádek po řádku. MC ti z **těch samých** uzavřených obchodů ukáže, jak moc by se mohla změnit „škola“ **jiným pořadím** výsledků — jestli je výsledek spíš **robustní**, nebo **křehký**.",
+      "Oddělení šetří čas běhu backtestu a dává samostatný prostor pro simulace a grafy v prohlížeči.",
     howToUse: [
-      "Zapni u kandidátů, u kterých chceš kromě **jedné** equity křivky i **rozptyl rizika** po doběhnutí běhu.",
-      "Po Run otevři **Analytics** (nebo horní přehled metrik) a najdi blok **Monte Carlo** — tam jsou čísla z té **druhé fáze**.",
-      "Čti i **horší kvantily** (např. drawdown p90/p95), ne jen střed — a přečti si **note** u výsledku MC v UI.",
+      "Ulož výsledek backtestu, přepni na záložku Monte Carlo, vyber run vlevo a spusť typ simulace.",
+      "Starší uložené runy mohou stále obsahovat pole `monteCarlo` z dřívějšího serverového výstupu.",
     ],
-    recommendedDefault: "Zapnuto pro kandidáty, které už prošly základní logikou a validací dat.",
-    withoutIt:
-      "Výsledky uvidíš **bez** pole `monteCarlo` / bez bloku MC v Analytics — zůstane jen **jedna** naměřená cesta z backtestu.",
-    bestPractices: [
-      "MC **nedokazuje** budoucnost — je to **bootstrap z minulých obchodů** v tom běhu, ne model celého trhu.",
-    ],
+    recommendedDefault: "Nové analýzy řeš v záložce Monte Carlo.",
+    withoutIt: "Shuffle / prop challenge z backtest menu nejde.",
+    bestPractices: ["Pro srovnání drž stejný uložený run jako vstup."],
   },
   monteCarloSims: {
     id: "monteCarloSims",
-    title: "Počet Monte Carlo simulací",
+    title: "Počet MC simulací (přesunuto)",
+    whatItMeans: "Počet simulací nastavuješ v záložce **Monte Carlo** u konkrétního typu (shuffle / prop challenge).",
+    whyItMatters: "Odděleno od běhu engine backtestu.",
+    howToUse: ["Monte Carlo → zvol run → nastav počet simulací v hlavním panelu."],
+    recommendedDefault: "Začni 300–500 shuffle běhů podle výkonu prohlížeče.",
+    withoutIt: "—",
+    bestPractices: ["Vyšší počet = hladší histogramy, ale delší výpočet v UI."],
+  },
+  perRegimeSegmentation: {
+    id: "perRegimeSegmentation",
+    title: "Per Regime — segmentace backtestu",
     whatItMeans:
-      "Kolikrát se má celá ta **„přeházená hra“** zopakovat **až po dokončení backtestu** (každá simulace = jeden alternativní řetězec PnL z tvých uzavřených obchodů). " +
-      "Málo simulací = obrázek **skákavý**; hodně simulací = **hladší odhad** rozložení, ale **délka druhé fáze** Runu roste (pořád je to **jeden** Run od začátku do konce).",
-    whyItMatters:
-      "S příliš malým počtem můžeš **přehlédnout ocas rizika** (vzácné, ale hodně bolavé situace) nebo naopak **vystrašit** z jednoho náhodného extrému.",
+      "Engine po doběhu přiřadí každému obchodu režim trhu (uptrend / downtrend / range) podle EMA a relativního ATR na stejném timeframe jako data, a spočte metriky a equity dílčími řadami.",
+    whyItMatters: "Uvidíš, kde strategie tahá výkon a kde dře — a můžeš spustit Monte Carlo zvlášť po režimech.",
     howToUse: [
-      "Na **rychlý průlet** stačí nižší číslo (minimum může engine omezit — typicky řád desítek a výš).",
-      "Na **vážné rozhodnutí** přidej simulace — často řád **stovky**; výsledek uvidíš ve **stejném** výstupu Runu pod `monteCarlo` / v Analytics.",
-      "Když porovnáváš dva běhy, použij **stejný počet** simulací.",
+      "Zapni před runem v Edge finding → výsledky v Analytics (záložka Regime) a v hlavní záložce Regime.",
+      "Monte Carlo: režim „po režimech“ je dostupný jen u runu s touto segmentací.",
     ],
-    recommendedDefault: "300–500 pro rozumný kompromis přesnosti a času.",
-    withoutIt:
-      "Odhad rozložení rizika může být **nestabilní** — jako měřit výšku vlny z jedné fotky.",
-    bestPractices: [
-      "Když výsledky MC divně skáčou mezi opakováními, zvyš počet simulací **nebo** zkontroluj počet obchodů a režim (IID vs block).",
-    ],
+    recommendedDefault: "Vypnuto pro rychlou iteraci; zapni při hlubší analýze robustnosti.",
+    withoutIt: "Žádné byRegime metriky ani MC po režimech pro nové runy.",
+    bestPractices: ["Stejný timeframe dat = stejná definice režimu — pro jiný HTF by bylo potřeba resampling (zatím ne)."],
   },
   regimeEnabled: {
     id: "regimeEnabled",
-    title: "Segmentace podle režimu trhu",
+    title: "Regime segmentation (legacy popisek)",
     whatItMeans:
-      "**Režim trhu** = „jak se trh právě chová“ v hrubých soudech: třeba **trenduje**, **jde do strany**, je **hodně nervózní** (volatilní) apod. Tato volba říká: **rozděl výsledky strategie podle těchto období** a ukaž, kde strategie **svítí** a kde **hasne**. " +
-      "Analogie: stejný recept na bábovku — v horké troubě se připálí, ve studené zůstane syrový; **neříkej jen „bábovka je špatná“**, zjisti **v jaké troubě**.",
-    whyItMatters:
-      "Velmi často **edge není univerzální** — funguje třeba jen v silném trendu a v bočním trhu dělá díry na účtu. Bez režimů to vypadá jako **průměrně OK**, ale průměr může skrývat **dvě úplně jiné strategie v jednom kabátě**.",
-    howToUse: [
-      "Zapni ve fázi, kdy už máš **základní logiku** a chceš pochopit **kde přesně** vyděláváš.",
-      "Čti výstupy jako **mapu**: „tady ano, tam ne“ — ne jako finální soud.",
-    ],
-    recommendedDefault: "Zapnout při hlubší analýze kandidáta, ne u prvního hrubého náčrtu.",
-    withoutIt:
-      "Můžeš si myslet, že strategie je **všestranná**, i když ve skutečnosti jen **trefila jeden typ roku** na trhu.",
-    bestPractices: [
-      "Kombinuj s **delší historií**, ať vidíš víc režimů než jednu sezónu.",
-    ],
+      "Historicky odstraněná položka — aktuální segmentace je **Per Regime** v sekci Edge finding.",
+    whyItMatters: "—",
+    howToUse: ["Použij „Per Regime — segmentace výsledků“ nad quality gates."],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   portfolioEnabled: {
     id: "portfolioEnabled",
-    title: "Portfolio backtest (více nástrojů najednou)",
+    title: "Portfolio backtest (odstraněno z menu)",
     whatItMeans:
-      "Místo „jedna strategie na jednom trhu“ engine **spojí více instrumentů** do **jednoho portfolia** podle tvého nastavení — jako kdybys nekoupil jen jednu akcii, ale **košík** a díval se, jak se chová **celý košík dohromady** (zisk, propady, vzájemné vyrovnávání).",
-    whyItMatters:
-      "Někdy jeden trh **šumí**, jiný zrovna **trenduje** — rozložení může **zmírnit propady**, ale taky přidat **složitost** a riziko, že některá noha portfolia **táhne dolů** a ty to nevidíš, když se díváš jen na každý kus zvlášť.",
-    howToUse: [
-      "Nejdřív si ověř strategii **na jednom** trhu; portfolio je **další level** složitosti.",
-      "Po zapnutí musíš vyplnit **JSON se seznamem** instrumentů, timeframe, období, vah — přesně podle formátu v nápovědě u pole JSON.",
-    ],
-    recommendedDefault: "Zapínat až po rozumném single-instrument výsledku a pochopení nákladů.",
-    withoutIt:
-      "Nevidíš **diverzifikaci** ani **koncentraci rizika** — jen jednotlivé díly, ne celek.",
-    bestPractices: [
-      "Zkontroluj, že **data pro každý nástroj existují** a že **váhy** dávají ekonomický smysl (např. odpovídají tomu, kolik kapitálu kam dáváš).",
-    ],
+      "Portfolio režim (více nástrojů v jednom běhu) už **není v backtest konfiguraci** — testuj **jednu strategii na jednom instrumentu**.",
+    whyItMatters: "Jednodušší zaměření; nejsme multi-asset hedge-fund workflow.",
+    howToUse: ["Starší runy mohou mít pole portfolio v uložených výsledcích."],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   portfolioInstrumentsJson: {
     id: "portfolioInstrumentsJson",
-    title: "Portfolio — instrumenty (JSON)",
-    whatItMeans:
-      "Sem patří **technický zápis** (JSON) seznamu: **které trhy**, **jaký timeframe**, **jaké roky / soubory dat** a **jaké váhy** mají v portfoliu. Představ si to jako **nákupní seznam** pro počítač — musí být napsaný **přesně podle pravidel závorky**, jinak to parser nepochopí.",
-    whyItMatters:
-      "Jedna chyba v zápisu (čárka, uvozovka, špatný klíč) a test běží **na něčem jiném**, než si myslíš — jako kdybys objednal místo jablek **hrušky** a divil se, proč koláč chutná divně.",
-    howToUse: [
-      "Začni **2–3 jednoduchými řádky** (málo instrumentů, jednoduché váhy).",
-      "Ověř, že každý řádek odkazuje na **existující data** v systému.",
-      "Po úpravě vždy zkontroluj **validitu JSON** (čárky mezi objekty, uvozovky).",
-    ],
-    recommendedDefault: "Nejdřív zkopíruj vzor z dokumentace / výchozího pole a měň po jednom poli.",
-    withoutIt:
-      "Portfolio režim **neví**, co má obchodovat — chybí mu „seznam ingrediencí“.",
-    bestPractices: [
-      "Verzuj JSON do poznámky k hypotéze („portfolio v2: zvýšená váha NQ“).",
-    ],
+    title: "Portfolio JSON (odstraněno z menu)",
+    whatItMeans: "Konfigurace portfolia přes JSON už **není v UI**.",
+    whyItMatters: "—",
+    howToUse: [],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   executionEnabled: {
     id: "executionEnabled",
@@ -695,100 +573,55 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
   },
   monteCarloMode: {
     id: "monteCarloMode",
-    title: "Režim Monte Carla (jak „mícháme“ minulost)",
+    title: "Režim Monte Carla (shuffle v UI)",
     whatItMeans:
-      "**Kdy se to aplikuje:** stejně jako celé MC **až po backtestu** — oba režimy pracují jen s **uzavřenými obchody** a jejich PnL z toho běhu; liší se jen **způsob míchání**. " +
-      "**IID trade bootstrap** („nezávislé obchody“): bere uzavřené obchody a **losuje je z pytle** jako **kuličky**, které po každém vrátíš — pořadí se mění, ale **každý obchod je jen sám o sobě**. " +
-      "**Block bootstrap** („bloky po sobě“): místo jednotlivých obchodů bere **celé souvislé kousky** PnL v **původním pořadí uvnitř bloku** a ty pak skládá — jako když stříháš **úseky videa** a skládáš je jinak, ale **záběry uvnitř úseku** necháš v původním sledu. " +
-      "Proč? Protože obchody často **nejsou nezávislé** — jeden den špatné série může souviset s dalším.",
-    whyItMatters:
-      "Když jsou výsledky **navzájem podobné** (trend, série, držení pozic), IID může **podcenit** „špatné série po sobě“ nebo naopak **zkreslit ocas rizika**. Block bootstrap se snaží **respektovat souslednost** v datech.",
-    howToUse: [
-      "U **intradne**, **krátkých holdů** nebo **rychlého řetězení** signálů často dává smysl zkusit **block_bootstrap**.",
-      "U **dlouhých swingů**, kde obchody působí **víc odděleně**, může **IID** stačit na první pohled.",
-      "Vždy čti **method / mode / note** v JSON výstupu — tam je přesně popsáno, co engine udělal.",
-    ],
-    recommendedDefault: "IID pro rychlý první průchod; block bootstrap, když tušíš „lepení“ výsledků v čase.",
-    withoutIt:
-      "riskOfRuin a ocasová rizika mohou být **příliš růžová nebo příliš černá** podle struktury obchodů.",
-    bestPractices: [
-      "MC potřebuje **dost obchodů** — u 8 obchodů je každý režim spíš **hračka než věda**.",
-    ],
+      "Záložka **Monte Carlo** aktuálně nabízí **náhodné přeřazení celých obchodů** (shuffle) z uloženého runu — obdoba IID bootstrapu z jedné série PnL. Režim **block bootstrap** zde dnes není; lze ho doplnit jako další model motoru.",
+    whyItMatters: "Různé způsoby resamplování mění odhad „ocasu“ u korelovaných výsledků.",
+    howToUse: ["Shuffle použij jako rychlý robustness check po uložení runu."],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: ["U málo obchodů buď na výsledky opatrný."],
   },
   batchMatrix: {
     id: "batchMatrix",
-    title: "Batch / matrix (více běhů najednou)",
+    title: "Matrix / dávkové běhy (odstraněno z menu)",
     whatItMeans:
-      "**Batch** = **dávka**. Místo 20× klikat Run s drobnými změnami pošleš **jeden seznam variant** (JSON `items`): např. **jiný instrument**, **jiný soubor dat**, **jiné roky**. Backend pak **za sebou** spustí několik běhů se **stejným kódem** a sloučí základní nastavení s každou položkou. " +
-      "Je to jako **stejný recept**, ale **jiné ingredience** v každé misce.",
-    whyItMatters:
-      "Čím víc mishek ochutnáš, tím větší šance, že **některá** náhodou chutná skvěle — i když recept není geniální. To se jmenuje **multiple testing** (mnoho pokusů = víc falešných „úspěchů“).",
-    howToUse: [
-      "Drž **max_runs** nízko na začátku — nejdřív **2–4** varianty s **jasnou otázkou** u každé.",
-      "Každý objekt v `items` je jen **doplněk** k základnímu requestu — nemusíš opisovat vše znovu.",
-    ],
-    recommendedDefault: "Nejdřív malá dávka; plnou matici až s disciplínou a validací.",
-    withoutIt:
-      "Musíš **opakovat ručně** — pomalejší a snadno zapomeneš zapsat, co bylo jinak.",
-    bestPractices: [
-      "**Nepoužívej současně** s portfolio režimem (pravidla produktu).",
-      "Exportuj / ulož **batchSummary** pro audit — ať víš, co přesně běželo.",
-    ],
+      "Spouštění více variant v jednom requestu (`batch_config`) už **z klienta nekonfiguruješ** — jeden Run = jedna strategie, jeden instrument.",
+    whyItMatters: "Méně multiple-testing pastí a jednodušší mentální model.",
+    howToUse: ["Starší výsledky mohou mít batchSummary z dřívějších běhů."],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   batchEnabled: {
     id: "batchEnabled",
-    title: "Batch / matrix — zapnutí",
-    whatItMeans:
-      "Tímhle přepínačem řekneš aplikaci: **pošli konfiguraci dávky** na backend. Bez něj běží jen **jeden** standardní běh. Zapnutím povolíš, aby se z JSON položek poskládalo **víc běhů za sebou**.",
-    whyItMatters:
-      "Šetří čas, ale **zvýšíš počet pokusů** — musíš být opatrnější při interpretaci („jedna z deseti mi vyšla skvěle“ ≠ objev).",
-    howToUse: [
-      "Nejdřív **vypni portfolio** režim — **obojí najednou nesmí** (ochrana před chaosem).",
-      "Po doběhnutí čti **batchSummary** a případné **multipleTestingWarning** ve výsledku.",
-    ],
-    recommendedDefault: "Vypnuto, dokud opravdu nepotřebuješ srovnat více konfigurací vedle sebe.",
-    withoutIt:
-      "Každou variantu spouštíš **ručně zvlášť** — pomalejší, ale někdy i **bezpečnější** pro přemýšlení.",
-    bestPractices: [
-      "Pro celou dávku drž **stejnou větev** a **stejné tagy** — ať z historie poznáš souvislost.",
-    ],
+    title: "Batch / matrix (odstraněno z menu)",
+    whatItMeans: "Přepínač matrix runů už **není v backtest konfiguraci**.",
+    whyItMatters: "—",
+    howToUse: [],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   batchMaxRuns: {
     id: "batchMaxRuns",
-    title: "Max. počet běhů v dávce (strop)",
-    whatItMeans:
-      "**Strop** = **horní limit**, kolik položek z JSON `items` se smí **opravdu spustit**. Backend má také vlastní bezpečnostní limit (např. do **48**) — i kdybys chtěl milion pokusů, systém tě **chrání před sebou samým** (čas, náklady, náhodné úspěchy).",
-    whyItMatters:
-      "Bez stropu by šlo snadno udělat **100 rychlých pokusů**, najít jeden zelený a **prohlásit vítězství** — což statisticky skoro vždy někde vyjde.",
-    howToUse: [
-      "Začni **4–8**.",
-      "Zvyšuj jen když máš **konkrétní hypotézu** pro každou položku v seznamu.",
-    ],
-    recommendedDefault: "8 pro první průchod; při čistém průzkumu klidně ještě méně.",
-    withoutIt:
-      "Backend stejně **omezuje** — hodnota v UI je hlavně tvoje **nastavení očekávání** a kontrola.",
-    bestPractices: [
-      "Při porovnání dvou strategií použij **stejný strop**.",
-    ],
+    title: "Max. běhů v dávce (odstraněno z menu)",
+    whatItMeans: "—",
+    whyItMatters: "—",
+    howToUse: [],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   batchItemsJson: {
     id: "batchItemsJson",
-    title: "Položky dávky (JSON pole)",
-    whatItMeans:
-      "Seznam **objektů** v hranatých závorkách `[ ... ]`. Každý objekt `{ ... }` říká: **v tomhle dílčím běhu změň jen tohle** oproti základnímu formuláři — např. jiný `instrument`, `data_file`, `timeframe`, `years`, části `params`. Zbytek se **dědí** ze společného nastavení.",
-    whyItMatters:
-      "Je to **nejrychlejší** způsob v UI udělat „tabulku pokusů“ bez opakovaného klikání — ale zároveň **nejrychlejší způsob**, jak si **rozbít JSON** jednou čárkou.",
-    howToUse: [
-      "Platné JSON pole, např. `[{\"instrument\":\"NQ\",\"data_file\":\"mock/NQ_5Y.csv\",\"timeframe\":\"1d\"}]`.",
-      "Každá položka musí odkazovat na **existující datový soubor** a dávat smysl v kontextu strategie.",
-    ],
-    recommendedDefault: "Zkopíruj vzor z výchozího pole a měň **po jednom** poli.",
-    withoutIt:
-      "Dávku **nelze** rozumně definovat — zůstane jen jeden běh.",
-    bestPractices: [
-      "Verzuj JSON v poznámce k hypotéze.",
-      "Po úpravě zkontroluj syntaxi: **čárky** mezi objekty, **uvozovky** kolem řetězců.",
-    ],
+    title: "Položky dávky JSON (odstraněno z menu)",
+    whatItMeans: "—",
+    whyItMatters: "—",
+    howToUse: [],
+    recommendedDefault: "—",
+    withoutIt: "—",
+    bestPractices: [],
   },
   stressMultiplier: {
     id: "stressMultiplier",
@@ -810,17 +643,17 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "drawdownDuration",
     title: "Drawdown duration & recovery",
     whatItMeans:
-      "Engine pocita delku nejdelsiho drawdown obdobi (bary i kalendarne dny), cas zotaveni od nejhlubsiho propadu a underwater integral (prumerne DD% pres vsechny bary).",
+      "Engine měří délku nejdelšího drawdownu (v barech i dnech), čas návratu od dna k novému high a podíl času stráveného „pod vodou“.",
     whyItMatters:
-      "Hloubka propadu sama o sobe nic nerika o tom, jak dlouho v nem sedis. Pro psychologii i alokaci kapitalu je casova dimenze DD stejna dulezita jako procentualni.",
+      "Dvě strategie se stejným max DD % mohou psychologicky znamenat týdny vs. měsíce v krvácení.",
     howToUse: [
-      "V StatBlocks vidis DD Duration a Recovery primo v hlavnim prehledu.",
-      "V Analytics > Drawdown analysis jsou vsechny detaily vcetne underwater integralu a poctu DD period.",
-      "Recovery = null znamena, ze equity se nevrátila na predchozi peak pred koncem dat.",
+      "V StatBlocks najdeš DD Duration a Recovery.",
+      "V Analytics → Drawdown analysis jsou detaily včetně počtu epizod.",
+      "Recovery = prázdné znamená, že se equity k novému peaku nedostala.",
     ],
-    recommendedDefault: "Sleduj vzdy — neni co nastavovat, engine pocita automaticky z equity krivky.",
-    withoutIt: "Vidis jen hloubku DD, ale ne jak dlouho v nem sedis — kriticky blind spot.",
-    bestPractices: ["Porovnavej DD duration napric runy; strategii s kratsim recovery preferuj."],
+    recommendedDefault: "Jen čti výstup — není co ručně nastavovat.",
+    withoutIt: "Vidíš jen hloubku DD, ne jak dlouho bolí.",
+    bestPractices: ["Srovnej délky DD napříč runy se stejnou validací."],
   },
   tradePnlDistribution: {
     id: "tradePnlDistribution",
@@ -836,7 +669,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     ],
     recommendedDefault: "Engine pocita automaticky. Sleduj skewness (kladna = vic pravych vyheru, zaporna = vic levych ztrat).",
     withoutIt: "Nevidis tvar distribuce a tail riziko — muzes prihlednouti k vysokemu prumeru, ktery stoji na jednom obchodu.",
-    bestPractices: ["Kombinuj s MC a WF validaci pro komplexni obraz."],
+    bestPractices: ["Kombinuj s WF validací; tail risk přes záložku Monte Carlo po uložení runu."],
   },
   bootstrapCI: {
     id: "bootstrapCI",
@@ -855,7 +688,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     withoutIt: "Vidíš jen jedno číslo bez představy o jeho spolehlivosti — snadno přeceníš náhodný výsledek.",
     bestPractices: [
       "CI předpokládá i.i.d. obchody — u sériově korelovaných strategií mohou být intervaly příliš úzké.",
-      "Kombinuj s MC simulací a WF validací pro kompletní obraz.",
+      "Kombinuj s walk-forward; tail scénáře doplň v záložce Monte Carlo.",
     ],
   },
   payoffDecomposition: {
@@ -892,26 +725,6 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     withoutIt: `Zapomeneš, kolik věcí jsi zkusil — a „nejlepší" výsledek vypadá jistěji, než je.`,
     bestPractices: ["Drž trial count co nejnižší — méně testů = silnější evidence z každého testu."],
   },
-  paramTestTrainOnly: {
-    id: "paramTestTrainOnly",
-    title: "Param test: train-only mode",
-    whatItMeans:
-      "Přepne param test tak, že OAT sweep běží **pouze na trénovací části** dat (např. 75%). " +
-      "Nejlepší nalezený parametr se pak **jednou otestuje na holdoutu** — a ty vidíš, jak moc se výsledek zhorší.",
-    whyItMatters:
-      `Bez toho hledáš špičky metrik na **stejných datech**, která pak používáš jako důkaz — to je ` +
-      `**klasický overfit**. Train-only split to zabrání: holdout ti řekne „realitu" bez zkreslení.`,
-    howToUse: [
-      "Zaškrtni **Train-only** v param test nastavení.",
-      "V Analytics uvidíš holdout metriky nejlepšího parametru — pokud je holdout výrazně horší, je to overfit.",
-    ],
-    recommendedDefault: "Zapni vždy, pokud máš dostatek dat (60+ barů). Train ratio 0.75.",
-    withoutIt: "Param test na celém datasetu = explorace, ne validace. Špičky metrik jsou nespolehlivé.",
-    bestPractices: [
-      "Holdout return záporný při kladném train = silný signál overfittingu.",
-      "Kombinuj s OOS/WF na finální výběr.",
-    ],
-  },
   propRedFlags: {
     id: "propRedFlags",
     title: "Prop-level red flags & trust assessment",
@@ -937,7 +750,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "propConservativePreset",
     title: "Prop conservative preset",
     whatItMeans:
-      "Nejpřísnější přednastavení: WF 5 foldů, min 50 obchodů, max DD 15%, PF ≥ 1.5, MC 1000 sim (block bootstrap), " +
+      "Nejpřísnější přednastavení: WF 5 foldů, min 50 obchodů, max DD 15%, PF ≥ 1.5, " +
       "execution se spread 1.5 bps, slippage ×vol 2, latency 1 bar, stress multiplier 1.5×. " +
       "Param test automaticky v train-only režimu.",
     whyItMatters:
@@ -948,7 +761,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     ],
     recommendedDefault: "Použij jako základ pro seriózní validaci. Uprav dle potřeby.",
     withoutIt: "Musíš ručně nastavit desítku parametrů pro přísnou konfiguraci.",
-    bestPractices: ["Přidej i regime analýzu a portfolio multi-instrument pro komplexní obraz."],
+    bestPractices: ["Po WF zvaž doplnit analýzu v záložce Monte Carlo na uložených runech."],
   },
   validationWalkForward: {
     id: "validationWalkForward",
@@ -1032,7 +845,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     whyItMatters:
       "Backtest se strategi\u00ed USE_SD_ARTIFACTS m\u00e1 sed\u011bt se stejn\u00fdmi z\u00f3nami jako po Build features. Cache re\u017eim ve View ti uk\u00e1\u017ee p\u0159esn\u011b ty z\u00f3ny; live re\u017eim m\u016f\u017ee kv\u016fli jin\u00e9mu oknu, k\u00f3du nebo TF vypadat jinak.",
     howToUse: [
-      "Nejd\u0159\u00edv Build features (nebo ov\u011b\u0159 zelen\u00fd/ok stav cache), pak za\u0161krtni tento re\u017eim.",
+      "P\u0159epni **Vrstvy** na P\u0159edpo\u010dten\u00e9 artefakty, ov\u011b\u0159 stav cache (\u0161t\u00edtek), p\u0159\u00edpadn\u011b spus\u0165 **Build features**.",
       "Build v\u017edy po\u010d\u00edt\u00e1 na **cel\u00fd** data_file; **Obdob\u00ed** ve View jen zu\u017euje co vid\u00ed\u0161 na grafu.",
       "Strategick\u00fd parametr use_sd_artifacts v backtestu mus\u00ed m\u00edt k dispozici cestu k Parquet z runneru (viz README / pipeline).",
     ],
@@ -1064,7 +877,7 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "artifactViewBuildFeatures",
     title: "View: Build features",
     whatItMeans:
-      "Pod li\u0161tou View za\u0161krtni **Kroky buildu**: **H/L**, **S/D z\u00f3ny**, nebo oboj\u00ed. **Dataset** je v\u017edy **data_file** z rozbalov\u00e1\u010dky instrumentu v\u00fd\u0161e \u2014 nez\u00e1vis\u00ed na tom, kter\u00fd modul/strategie m\u00e1\u0161 jen pro graf. Jen **S/D** = mus\u00ed u\u017e b\u00fdt H/L artefakt. " +
+      "V panelu artefakt\u016f (po p\u0159epnut\u00ed **Vrstvy** na P\u0159edpo\u010dten\u00e9 artefakty) zvol **Kroky buildu**: **H/L**, **S/D z\u00f3ny**, nebo oboj\u00ed. **Dataset** je v\u017edy **data_file** z rozbalov\u00e1\u010dky instrumentu v\u00fd\u0161e \u2014 nez\u00e1vis\u00ed na tom, kter\u00fd modul/strategie m\u00e1\u0161 jen pro graf. Jen **S/D** = mus\u00ed u\u017e b\u00fdt H/L artefakt. " +
       "H/L precompute b\u011b\u017e\u00ed na **cel\u00fd** obsah **data_file** a na **ka\u017ed\u00fd timeframe** v intern\u00edm \u017eeb\u0159\u00ed\u010dku, pak S/D z\u00f3ny pro **v\u0161echny** tyto TF. **Obdob\u00ed** ve View se buildu net\u00fdk\u00e1 \u2014 jen omezuje, co se na grafu vykresl\u00ed. " +
       "Velk\u00e9 soubory mohou trvat **des\u00edtky minut**; HTTP 500 po dlouh\u00e9 \u010dek\u00e1n\u00ed: pod\u00edvej se do termin\u00e1lu **uvicorn** (traceback) nebo zda t\u011b proxy nep\u0159eru\u0161ila spojen\u00ed. " +
       "V\u00fdsledek se ulo\u017e\u00ed do workspace .backtest_artifacts (z\u00e1mek se po p\u00e1du procesu uvoln\u00ed, pokud PID u\u017e neb\u011b\u017e\u00ed).",
@@ -1133,16 +946,18 @@ export const backtestFieldHelp: Record<string, BacktestFieldHelp> = {
     id: "resultsRMultipleStats",
     title: "Statistiky R-multiple (obchody)",
     whatItMeans:
-      "Agregace z uzav\u0159en\u00fdch obchod\u016f, kde jde z zoneMeta odvodit vstup, stop a size. R = PnL d\u011bleno rizikem v bodech (|entry\u2212stop|\u00d7|size|). Obchody bez pot\u0159ebn\u00fdch pol\u00ed se vynechaj\u00ed.",
+      "Agregace z uzav\u0159en\u00fdch obchod\u016f, kde jde spo\u010d\u00edtat po\u010d\u00e1te\u010dn\u00ed riziko: z API pole initialRiskUsd, nebo z odvozen\u00e9ho |entry\u2212stop|\u00d7|size| (p\u0159. z metadatech obchodu). R = PnL / riziko. Obchody bez pot\u0159ebn\u00fdch \u00fadaj\u016f se vynechaj\u00ed.",
     whyItMatters:
-      "Expect. R v m\u0159\u00ed\u017ek\u00e1ch PnL je hrub\u00fd proxy; tento blok ukazuje rozlo\u017een\u00ed skute\u010dn\u00fdch R u obchod\u016f s metadaty.",
+      "Expect. R v m\u0159\u00ed\u017ek\u00e1ch PnL je hrub\u00fd proxy; tento blok ukazuje rozlo\u017een\u00ed skute\u010dn\u00fdch R tam, kde je riziko definovan\u00e9.",
     howToUse: [
-      "Srovnej po\u010det \u201epo\u010d\u00edtan\u00fdch\u201c vs celkov\u00fd po\u010det obchod\u016f \u2014 velk\u00fd rozd\u00edl = chyb\u00edc\u00ed zoneMeta.",
+      "Srovnej po\u010det \u201epo\u010d\u00edtan\u00fdch\u201c vs celkov\u00fd po\u010det obchod\u016f \u2014 velk\u00fd rozd\u00edl = chyb\u00ed definice rizika u v\u011bt\u0161iny obchod\u016f.",
       "Pou\u017eij percentily a medi\u00e1n pro odolnost proti jednomu outlieru.",
     ],
     recommendedDefault: "Kontroluj po ka\u017ed\u00e9 zm\u011bn\u011b logiky vstupu/v\u00fdstupu.",
     withoutIt: "\u0158\u00edk\u00e1\u0161 si, \u017ee strategie m\u00e1 R edge, ale nem\u00e1\u0161 spo\u010d\u00edtan\u00fd rozptyl.",
-    bestPractices: ["Dr\u017e v k\u00f3du konzistentn\u00ed zapisov\u00e1n\u00ed stop do metadat z\u00f3n."],
+    bestPractices: [
+      "Nech strategii konzistentn\u011b plnit initialRiskUsd nebo stop v metadatech, pokud chce\u0161 smyslupln\u00e9 R.",
+    ],
   },
   sdZoneTestBreakevenMoveR: {
     id: "sdZoneTestBreakevenMoveR",
@@ -1258,21 +1073,21 @@ export function getParamFallbackHelp(paramName: string, source: "PARAMS" | "VIEW
   return {
     id: `dynamic-${source}-${paramName}`,
     title: prettyName,
-    whatItMeans: `${source} parametr definovany v Python kodu.`,
+    whatItMeans: `${source} parametr z Python kódu — ovlivňuje strategii nebo vykreslení.`,
     whyItMatters:
-      "Bez dokumentace parametru je easy udelat tuning naslepo a ztratit konzistenci mezi runy.",
+      "Bez kontextu snadno naladíš nahodile a ztratíš konzistenci mezi runy.",
     howToUse: [
-      "Nastav hodnotu podle hypotezy a testuj po malych krocich.",
-      "Po kazde zmene zkontroluj dopad na quality gates a robustnost.",
+      "Měň po malých krocích a sleduj quality gates.",
+      "Po každé změně zkontroluj View nebo krátký baseline run.",
       isView
-        ? "Ve View modu pouzij parametr pro vizualni kontrolu logiky."
-        : "V backtestu parametr men pouze s jasnym duvodem.",
+        ? "Ve View slouží parametr k rychlé vizuální kontrole."
+        : "V backtestu měň jen s jasným důvodem v hypotéze.",
     ],
-    recommendedDefault: "Pouzij default z Python kodu, dokud nemas duvod menit.",
-    withoutIt: "Muzes nechtene preladit strategii bez pochopeni dopadu.",
+    recommendedDefault: "Drž výchozí hodnotu z kódu, dokud nemáš důvod měnit.",
+    withoutIt: "Riziko nechtěné optimalizace na šum.",
     bestPractices: [
-      "Dopln metadata v PARAMS_META/VIEW_PARAMS_META pro detailni wiki vysvetleni.",
-      "Pri tuning iteracich zapisuj branch, tags a hypothesis.",
+      "Doplň PARAMS_META / VIEW_PARAMS_META pro bohatší nápovědu.",
+      "Zapisuj branch, tagy a hypothesis.",
     ],
   };
 }

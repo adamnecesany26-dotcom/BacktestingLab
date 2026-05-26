@@ -19,6 +19,7 @@ export type VisibilityKey =
   | "bos_levels"
   | "inducement_points"
   | "demand_supply_zones"
+  | "zone_touches"
   | "support_resistance_zones"
   | "premium_discount_zones"
   | "lines";
@@ -30,10 +31,89 @@ export const DEFAULT_VISIBILITY: Record<VisibilityKey, boolean> = {
   bos_levels: false,
   inducement_points: false,
   demand_supply_zones: true,
+  zone_touches: true,
   support_resistance_zones: false,
   premium_discount_zones: false,
   lines: false,
 };
+
+/** Pořadí řádků v panelech „vrstvy grafu“ (Strategy View, …). */
+export const VISIBILITY_ROW_ORDER: VisibilityKey[] = [
+  "swing_hl",
+  "internal_hl",
+  "major_hl",
+  "bos_levels",
+  "inducement_points",
+  "demand_supply_zones",
+  "zone_touches",
+  "support_resistance_zones",
+  "premium_discount_zones",
+  "lines",
+];
+
+export const VISIBILITY_LABELS_CS: Record<VisibilityKey, string> = {
+  swing_hl: "Swing HL (+ BOS markery)",
+  internal_hl: "Internal HL",
+  major_hl: "Major HL",
+  bos_levels: "BOS úrovně",
+  inducement_points: "Inducement points",
+  demand_supply_zones: "Demand / Supply zóny",
+  zone_touches: "Touch zóny",
+  support_resistance_zones: "Support / Resistance zóny",
+  premium_discount_zones: "Premium / Mid / Discount",
+  lines: "Čáry (indikátory)",
+};
+
+export type VisibilityDataContext = {
+  markers: { type: string }[];
+  lines: ViewLine[];
+  zones: ViewZone[];
+};
+
+/** Zda má smysl zapínat vrstvu (checkbox v UI). */
+export function visibilityRowHasData(key: VisibilityKey, ctx: VisibilityDataContext): boolean {
+  const { markers, lines, zones } = ctx;
+  const high = markers.filter((m) => m.type === "high");
+  const low = markers.filter((m) => m.type === "low");
+  const ih = markers.filter((m) => m.type === "internal_high");
+  const il = markers.filter((m) => m.type === "internal_low");
+  const mh = markers.filter((m) => m.type === "major_high");
+  const ml = markers.filter((m) => m.type === "major_low");
+  const bb = markers.filter((m) => m.type === "bos_bullish");
+  const br = markers.filter((m) => m.type === "bos_bearish");
+  switch (key) {
+    case "swing_hl":
+      return high.length > 0 || low.length > 0 || bb.length > 0 || br.length > 0;
+    case "internal_hl":
+      return ih.length > 0 || il.length > 0;
+    case "major_hl":
+      return mh.length > 0 || ml.length > 0;
+    case "bos_levels":
+      return zones.some((z) => z.name === "BOS" || z.name === "BOS (M)");
+    case "inducement_points":
+      return (
+        zones.some((z) => (z.inducements?.length ?? 0) > 0) ||
+        markers.some((m) => m.type === "inducement" || m.type === "inducement_point")
+      );
+    case "demand_supply_zones":
+      return zones.some((z) => z.name === "Demand" || z.name === "Supply");
+    case "zone_touches":
+      return zones.some(
+        (z) =>
+          typeof z.touch_bar_index === "number" &&
+          typeof z.touch_marker_price === "number" &&
+          Number.isFinite(z.touch_marker_price),
+      );
+    case "support_resistance_zones":
+      return zones.some((z) => z.name === "Support" || z.name === "Resistance");
+    case "premium_discount_zones":
+      return zones.some((z) => z.name === "Discount" || z.name === "Mid" || z.name === "Premium");
+    case "lines":
+      return (lines?.length ?? 0) > 0;
+    default:
+      return false;
+  }
+}
 
 function hexToRgba(hex: string, alpha: number): string {
   const m = hex.replace("#", "").trim();
@@ -796,7 +876,7 @@ export function buildViewLikeChartSpec(input: ViewLikeSpecInput): { traces: any[
     if (inducementSupplyTrace) traces.push({ ...inducementSupplyTrace, ...pax });
     if (inducementOtherTrace) traces.push({ ...inducementOtherTrace, ...pax });
   }
-  if (visibility.demand_supply_zones && zoneTouchTrace) traces.push({ ...zoneTouchTrace, ...pax });
+  if (visibility.zone_touches && zoneTouchTrace) traces.push({ ...zoneTouchTrace, ...pax });
   if (visibility.lines) traces.push(...lineTraces.map((t) => ({ ...t, ...pax })));
   if (showRegimeHistogram && regimeBarTrace) traces.push(regimeBarTrace);
   if (extraTraces?.length) traces.push(...extraTraces.map((t) => ({ ...t, ...pax })));

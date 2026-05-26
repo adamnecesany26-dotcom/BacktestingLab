@@ -60,8 +60,8 @@ export default function GuidePage() {
               <ul className="mt-2 space-y-1 text-xs text-zinc-200">
                 <li>Budeš umět aplikaci používat zhruba na 90 % bez řešení edge-case supportu.</li>
                 <li>Budeš umět rozlišit věrohodný a nevěrohodný backtest.</li>
-                <li>Budeš rozumět OOS, Walk-forward a Monte Carlo v praktickém workflow.</li>
-                <li>Budeš vědět, kde je batch/sweep, fixní seed, repro ZIP a co znamená readiness v Analytics.</li>
+                <li>Budeš rozumět OOS, Walk-forward a Monte Carlo v samostatné záložce (po uložení runu).</li>
+                <li>Budeš vědět, kde je sweep vs. fixní seed, repro ZIP a co znamená readiness v Analytics.</li>
               </ul>
             </div>
           </aside>
@@ -128,12 +128,16 @@ export default function GuidePage() {
               <ul className="mt-3 list-disc space-y-2 pl-5 text-sm text-zinc-200">
                 <li>Validace není pouze single run (ideálně OOS nebo Walk-forward).</li>
                 <li>Quality gates filtrují slabé nebo náhodné edge.</li>
-                <li>Monte Carlo je zapnuté, risk-of-ruin je v přijatelné oblasti a víš, jestli běží IID nebo block bootstrap.</li>
+                <li>
+                  Po sweepu nebo walk-forward s mnoha foldy nepřebírej jen jeden „nejlepší“ řádek; uvědom si multiple testing (trial count v Analytics).
+                </li>
+                <li>
+                  Monte Carlo (shuffle / prop simulace) spouštěj v záložce <strong>Monte Carlo</strong> po uložení výsledku — není v menu Edge finding.
+                </li>
                 <li>Execution model započítává spread, slippage i latenci; v Analytics zkontroluj cost attribution.</li>
                 <li>
                   Run má v manifestu lineage včetně seedu — při potřebě přesné opakovatelnosti zapni fixní seed v Edge finding.
                 </li>
-                <li>Po sweepu nebo batch dávce nepřebírej jen nejlepší výsledek; uvědom si multiple testing.</li>
                 <li>V Analytics projdi oranžové overfitting varování a readiness / severity (heuristika).</li>
                 <li>Rozhodnutí o promote je podložené compare workspace + reviewer approval.</li>
                 <li>Výsledek drží stabilitu napříč více runy ve stejné branchi.</li>

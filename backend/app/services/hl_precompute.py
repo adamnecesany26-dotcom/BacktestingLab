@@ -18,7 +18,7 @@ from app.services.data_ohlc import fingerprint_dataset_file, resolve_safe_data_p
 from app.services.hl_artifact_spec import canonical_precompute_tf, resolve_build_timeframes
 from app.services.hl_data_load import load_native_ohlc
 
-_SWING_HL_REL = Path("strategies") / "sd_zone_strategy" / "modules" / "Swing_HL.py"
+_SWING_HL_REL = Path("strategies") / "modules" / "Swing_HL.py"
 
 
 def swing_hl_module_path() -> Path:

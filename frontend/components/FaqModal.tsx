@@ -44,11 +44,11 @@ const FAQ_ITEMS: FaqItem[] = [
   },
   {
     q: "Jak spustím backtest?",
-    a: "Otevřete strategii, vyberte instrument (Instrument Type a Instrument v pravém panelu), nastavte délku v letech a parametry. Klikněte Run. Backtest se spustí v izolovaném prostředí. Po dokončení se výsledky zobrazí automaticky.",
+    a: "Otevřete strategii, vyberte futures instrument v pravém panelu, nastavte délku v letech a parametry. Klikněte Run. Backtest se spustí v izolovaném prostředí. Po dokončení se výsledky zobrazí automaticky.",
   },
   {
-    q: "Co znamená Instrument Type a Instrument?",
-    a: "Instrument Type určuje typ trhu: Futures (NQ, ES), Stocks (akcie) nebo Forex. Instrument je konkrétní symbol – např. NQ pro futures. Každý typ má jiné parametry (Tick Size, Value Per Tick pro futures; Position Size pro akcie; Lot Size pro forex).",
+    q: "Co znamená Instrument?",
+    a: "Aplikace backtestuje pouze futures kontrakty (PnL a komise v logice kontraktu). Instrument je konkrétní symbol a datový soubor – např. NQ nebo MNQ. Tick size a value per tick se odvozují z tabulky podle symbolu.",
   },
   {
     q: "Kde jsou výsledky po Run?",

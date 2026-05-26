@@ -6,11 +6,16 @@ import { Sidebar } from "@/components/Sidebar";
 import { StrategyEditor } from "@/components/editor/StrategyEditor";
 import { CreateModal } from "@/components/CreateModal";
 import { AddFileModal } from "@/components/AddFileModal";
-import { BacktestSettings, MAX_INSTRUMENTS_BATCH } from "@/components/BacktestSettings";
-import type { EdgeFindingSettings } from "@/components/BacktestSettings";
+import {
+  BacktestSettings,
+  defaultOatSweepConfig,
+  type EdgeFindingSettings,
+  type OatSweepConfig,
+} from "@/components/BacktestSettings";
 import { ResultsView } from "@/components/results/ResultsView";
 import { StrategyViewChart } from "@/components/StrategyViewChart";
-import { LogPanel } from "@/components/LogPanel";
+import { MonteCarloWorkspace } from "@/components/monteCarlo/MonteCarloWorkspace";
+import { RegimeAnalysisWorkspace } from "@/components/regime/RegimeAnalysisWorkspace";
 import { LoadingOverlay } from "@/components/LoadingOverlay";
 import {
   saveBacktestResult,
@@ -31,12 +36,10 @@ import {
   type FirestoreItem,
 } from "@/lib/firestore";
 import { ensureAnonymousSession } from "@/lib/firebase";
-import { runBacktestStreaming, getAvailableData, type SdZoneTestResponse } from "@/lib/api";
-import type { SdZoneTestRunBody } from "@/lib/api";
-import { SdTestingSettings } from "@/components/SdTestingSettings";
-import { SdSavedRunsPicker } from "@/components/SdSavedRunsPicker";
-import { SdZoneTestResultsView } from "@/components/SdZoneTestResultsView";
-import { SdSavedRunsAnalyticsView } from "@/components/SdSavedRunsAnalyticsView";
+import {
+  runBacktestStreaming,
+  getAvailableData,
+} from "@/lib/api";
 import { MIN_BACKTEST_YEARS } from "@/lib/dataRange";
 import {
   parseStrategyParams,
@@ -55,12 +58,16 @@ import {
 } from "@/lib/backtestPageUtils";
 import { useBacktestExecutionParams } from "@/hooks/useBacktestExecutionParams";
 import {
-  filterInstrumentsByType,
   type RunRequest,
   type RunResponse,
   type DataInstrument,
-  type InstrumentType,
 } from "@shared/types";
+import { getFuturesExecutionSpec } from "@/lib/futuresExecutionSpec";
+import {
+  buildPropFirmBacktestRequestPayload,
+  defaultPropFirmForm,
+  type PropFirmBacktestFormState,
+} from "@/lib/propFirmBacktestConfig";
 
 const EMPTY_SIDEBAR_LISTS: Record<ItemType, FirestoreItem[]> = {
   strategies: [],
@@ -73,6 +80,19 @@ const DEFAULT_EXPANDED_SIDEBAR: Record<ItemType, boolean> = {
   indicators: false,
   modules: false,
 };
+
+/** Wall-clock limit pro engine run (sekundy); UI pole odstraněno — fixní hodnota. */
+const RUN_TIMEOUT_SEC_DEFAULT = 7200;
+
+/** Hlavní režim aplikace (záložky uprostřed workspace). */
+type WorkspaceTab = "backtest" | "view" | "monteCarlo" | "regime";
+
+const WORKSPACE_TABS: { id: WorkspaceTab; label: string }[] = [
+  { id: "backtest", label: "Backtest" },
+  { id: "view", label: "View" },
+  { id: "regime", label: "Regime" },
+  { id: "monteCarlo", label: "Monte Carlo" },
+];
 
 export default function Home() {
   const runLockRef = useRef(false);
@@ -96,7 +116,7 @@ export default function Home() {
   const [instruments, setInstruments] = useState<DataInstrument[]>([]);
   const [instrumentsLoaded, setInstrumentsLoaded] = useState(false);
   const [dataLoadError, setDataLoadError] = useState<string | null>(null);
-  /** Pořadí = pořadí dílčích runů v batch_config */
+  /** Vybraný datový soubor (jeden instrument na run). */
   const [selectedInstrumentFiles, setSelectedInstrumentFiles] = useState<string[]>([]);
   const [indicators, setIndicators] = useState<FirestoreItem[]>([]);
   const [selectedIndicatorIds, setSelectedIndicatorIds] = useState<string[]>([]);
@@ -112,6 +132,8 @@ export default function Home() {
   /** PARAM_MODULE_CHAIN z uloženého main.py (když v editoru není otevřený main.py). */
   const [savedMainParamModuleChain, setSavedMainParamModuleChain] = useState<string[]>([]);
   const [years, setYears] = useState(1);
+  const [backtestSettingsPanel, setBacktestSettingsPanel] = useState<"standard" | "prop">("standard");
+  const [propFirmForm, setPropFirmForm] = useState<PropFirmBacktestFormState>(() => defaultPropFirmForm());
   const [backtestParams, setBacktestParams] = useBacktestExecutionParams();
 
   const [strategyParams, setStrategyParams] = useState<StrategyParams>({});
@@ -122,7 +144,6 @@ export default function Home() {
   const [indicatorParamMeta, setIndicatorParamMeta] = useState<Record<string, StrategyParamsMeta>>({});
   const [edgeSettings, setEdgeSettings] = useState<EdgeFindingSettings>({
     validationMode: "single",
-    oosRatio: 0.25,
     wfFolds: 4,
     wfTestRatio: 0.2,
     minTradesGate: 30,
@@ -130,12 +151,6 @@ export default function Home() {
     minPfGate: 1.2,
     sweepMode: "none",
     sweepSamples: 24,
-    monteCarloEnabled: false,
-    monteCarloSims: 300,
-    regimeEnabled: false,
-    portfolioEnabled: false,
-    portfolioInstrumentsJson:
-      '[{"instrument":"NQ","timeframe":"1d","years":1,"weight":1},{"instrument":"ES","timeframe":"1d","years":1,"weight":1}]',
     executionEnabled: false,
     spreadBps: 0.5,
     slippageVolMult: 1.0,
@@ -150,41 +165,24 @@ export default function Home() {
     promoteOnPass: false,
     runFixedSeedEnabled: false,
     runFixedSeedValue: 42,
-    monteCarloMode: "iid_trade",
-    batchEnabled: false,
-    batchMaxRuns: 8,
-    batchItemsJson: '[{"instrument":"NQ","data_file":"mock/NQ_5Y.csv","timeframe":"1d"}]',
-    paramTestMaxRuns: 24,
-    paramTestTrainOnly: false,
-    paramTestRanges: {},
+    perRegimeSegmentation: false,
   });
+  const [oatSweep, setOatSweep] = useState<OatSweepConfig>(() => defaultOatSweepConfig());
   const [results, setResults] = useState<RunResponse | null>(null);
   const [runHistory, setRunHistory] = useState<SavedBacktestRun[]>([]);
-  const [logs, setLogs] = useState<string[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [runProgress, setRunProgress] = useState(0);
   const [showResults, setShowResults] = useState(false);
-  const [rightSettingsTab, setRightSettingsTab] = useState<"backtest" | "sd_test" | "sd_saved" | "analytics">("backtest");
-  const [sdTestLoading, setSdTestLoading] = useState(false);
-  const [sdTestResult, setSdTestResult] = useState<SdZoneTestResponse | null>(null);
-  const [showSdTestResults, setShowSdTestResults] = useState(false);
-  const [sdTestLastRequest, setSdTestLastRequest] = useState<SdZoneTestRunBody | null>(null);
-  /** Uložený S/D běh na backendu (cache nebo po „Uložit backtest“). */
-  const [sdTestSavedRunId, setSdTestSavedRunId] = useState<string | null>(null);
-  /** S/D testing: vlastní datový soubor a délka okna (nezávislé na výběru v Backtestu). */
-  const [sdTestDataFile, setSdTestDataFile] = useState<string | null>(null);
-  const [sdTestYears, setSdTestYears] = useState(1);
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>("backtest");
   const [abortController, setAbortController] = useState<AbortController | null>(null);
-  const [terminalMinimized, setTerminalMinimized] = useState(false);
   /** Levé adresářové menu + pravý panel nastavení — lze schovat kvůli většímu prostoru pro editor / výsledky. */
   const [leftNavOpen, setLeftNavOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
-  const [viewMode, setViewMode] = useState(false);
   const [strategiesForView, setStrategiesForView] = useState<FirestoreItem[]>([]);
   const [autoDetectedForStrategy, setAutoDetectedForStrategy] = useState<string | null>(null);
 
   const addLog = useCallback((msg: string) => {
-    setLogs((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    console.log(`[${new Date().toLocaleTimeString()}] ${msg}`);
   }, []);
 
   // Plotly charts resize on window resize. When we collapse/expand side panels,
@@ -198,7 +196,7 @@ export default function Home() {
       }
     }, 250); // match panel transition duration (200ms) with a bit of buffer
     return () => clearTimeout(t);
-  }, [leftNavOpen, rightPanelOpen]);
+  }, [leftNavOpen, rightPanelOpen, workspaceTab]);
 
   /** Sloučí statické importy, importlib.import_module("modules.X") a PARAM_MODULE_CHAIN → výběr modulů/indikátorů. */
   const applyLibraryAutoDetect = useCallback(
@@ -329,16 +327,16 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (viewMode) {
+    if (workspaceTab === "view") {
       listItems("strategies").then(setStrategiesForView);
     }
-  }, [viewMode]);
+  }, [workspaceTab]);
 
   useEffect(() => {
     if (openItem?.type === "strategies") {
       listItems("indicators").then(setIndicators);
       listItems("modules").then(setModules);
-    } else if (viewMode) {
+    } else if (workspaceTab === "view") {
       listItems("indicators").then(setIndicators);
       listItems("modules").then(setModules);
     } else {
@@ -349,7 +347,7 @@ export default function Home() {
       setSelectedModuleIds([]);
       setAppliedModuleIds([]);
     }
-  }, [openItem?.type, openItem?.id, viewMode]);
+  }, [openItem?.type, openItem?.id, workspaceTab]);
 
   useEffect(() => {
     if (openItem) {
@@ -545,11 +543,7 @@ export default function Home() {
     return flat;
   }, [strategyParams, moduleIdsForParamPanels, modules, moduleParams]);
 
-  /** Instruments filtered by selected instrument type */
-  const filteredInstruments = useMemo(
-    () => filterInstrumentsByType(instruments, backtestParams.instrumentType),
-    [instruments, backtestParams.instrumentType]
-  );
+  const filteredInstruments = instruments;
 
   const selectedInstruments = useMemo(() => {
     return selectedInstrumentFiles
@@ -567,10 +561,11 @@ export default function Home() {
     [selectedInstruments],
   );
 
-  /** Drž výběr v souladu s aktuálním typem (Futures/…) a zajisti nejméně jeden instrument */
+  /** Drž výběr v souladu s dostupnými futures instrumenty a zajisti nejméně jeden instrument */
   useEffect(() => {
     setSelectedInstrumentFiles((prev) => {
       const valid = prev.filter((f) => filteredInstruments.some((i) => i.file === f));
+      if (valid.length > 1) return [valid[0]!];
       if (valid.length === prev.length && prev.length > 0) return prev;
       if (valid.length > 0) return valid;
       const first = filteredInstruments[0];
@@ -585,51 +580,33 @@ export default function Home() {
     setYears((y) => Math.min(y, cap));
   }, [selectedInstruments.length, minYearsAcrossSelected]);
 
-  /** S/D test: platný soubor vůči filtrovanému seznamu; výchozí první instrument. */
+  /** Tick spec z tabulky podle prvního vybraného souboru (batch dílčí položky mají vlastní tick). */
   useEffect(() => {
-    setSdTestDataFile((prev) => {
-      if (prev && filteredInstruments.some((i) => i.file === prev)) return prev;
-      return filteredInstruments[0]?.file ?? null;
-    });
-  }, [filteredInstruments]);
-
-  const sdTestInstrument = useMemo(
-    () => filteredInstruments.find((i) => i.file === sdTestDataFile) ?? null,
-    [filteredInstruments, sdTestDataFile],
-  );
-
-  /** S/D test: drž roky v [min, max dostupných dat]. */
-  useEffect(() => {
-    if (!sdTestInstrument) return;
-    const cap = sdTestInstrument.yearsAvailable > 0 ? sdTestInstrument.yearsAvailable : 100;
-    setSdTestYears((y) => Math.max(MIN_BACKTEST_YEARS, Math.min(y, cap)));
-  }, [sdTestInstrument?.file, sdTestInstrument?.yearsAvailable]);
-
-  /** Tick z brokerConfig jen při přesně jednom vybraném futures instrumentu */
-  useEffect(() => {
-    if (selectedInstrumentFiles.length !== 1 || backtestParams.instrumentType !== "futures") return;
+    if (selectedInstrumentFiles.length === 0) return;
     const inv = filteredInstruments.find((i) => i.file === selectedInstrumentFiles[0]);
-    if (!inv?.brokerConfig) return;
+    if (!inv) return;
+    const spec = getFuturesExecutionSpec(inv.instrument);
     setBacktestParams((prev) => ({
       ...prev,
-      tickSize: inv.brokerConfig?.tick_size ?? prev.tickSize,
-      valuePerTick: inv.brokerConfig?.tick_value ?? prev.valuePerTick,
+      tickSize: spec.tickSize,
+      valuePerTick: spec.valuePerTick,
+      slippagePerc: spec.defaultSlippagePerc,
     }));
-  }, [selectedInstrumentFiles, filteredInstruments, backtestParams.instrumentType]);
+  }, [selectedInstrumentFiles, filteredInstruments]);
 
   const toggleInstrumentFile = useCallback((file: string) => {
     setSelectedInstrumentFiles((prev) => {
       if (prev.includes(file)) {
-        const next = prev.filter((f) => f !== file);
-        return next.length > 0 ? next : prev;
+        if (prev.length <= 1) return prev;
+        return prev.filter((f) => f !== file);
       }
-      if (prev.length >= MAX_INSTRUMENTS_BATCH) return prev;
-      return [...prev, file];
+      return [file];
     });
   }, []);
 
   const selectAllInstrumentFiles = useCallback(() => {
-    setSelectedInstrumentFiles(filteredInstruments.slice(0, MAX_INSTRUMENTS_BATCH).map((i) => i.file));
+    const first = filteredInstruments[0];
+    setSelectedInstrumentFiles(first ? [first.file] : []);
   }, [filteredInstruments]);
 
   const toggleSidebarSection = (type: ItemType) => {
@@ -730,19 +707,13 @@ export default function Home() {
       addLog(`Run: moduly z PARAM_MODULE_CHAIN (přibaleny + jejich VIEW_PARAMS): ${chainBundledNames.join(", ")}`);
     }
     if (edgeSettings.validationMode === "single") {
-      addLog("WARNING: běžíte pouze single run. Pro první edge doporučeno OOS split nebo walk-forward.");
-    }
-    if (edgeSettings.validationMode === "param_test" && edgeSettings.sweepMode !== "none") {
-      addLog("WARNING: Param test + robustness sweep — velmi mnoho simulací; výsledky interpretuj opatrně.");
+      addLog("INFO: single run na celé historii — out-of-sample ověření si nastav ručně mimo app, pokud potřebuješ.");
     }
     if (edgeSettings.sweepMode !== "none" && edgeSettings.validationMode === "single") {
-      addLog("WARNING: sweep bez OOS/WF může vést k overfittingu.");
+      addLog("WARNING: Robustness sweep na single runu může vést k overfittingu — interpretuj opatrně.");
     }
     if (edgeSettings.minTradesGate < 20) {
       addLog("WARNING: min trades gate < 20 může dělat metriky nestabilní.");
-    }
-    if (!edgeSettings.monteCarloEnabled) {
-      addLog("TIP: zapněte Monte Carlo pro odhad tail-risk/risk of ruin.");
     }
 
     const allFiles: Record<string, string> = {};
@@ -805,7 +776,6 @@ export default function Home() {
     setAbortController(controller);
     setIsRunning(true);
     setRunProgress(0);
-    setLogs([]);
     addLog("Spouštím backtest...");
 
     try {
@@ -870,144 +840,89 @@ export default function Home() {
             tradeCount: Number(latestRun.metrics.tradeCount ?? 0),
           }
         : undefined;
-      let portfolioConfig: Record<string, unknown> | undefined = undefined;
-      if (edgeSettings.portfolioEnabled) {
-        try {
-          const parsed = JSON.parse(edgeSettings.portfolioInstrumentsJson);
-          if (!Array.isArray(parsed) || parsed.length < 2) {
-            addLog("Portfolio config musí být JSON pole alespoň se 2 instrumenty.");
-            runLockRef.current = false;
-            return;
-          }
-          portfolioConfig = { instruments: parsed };
-        } catch {
-          addLog("Portfolio JSON je neplatný. Oprav formát v Edge finding sekci.");
-          runLockRef.current = false;
-          return;
-        }
+      const isPropRun = backtestSettingsPanel === "prop";
+      if (isPropRun) {
+        addLog("Prop firm backtest: single run + sekvenční simulace challenge na uzavřených obchodech.");
       }
-      let batchConfig: Record<string, unknown> | undefined = undefined;
-      if (selectedInstruments.length > 1) {
-        if (edgeSettings.portfolioEnabled) {
-          addLog("Vícero instrumentů v Basic nelze kombinovat s portfoliem — vyber jeden instrument nebo vypni portfolio.");
-          runLockRef.current = false;
-          return;
-        }
-        if (edgeSettings.batchEnabled) {
-          addLog(
-            "Máš vybráno více instrumentů v Basic — vypni „Batch / matrix runs (JSON)“ v Edge finding, nebo ponech jen jeden instrument.",
-          );
-          runLockRef.current = false;
-          return;
-        }
-        batchConfig = {
-          max_runs: Math.min(MAX_INSTRUMENTS_BATCH, selectedInstruments.length),
-          items: selectedInstruments.map((inv) => ({
-            instrument: inv.instrument,
-            timeframe: inv.timeframe,
-            data_file: inv.file,
-            years: Math.min(years, inv.yearsAvailable),
-          })),
-        };
-      } else if (edgeSettings.batchEnabled) {
-        if (edgeSettings.portfolioEnabled) {
-          addLog("Batch run nelze kombinovat s portfolio režimem — vypni jedno z nich.");
-          runLockRef.current = false;
-          return;
-        }
-        try {
-          const items = JSON.parse(edgeSettings.batchItemsJson) as unknown;
-          if (!Array.isArray(items) || items.length === 0) {
-            throw new Error("empty");
-          }
-          batchConfig = {
-            max_runs: Math.min(48, Math.max(1, edgeSettings.batchMaxRuns)),
-            items,
-          };
-        } catch {
-          addLog("Batch items JSON je neplatný. Očekává se pole objektů s poli jako instrument, data_file, …");
-          runLockRef.current = false;
-          return;
-        }
+      const oatWant = !isPropRun && oatSweep.enabled && Boolean(oatSweep.paramKey);
+      const oatGridN =
+        oatWant && oatSweep.step > 0
+          ? (() => {
+              const lo = Math.min(oatSweep.from, oatSweep.to);
+              const hi = Math.max(oatSweep.from, oatSweep.to);
+              const n = Math.floor((hi - lo) / oatSweep.step + 1e-9) + 1;
+              return Number.isFinite(n) && n >= 1 ? n : 0;
+            })()
+          : 0;
+      const useOatSweep = oatWant && oatGridN > 0;
+      if (oatWant && !useOatSweep) {
+        addLog(
+          "WARNING: OAT sweep je zapnutý, ale konfigurace není platná (parametr, od/do, krok > 0). Použije se běh bez param_test.",
+        );
       }
-      if (edgeSettings.batchEnabled && edgeSettings.validationMode === "param_test") {
-        addLog("Param test nelze kombinovat s batch/matrix runs — vypni jedno z nich.");
-        runLockRef.current = false;
-        return;
+      if (useOatSweep) {
+        addLog(`OAT sweep: ${oatGridN} hodnot parametru ${oatSweep.paramKey} v jednom runu (param_test).`);
       }
-      if (selectedInstruments.length > 1 && edgeSettings.validationMode === "param_test") {
-        addLog("Param test je podporován jen pro jeden instrument — v Basic nech jeden výběr.");
-        runLockRef.current = false;
-        return;
-      }
-      const validationConfigPayload: RunRequest["validation_config"] = (() => {
-        if (edgeSettings.validationMode === "oos_split") {
-          return { oos_ratio: edgeSettings.oosRatio };
-        }
-        if (edgeSettings.validationMode === "walk_forward") {
-          return { folds: edgeSettings.wfFolds, test_ratio: edgeSettings.wfTestRatio };
-        }
-        if (edgeSettings.validationMode === "param_test") {
-          const ranges: Record<string, { min: number; max: number; enabled: boolean }> = {};
-          for (const [k, r] of Object.entries(edgeSettings.paramTestRanges)) {
-            if (r?.enabled) {
-              ranges[k] = { min: r.min, max: r.max, enabled: true };
+      const validationConfigPayload: RunRequest["validation_config"] = isPropRun
+        ? undefined
+        : useOatSweep
+          ? {
+              param_test: {
+                max_runs: Math.min(500, Math.max(24, oatGridN)),
+                param_ranges: {
+                  [oatSweep.paramKey as string]: {
+                    enabled: true,
+                    min: Math.min(oatSweep.from, oatSweep.to),
+                    max: Math.max(oatSweep.from, oatSweep.to),
+                    step: oatSweep.step,
+                  },
+                },
+              },
             }
-          }
-          return {
-            param_test: {
-              max_runs: Math.min(48, Math.max(4, Math.floor(edgeSettings.paramTestMaxRuns))),
-              param_ranges: ranges,
-              train_only: edgeSettings.paramTestTrainOnly ?? false,
-            },
-          };
-        }
-        return undefined;
-      })();
+          : edgeSettings.validationMode === "walk_forward"
+            ? { folds: edgeSettings.wfFolds, test_ratio: edgeSettings.wfTestRatio }
+            : undefined;
       const runRequest: RunRequest = {
         files: allFiles,
         instrument: selectedInstrument.instrument,
         timeframe: selectedInstrument.timeframe,
         years,
         data_file: selectedInstrument.file,
-        initial_capital: backtestParams.initialCapital,
+        initial_capital: isPropRun ? propFirmForm.accountSize : backtestParams.initialCapital,
         slippage_perc: backtestParams.slippagePerc,
-        commission_perc: backtestParams.commissionPerc,
-        instrument_type: backtestParams.instrumentType,
+        commission_perc: 0,
+        instrument_type: "futures",
         tick_size: backtestParams.tickSize,
         value_per_tick: backtestParams.valuePerTick,
-        share_size: backtestParams.shareSize,
-        lot_size: backtestParams.lotSize,
-        pip_size: backtestParams.pipSize,
-        pip_value: backtestParams.pipValue,
-        run_timeout_sec: backtestParams.runTimeoutSec,
+        run_timeout_sec: RUN_TIMEOUT_SEC_DEFAULT,
         params: runParams,
         applied_modules: appliedModules.length > 0 ? appliedModules : undefined,
         run_id: requestRunId,
-        validation_mode: edgeSettings.validationMode,
+        validation_mode: isPropRun ? "single" : useOatSweep ? "param_test" : edgeSettings.validationMode,
         validation_config: validationConfigPayload,
         quality_gates: {
           min_trades: edgeSettings.minTradesGate,
           max_dd: edgeSettings.maxDdGate,
           min_pf: edgeSettings.minPfGate,
         },
-        sweep_mode: edgeSettings.sweepMode === "none" ? undefined : edgeSettings.sweepMode,
+        sweep_mode:
+          isPropRun || useOatSweep || edgeSettings.sweepMode === "none" ? undefined : edgeSettings.sweepMode,
         sweep_config:
-          edgeSettings.sweepMode === "none"
+          isPropRun || useOatSweep || edgeSettings.sweepMode === "none"
             ? undefined
             : {
                 max_samples: edgeSettings.sweepSamples,
               },
-        monte_carlo: edgeSettings.monteCarloEnabled
+        regime_config: edgeSettings.perRegimeSegmentation
           ? {
-              simulations: edgeSettings.monteCarloSims,
-              ruin_dd_pct: 50,
+              enabled: true,
+              ema_fast: 50,
+              ema_slow: 200,
+              atr_period: 14,
             }
           : undefined,
-        regime_config: edgeSettings.regimeEnabled ? { enabled: true } : undefined,
-        portfolio_config: portfolioConfig,
         execution_model: {
-          commission_mode: backtestParams.commissionMode,
+          commission_mode: "per_contract",
           commission_per_contract: backtestParams.commissionPerContract,
           ...(edgeSettings.executionEnabled
             ? {
@@ -1025,7 +940,6 @@ export default function Home() {
               }
             : {}),
         },
-        batch_config: batchConfig,
         experiment: {
           hypothesis: edgeSettings.experimentHypothesis || strategyContext.name,
           tags: edgeSettings.experimentTagsCsv
@@ -1053,6 +967,7 @@ export default function Home() {
           reviewerApproved: false,
           approvalRequired: true,
         },
+        prop_firm_backtest: isPropRun ? buildPropFirmBacktestRequestPayload(propFirmForm) : undefined,
       };
       const data = await runBacktestStreaming(
         runRequest,
@@ -1069,6 +984,16 @@ export default function Home() {
       setResults(data);
       setShowResults(true);
       addLog(`Hotovo. ${data.metrics.tradeCount} obchodů, equity: ${data.metrics.finalEquity.toFixed(2)}`);
+      if (isPropRun && data.propFirmBacktest && typeof data.propFirmBacktest === "object") {
+        const pf = data.propFirmBacktest as Record<string, unknown>;
+        const s = pf.summary as Record<string, unknown> | undefined;
+        if (s && !pf.error && !pf.skipped) {
+          addLog(
+            `Prop firm: pass rate ${s.evaluationPassRate != null ? (Number(s.evaluationPassRate) * 100).toFixed(1) : "?"} % (` +
+              `${String(s.evaluationPassed ?? 0)} pass / ${String(s.evaluationFailed ?? 0)} fail).`,
+          );
+        }
+      }
       const bs = data.batchSummary;
       if (bs && typeof bs === "object" && Number((bs as { runCount?: number }).runCount) > 1) {
         addLog(
@@ -1153,6 +1078,18 @@ export default function Home() {
   }, [openItem?.type, openItem?.id, loadRunHistory]);
 
   useEffect(() => {
+    if (workspaceTab === "monteCarlo" && openItem?.type === "strategies") {
+      loadRunHistory();
+    }
+  }, [workspaceTab, openItem?.type, openItem?.id, loadRunHistory]);
+
+  useEffect(() => {
+    if (workspaceTab === "regime" && openItem?.type === "strategies") {
+      loadRunHistory();
+    }
+  }, [workspaceTab, openItem?.type, openItem?.id, loadRunHistory]);
+
+  useEffect(() => {
     if (showResults && openItem?.type === "strategies") {
       loadRunHistory();
     }
@@ -1188,134 +1125,119 @@ export default function Home() {
     }
   };
 
+  const showLeftColumn = true;
+  const showRightSettingsPanel = workspaceTab === "backtest";
+
   const centerContent =
-    showSdTestResults && sdTestResult ? (
-      <SdZoneTestResultsView
-        result={sdTestResult}
-        lastRequest={sdTestLastRequest}
-        onRerunRequest={setSdTestLastRequest}
-        onResult={setSdTestResult}
-        savedRunId={sdTestSavedRunId}
-        onSavedRunId={setSdTestSavedRunId}
-        onBack={() => {
-          setShowSdTestResults(false);
-        }}
-      />
-    ) : rightSettingsTab === "analytics" ? (
-      <SdSavedRunsAnalyticsView instruments={instruments} />
-    ) : rightSettingsTab === "sd_saved" ? (
-      <div className="p-4">
-        <SdSavedRunsPicker
-          instruments={instruments}
-          onOpen={(doc) => {
-            setSdTestLastRequest(doc.request as any);
-            setSdTestResult(doc.response as any);
-            setSdTestSavedRunId(String(doc.run_id || ""));
-            setShowSdTestResults(true);
-            setShowResults(false);
-          }}
+    workspaceTab === "monteCarlo" ? (
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <MonteCarloWorkspace
+          runs={runHistory}
+          strategyOpen={openItem?.type === "strategies"}
+          strategyName={openItem?.type === "strategies" ? openItem.name : undefined}
         />
       </div>
-    ) : showResults ? (
-    <ResultsView
-      results={results}
-      runHistory={runHistory}
-      strategyId={openItem?.id ?? ""}
-      onBack={() => setShowResults(false)}
-      onExport={handleExport}
-      onDeleteRun={handleDeleteRun}
-      onDeleteAllRuns={handleDeleteAllRuns}
-      onUpdateLifecycle={handleUpdateRunLifecycle}
-      strategyName={openItem?.name}
-      strategyMainPy={fileContent}
-    />
-  ) : (
-    <div className="flex flex-col min-h-0 flex-1">
-      <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2">
-        {openItem && selectedFile && (
-          <>
-            <button
-              onClick={handleSaveFile}
-              disabled={fileContent === lastSavedContent || isSaving}
-              className={`px-4 py-2 rounded-lg text-sm ${
-                fileContent === lastSavedContent && !isSaving
-                  ? "bg-zinc-800 text-zinc-500 cursor-default"
-                  : "bg-zinc-700 hover:bg-zinc-600"
-              }`}
-            >
-              {isSaving ? "Ukládám…" : fileContent === lastSavedContent ? "Uloženo" : "Uložit"}
-            </button>
-            <button
-              onClick={() => setViewMode((v) => !v)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium ${
-                viewMode ? "bg-emerald-600 text-white" : "bg-zinc-700 hover:bg-zinc-600"
-              }`}
-            >
-              View
-            </button>
-            <span className="text-sm text-zinc-500">
-              {selectedFile.startsWith("indicator:")
-                ? `📊 ${indicators.find((i) => i.id === selectedFile.replace("indicator:", ""))?.name ?? selectedFile}`
-                : selectedFile.startsWith("module:")
-                  ? `📦 ${modulesForViewChart.find((m) => m.id === selectedFile.replace("module:", ""))?.name ?? selectedFile}`
-                  : selectedFile}
-            </span>
-          </>
-        )}
+    ) : workspaceTab === "regime" ? (
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <RegimeAnalysisWorkspace
+          runs={runHistory}
+          liveResults={results}
+          strategyOpen={openItem?.type === "strategies"}
+          strategyName={openItem?.type === "strategies" ? openItem.name : undefined}
+        />
       </div>
-      <div className="flex-1 min-h-0">
-        {viewMode ? (
-          <div className="h-full p-4 overflow-auto">
-            <StrategyViewChart
-              instruments={instruments}
-              modules={modulesForViewChart}
-              indicators={indicators}
-              strategies={strategiesForView}
-              defaultDataFile={selectedInstrument?.file}
-              strategyZoneSyncCode={openItem?.type === "strategies" ? fileContent : null}
-              initialItemId={
-                selectedFile?.startsWith("module:")
-                  ? selectedFile.replace("module:", "")
-                  : selectedFile?.startsWith("indicator:")
-                    ? selectedFile.replace("indicator:", "")
-                    : openItem?.type === "strategies" && openItem?.id
+    ) : workspaceTab === "view" ? (
+      <div className="h-full overflow-auto p-4">
+        <StrategyViewChart
+          instruments={instruments}
+          modules={modulesForViewChart}
+          indicators={indicators}
+          strategies={strategiesForView}
+          defaultDataFile={selectedInstrument?.file}
+          strategyZoneSyncCode={openItem?.type === "strategies" ? fileContent : null}
+          initialItemId={
+            selectedFile?.startsWith("module:")
+              ? selectedFile.replace("module:", "")
+              : selectedFile?.startsWith("indicator:")
+                ? selectedFile.replace("indicator:", "")
+                : openItem?.type === "strategies" && openItem?.id
+                  ? openItem.id
+                  : openItem?.type === "modules" && openItem?.id
+                    ? openItem.id
+                    : openItem?.type === "indicators" && openItem?.id
                       ? openItem.id
-                      : openItem?.type === "modules" && openItem?.id
-                        ? openItem.id
-                        : openItem?.type === "indicators" && openItem?.id
-                          ? openItem.id
-                          : undefined
-              }
-              initialItemType={
-                selectedFile?.startsWith("module:")
-                  ? "module"
-                  : selectedFile?.startsWith("indicator:")
-                    ? "indicator"
-                    : openItem?.type === "strategies"
-                      ? "strategy"
-                      : openItem?.type === "modules"
-                        ? "module"
-                        : openItem?.type === "indicators"
-                          ? "indicator"
-                          : undefined
-              }
-              height={700}
-            />
-          </div>
-        ) : openItem && selectedFile ? (
-          <StrategyEditor value={fileContent} onChange={setFileContent} />
-        ) : (
-          <div className="flex-1 flex items-center justify-center bg-zinc-950 p-8">
-            <img
-              src="/assets/stonks.webp"
-              alt="Backtesting"
-              className="max-w-full max-h-full object-contain rounded-lg"
-            />
-          </div>
-        )}
+                      : undefined
+          }
+          initialItemType={
+            selectedFile?.startsWith("module:")
+              ? "module"
+              : selectedFile?.startsWith("indicator:")
+                ? "indicator"
+                : openItem?.type === "strategies"
+                  ? "strategy"
+                  : openItem?.type === "modules"
+                    ? "module"
+                    : openItem?.type === "indicators"
+                      ? "indicator"
+                      : undefined
+          }
+          height={700}
+        />
       </div>
-    </div>
-  );
+    ) : workspaceTab === "backtest" && showResults ? (
+      <ResultsView
+        results={results}
+        runHistory={runHistory}
+        strategyId={openItem?.id ?? ""}
+        onBack={() => setShowResults(false)}
+        onExport={handleExport}
+        onDeleteRun={handleDeleteRun}
+        onDeleteAllRuns={handleDeleteAllRuns}
+        onUpdateLifecycle={handleUpdateRunLifecycle}
+        strategyName={openItem?.name}
+        strategyMainPy={fileContent}
+      />
+    ) : workspaceTab === "backtest" ? (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex shrink-0 items-center gap-2 border-b border-zinc-800 px-4 py-2">
+          {openItem && selectedFile && (
+            <>
+              <button
+                onClick={handleSaveFile}
+                disabled={fileContent === lastSavedContent || isSaving}
+                className={`rounded-lg px-4 py-2 text-sm ${
+                  fileContent === lastSavedContent && !isSaving
+                    ? "cursor-default bg-zinc-800 text-zinc-500"
+                    : "bg-zinc-700 hover:bg-zinc-600"
+                }`}
+              >
+                {isSaving ? "Ukládám…" : fileContent === lastSavedContent ? "Uloženo" : "Uložit"}
+              </button>
+              <span className="text-sm text-zinc-500">
+                {selectedFile.startsWith("indicator:")
+                  ? `📊 ${indicators.find((i) => i.id === selectedFile.replace("indicator:", ""))?.name ?? selectedFile}`
+                  : selectedFile.startsWith("module:")
+                    ? `📦 ${modulesForViewChart.find((m) => m.id === selectedFile.replace("module:", ""))?.name ?? selectedFile}`
+                    : selectedFile}
+              </span>
+            </>
+          )}
+        </div>
+        <div className="min-h-0 flex-1">
+          {openItem && selectedFile ? (
+            <StrategyEditor value={fileContent} onChange={setFileContent} />
+          ) : (
+            <div className="flex h-full flex-1 items-center justify-center bg-zinc-950 p-8">
+              <img
+                src="/assets/stonks.webp"
+                alt="Backtesting"
+                className="max-h-full max-w-full rounded-lg object-contain"
+              />
+            </div>
+          )}
+        </div>
+      </div>
+    ) : null;
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -1336,206 +1258,162 @@ export default function Home() {
           existingFiles={files.map((f) => f.fileName)}
         />
       )}
-      <div
-        className={`shrink-0 overflow-hidden border-r border-zinc-800 transition-[width] duration-200 ease-out ${
-          leftNavOpen ? "w-64" : "w-0"
-        }`}
-      >
-        <Sidebar
-          openItem={openItem}
-          itemsByType={sidebarLists}
-          expandedSections={expandedSidebar}
-          onToggleSection={toggleSidebarSection}
-          onCreateForType={openCreateModalForType}
-          files={files}
-          onSelectItem={handleSelectItem}
-          onAddFileClick={() => setIsAddFileModalOpen(true)}
-          onBack={handleBack}
-          onSelectFile={(f) => {
-            setSelectedFile(f);
-            setShowResults(false);
-          }}
-          onSelectImported={(key) => {
-            setSelectedFile(key);
-            setShowResults(false);
-          }}
-          appliedIndicators={indicators.filter((i) => appliedIndicatorIds.includes(i.id))}
-          appliedModules={modules.filter((m) => appliedModuleIds.includes(m.id))}
-          selectedFile={selectedFile}
-        />
-      </div>
-      <button
-        type="button"
-        onClick={() => setLeftNavOpen((v) => !v)}
-        className="shrink-0 w-7 flex flex-col justify-center items-center border-r border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800/90 text-zinc-500 hover:text-zinc-300 text-xs font-mono transition-colors"
-        title={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
-        aria-expanded={leftNavOpen}
-        aria-label={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
-      >
-        {leftNavOpen ? "◄" : "►"}
-      </button>
-      <div className="flex flex-1 flex-col min-w-0">
-        <div className="flex-1 flex min-h-0">
-          <div className="flex-1 flex flex-col min-w-0 border-r border-zinc-800 relative">
-            {(isRunning || sdTestLoading) && (
-              <LoadingOverlay
-                progress={isRunning ? runProgress : 0}
-                message={
-                  sdTestLoading
-                    ? "S/D touch analytics…"
-                    : runProgress > 0
-                      ? `Běží ${runProgress}%`
-                      : "Spouštím backtest..."
-                }
-                onStop={isRunning ? handleStopRun : undefined}
-              />
-            )}
-            {centerContent}
+      {showLeftColumn && (
+        <>
+          <div
+            className={`shrink-0 overflow-hidden border-r border-zinc-800 transition-[width] duration-200 ease-out ${
+              leftNavOpen ? "w-64" : "w-0"
+            }`}
+          >
+            <Sidebar
+              openItem={openItem}
+              itemsByType={sidebarLists}
+              expandedSections={expandedSidebar}
+              onToggleSection={toggleSidebarSection}
+              onCreateForType={openCreateModalForType}
+              files={files}
+              onSelectItem={handleSelectItem}
+              onAddFileClick={() => setIsAddFileModalOpen(true)}
+              onBack={handleBack}
+              onSelectFile={(f) => {
+                setSelectedFile(f);
+                setShowResults(false);
+              }}
+              onSelectImported={(key) => {
+                setSelectedFile(key);
+                setShowResults(false);
+              }}
+              appliedIndicators={indicators.filter((i) => appliedIndicatorIds.includes(i.id))}
+              appliedModules={modules.filter((m) => appliedModuleIds.includes(m.id))}
+              selectedFile={selectedFile}
+            />
           </div>
           <button
             type="button"
-            onClick={() => setRightPanelOpen((v) => !v)}
-            className="shrink-0 w-7 flex flex-col justify-center items-center bg-zinc-900/80 hover:bg-zinc-800/90 text-zinc-500 hover:text-zinc-300 text-xs font-mono transition-colors border-l border-zinc-800"
-            title={rightPanelOpen ? "Skrýt nastavení backtestu" : "Zobrazit nastavení backtestu"}
-            aria-expanded={rightPanelOpen}
-            aria-label={rightPanelOpen ? "Skrýt pravý panel" : "Zobrazit pravý panel"}
+            onClick={() => setLeftNavOpen((v) => !v)}
+            className="shrink-0 w-7 flex flex-col justify-center items-center border-r border-zinc-800 bg-zinc-900/80 hover:bg-zinc-800/90 text-zinc-500 hover:text-zinc-300 text-xs font-mono transition-colors"
+            title={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
+            aria-expanded={leftNavOpen}
+            aria-label={leftNavOpen ? "Skrýt levé menu" : "Zobrazit levé menu"}
           >
-            {rightPanelOpen ? "►" : "◄"}
+            {leftNavOpen ? "◄" : "►"}
           </button>
-          <div
-            className={`shrink-0 flex flex-col min-h-0 overflow-hidden bg-zinc-900/50 transition-[width] duration-200 ease-out ${
-              rightPanelOpen ? "w-96 border-l border-zinc-800" : "w-0 border-l-0"
-            }`}
-          >
-            <div className="w-96 h-full min-h-0 overflow-y-auto p-4 flex flex-col gap-3">
-              <div className="flex rounded-lg border border-zinc-700 overflow-hidden text-[11px] shrink-0">
-                <button
-                  type="button"
-                  className={`flex-1 py-2 font-medium px-0.5 ${
-                    rightSettingsTab === "backtest" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
-                  }`}
-                  onClick={() => setRightSettingsTab("backtest")}
-                >
-                  Backtest
-                </button>
-                <button
-                  type="button"
-                  className={`flex-1 py-2 font-medium px-0.5 ${
-                    rightSettingsTab === "sd_test" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
-                  }`}
-                  onClick={() => setRightSettingsTab("sd_test")}
-                >
-                  S/D test
-                </button>
-                <button
-                  type="button"
-                  className={`flex-1 py-2 font-medium px-0.5 ${
-                    rightSettingsTab === "sd_saved" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
-                  }`}
-                  onClick={() => setRightSettingsTab("sd_saved")}
-                >
-                  S/D saved
-                </button>
-                <button
-                  type="button"
-                  className={`flex-1 py-2 font-medium px-0.5 ${
-                    rightSettingsTab === "analytics" ? "bg-zinc-700 text-white" : "bg-zinc-900 text-zinc-400"
-                  }`}
-                  onClick={() => setRightSettingsTab("analytics")}
-                >
-                  Analytics
-                </button>
-              </div>
-              {rightSettingsTab === "sd_test" ? (
-                <SdTestingSettings
-                  instruments={filteredInstruments}
-                  instrumentsLoaded={instrumentsLoaded}
-                  dataLoadError={dataLoadError}
-                  dataFile={sdTestDataFile}
-                  onDataFileChange={setSdTestDataFile}
-                  years={sdTestYears}
-                  onYearsChange={setSdTestYears}
-                  busy={sdTestLoading}
-                  onBusy={setSdTestLoading}
-                  onRequest={setSdTestLastRequest}
-                  onSavedRunId={setSdTestSavedRunId}
-                  savedRunsCount={runHistory.length}
-                  onDeleteSavedBacktests={handleDeleteAllRuns}
-                  onResult={(res) => {
-                    setSdTestResult(res);
-                    setShowSdTestResults(true);
-                    setShowResults(false);
-                  }}
+        </>
+      )}
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        <nav
+          className="pointer-events-none absolute left-1/2 top-3 z-50 flex w-full max-w-3xl -translate-x-1/2 justify-center px-2"
+          aria-label="Režim aplikace"
+        >
+          <div className="pointer-events-auto flex flex-wrap items-center justify-center gap-0.5 rounded-2xl border border-zinc-600/80 bg-zinc-900/95 px-1.5 py-1.5 shadow-xl shadow-black/40 backdrop-blur sm:gap-1">
+            {WORKSPACE_TABS.map(({ id, label }) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setWorkspaceTab(id)}
+                className={`whitespace-nowrap rounded-xl px-2.5 py-1.5 text-[11px] font-medium sm:px-3 sm:text-xs ${
+                  workspaceTab === id
+                    ? "bg-zinc-100 text-zinc-900"
+                    : "text-zinc-400 hover:bg-zinc-800/80 hover:text-zinc-100"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </nav>
+        <div className="flex min-h-0 flex-1 flex-col pt-14">
+          <div className="flex min-h-0 flex-1">
+            <div
+              className={`relative flex min-h-0 min-w-0 flex-1 flex-col ${
+                showRightSettingsPanel ? "border-r border-zinc-800" : ""
+              }`}
+            >
+              {isRunning && (
+                <LoadingOverlay
+                  progress={runProgress > 0 ? runProgress : 0}
+                  message={runProgress > 0 ? `Běží ${runProgress}%` : "Spouštím backtest..."}
+                  onStop={handleStopRun}
                 />
-              ) : rightSettingsTab === "sd_saved" ? (
-                <SdSavedRunsPicker
-                  instruments={filteredInstruments}
-                  onOpen={(doc) => {
-                    setSdTestLastRequest(doc.request as any);
-                    setSdTestResult(doc.response as any);
-                    setSdTestSavedRunId(String(doc.run_id || ""));
-                    setShowSdTestResults(true);
-                    setShowResults(false);
-                  }}
-                />
-              ) : (
-              <BacktestSettings
-                instruments={filteredInstruments}
-                instrumentsLoaded={instrumentsLoaded}
-                dataLoadError={dataLoadError}
-                selectedInstrument={selectedInstrument}
-                selectedInstrumentFiles={selectedInstrumentFiles}
-                onToggleInstrumentFile={toggleInstrumentFile}
-                onSelectAllInstrumentsInList={selectAllInstrumentFiles}
-                years={years}
-                onYearsChange={(y) =>
-                  setYears(
-                    Math.max(MIN_BACKTEST_YEARS, Math.min(y, minYearsAcrossSelected))
-                  )
-                }
-                params={backtestParams}
-                onParamsChange={(p) => setBacktestParams((prev) => ({ ...prev, ...p }))}
-                indicators={indicators}
-                selectedIndicatorIds={selectedIndicatorIds}
-                onSelectIndicators={setSelectedIndicatorIds}
-                modules={modules}
-                selectedModuleIds={selectedModuleIds}
-                onSelectModules={setSelectedModuleIds}
-                onConfirmSelection={handleConfirmSelection}
-                onRun={handleRun}
-                isRunning={isRunning}
-                canRun={openItem?.type === "strategies"}
-                savedRunsCount={runHistory.length}
-                onDeleteSavedBacktests={handleDeleteAllRuns}
-                strategyParams={strategyParams}
-                strategyParamMeta={strategyParamMeta}
-                onStrategyParamsChange={setStrategyParams}
-                moduleParams={moduleParams}
-                moduleParamMeta={moduleParamMeta}
-                onModuleParamsChange={(name, params) =>
-                  setModuleParams((prev) => ({ ...prev, [name]: params }))
-                }
-                moduleParamPanels={moduleParamPanels}
-                indicatorParams={indicatorParams}
-                indicatorParamMeta={indicatorParamMeta}
-                onIndicatorParamsChange={(name, params) =>
-                  setIndicatorParams((prev) => ({ ...prev, [name]: params }))
-                }
-                indicatorNamesForParams={appliedIndicatorIds
-                  .map((id) => indicators.find((i) => i.id === id)?.name)
-                  .filter((n): n is string => !!n)}
-                edgeSettings={edgeSettings}
-                onEdgeSettingsChange={setEdgeSettings}
-              />
               )}
+              {centerContent}
             </div>
+            {showRightSettingsPanel && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setRightPanelOpen((v) => !v)}
+                  className="shrink-0 w-7 flex flex-col justify-center items-center border-l border-zinc-800 bg-zinc-900/80 text-xs font-mono text-zinc-500 transition-colors hover:bg-zinc-800/90 hover:text-zinc-300"
+                  title={rightPanelOpen ? "Skrýt nastavení backtestu" : "Zobrazit nastavení backtestu"}
+                  aria-expanded={rightPanelOpen}
+                  aria-label={rightPanelOpen ? "Skrýt pravý panel" : "Zobrazit pravý panel"}
+                >
+                  {rightPanelOpen ? "►" : "◄"}
+                </button>
+                <div
+                  className={`flex shrink-0 flex-col overflow-hidden bg-zinc-900/50 transition-[width] duration-200 ease-out ${
+                    rightPanelOpen ? "w-96 border-l border-zinc-800" : "w-0 border-l-0"
+                  }`}
+                >
+                  <div className="flex h-full w-96 min-h-0 flex-col gap-3 overflow-y-auto p-4">
+                    <BacktestSettings
+                      instruments={filteredInstruments}
+                      instrumentsLoaded={instrumentsLoaded}
+                      dataLoadError={dataLoadError}
+                      selectedInstrument={selectedInstrument}
+                      selectedInstrumentFiles={selectedInstrumentFiles}
+                      onToggleInstrumentFile={toggleInstrumentFile}
+                      onSelectAllInstrumentsInList={selectAllInstrumentFiles}
+                      years={years}
+                      onYearsChange={(y) =>
+                        setYears(Math.max(MIN_BACKTEST_YEARS, Math.min(y, minYearsAcrossSelected)))
+                      }
+                      params={backtestParams}
+                      onParamsChange={(p) => setBacktestParams((prev) => ({ ...prev, ...p }))}
+                      indicators={indicators}
+                      selectedIndicatorIds={selectedIndicatorIds}
+                      onSelectIndicators={setSelectedIndicatorIds}
+                      modules={modules}
+                      selectedModuleIds={selectedModuleIds}
+                      onSelectModules={setSelectedModuleIds}
+                      onConfirmSelection={handleConfirmSelection}
+                      onRun={handleRun}
+                      isRunning={isRunning}
+                      canRun={openItem?.type === "strategies"}
+                      savedRunsCount={runHistory.length}
+                      onDeleteSavedBacktests={handleDeleteAllRuns}
+                      strategyParams={strategyParams}
+                      strategyParamMeta={strategyParamMeta}
+                      onStrategyParamsChange={setStrategyParams}
+                      moduleParams={moduleParams}
+                      moduleParamMeta={moduleParamMeta}
+                      onModuleParamsChange={(name, params) =>
+                        setModuleParams((prev) => ({ ...prev, [name]: params }))
+                      }
+                      moduleParamPanels={moduleParamPanels}
+                      indicatorParams={indicatorParams}
+                      indicatorParamMeta={indicatorParamMeta}
+                      onIndicatorParamsChange={(name, params) =>
+                        setIndicatorParams((prev) => ({ ...prev, [name]: params }))
+                      }
+                      indicatorNamesForParams={appliedIndicatorIds
+                        .map((id) => indicators.find((i) => i.id === id)?.name)
+                        .filter((n): n is string => !!n)}
+                      edgeSettings={edgeSettings}
+                      onEdgeSettingsChange={setEdgeSettings}
+                      oatSweep={oatSweep}
+                      onOatSweepChange={setOatSweep}
+                      backtestPanel={backtestSettingsPanel}
+                      onBacktestPanelChange={setBacktestSettingsPanel}
+                      propFirmForm={propFirmForm}
+                      onPropFirmFormChange={setPropFirmForm}
+                    />
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
-        <LogPanel
-          logs={logs}
-          minimized={terminalMinimized}
-          onToggleMinimize={() => setTerminalMinimized((v) => !v)}
-        />
       </div>
       <Link
         href="/guide"

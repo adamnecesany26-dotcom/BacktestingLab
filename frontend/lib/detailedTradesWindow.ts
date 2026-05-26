@@ -1,6 +1,6 @@
 import type { ModuleLineOutput, ModuleOutput, ModuleZone, OhlcBar, Trade } from "@shared/types";
 
-export type DetailedViewMode = "by_trades" | "by_months";
+export type DetailedViewMode = "by_trades" | "by_months" | "by_days";
 
 function parseBarMs(s: string | undefined): number {
   if (!s) return NaN;
@@ -41,13 +41,19 @@ export function computeDetailedChartWindow(
   mode: DetailedViewMode,
   page: number,
   tradesPerView: number,
-  monthsPerView: number
+  monthsPerView: number,
+  daysPerView: number
 ): {
   windowOhlc: OhlcBar[];
   visibleTrades: Trade[];
   summary: string;
   hasPrev: boolean;
   hasNext: boolean;
+  /**
+   * Skutečné časové meze výřezu (obchody + padding / měsíce) pro POST /api/view.
+   * Export `ohlc` z runu je globálně podvzorkovaný — bez tohoto načtení je graf řídký.
+   */
+  viewFetchWindow?: { startIso: string; endIso: string };
 } {
   if (!ohlc.length) {
     return {
@@ -115,6 +121,7 @@ export function computeDetailedChartWindow(
     const pad = Math.min(45 * DAY, Math.max(7 * DAY, padBase + 3 * DAY));
     const lo = minT - pad;
     const hi = maxT + pad;
+    const viewFetchWindow = { startIso: new Date(lo).toISOString(), endIso: new Date(hi).toISOString() };
     const win = ohlc.filter((b) => {
       const tt = parseBarMs(b.date);
       return Number.isFinite(tt) && tt >= lo && tt <= hi;
@@ -126,6 +133,63 @@ export function computeDetailedChartWindow(
       summary: `Obchody ${startIdx + 1}–${startIdx + visible.length} z ${trades.length} · ${windowOhlc.length} svíček`,
       hasPrev,
       hasNext,
+      viewFetchWindow,
+    };
+  }
+
+  if (mode === "by_days") {
+    const days = Math.max(1, Math.min(120, Math.floor(daysPerView)));
+    const anchor = new Date(ohlc[0].date);
+    if (Number.isNaN(anchor.getTime())) {
+      return {
+        windowOhlc: ohlc,
+        visibleTrades: trades,
+        summary: "Neplatné datum v OHLC",
+        hasPrev: false,
+        hasNext: false,
+      };
+    }
+    const start = new Date(anchor);
+    start.setDate(start.getDate() + page * days);
+    const end = new Date(start);
+    end.setDate(end.getDate() + days);
+
+    const windowOhlc = ohlc.filter((b) => {
+      const t = new Date(b.date);
+      return !Number.isNaN(t.getTime()) && t >= start && t < end;
+    });
+
+    const lastBar = new Date(ohlc[ohlc.length - 1].date);
+    const hasPrev = page > 0;
+    const hasNext = Number.isFinite(lastBar.getTime()) && lastBar >= end;
+
+    const visibleTrades = trades.filter((tr) => {
+      const e = parseBarMs(tr.entryDate ?? tr.date);
+      const x = parseBarMs(tr.exitDate ?? tr.date);
+      if (!Number.isFinite(e) && !Number.isFinite(x)) return false;
+      const e0 = Number.isFinite(e) ? e : x;
+      const e1 = Number.isFinite(x) ? x : e;
+      const lo = Math.min(e0, e1);
+      const hi = Math.max(e0, e1);
+      return hi >= start.getTime() && lo < end.getTime();
+    });
+
+    const wo =
+      windowOhlc.length > 0
+        ? windowOhlc
+        : ohlc.slice(0, Math.min(80, ohlc.length));
+    const sumExtra = windowOhlc.length === 0 ? " · v tomto okně žádné svíčky (náhled začátku dat)" : "";
+    const viewFetchWindow = {
+      startIso: start.toISOString(),
+      endIso: new Date(end.getTime() - 1).toISOString(),
+    };
+    return {
+      windowOhlc: wo,
+      visibleTrades,
+      summary: `${days} dní · ${start.toLocaleDateString("cs-CZ")} – ${end.toLocaleDateString("cs-CZ")} · ${visibleTrades.length} obch. · ${windowOhlc.length} svíček${sumExtra}`,
+      hasPrev,
+      hasNext,
+      viewFetchWindow,
     };
   }
 
@@ -171,12 +235,17 @@ export function computeDetailedChartWindow(
       ? windowOhlc
       : ohlc.slice(0, Math.min(80, ohlc.length));
   const sumExtra = windowOhlc.length === 0 ? " · v tomto měsíci žádné svíčky (náhled začátku dat)" : "";
+  const viewFetchWindow = {
+    startIso: start.toISOString(),
+    endIso: new Date(end.getTime() - 1).toISOString(),
+  };
   return {
     windowOhlc: wo,
     visibleTrades,
     summary: `Období ${start.toLocaleDateString("cs-CZ")} – ${end.toLocaleDateString("cs-CZ")} · ${visibleTrades.length} obch. · ${windowOhlc.length} svíček${sumExtra}`,
     hasPrev,
     hasNext,
+    viewFetchWindow,
   };
 }
 

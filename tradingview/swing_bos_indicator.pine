@@ -1,0 +1,348 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtesting_app — Swing H/L + BOS (structure only) v1.0
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Cíl indikátoru:
+//  • Najít swing High / Low (lokální extrémy) — identicky jako S/D Pro indikátor.
+//  • Detekovat BOS (break of structure) — identicky jako S/D Pro indikátor.
+//  • ŽÁDNÉ zóny, kvalita, near-touch ani HTF filter — pouze čistá struktura.
+// Logika i konfigurace pro swing + BOS jsou 1:1 s `sd_zones_hl_indicator.pine`.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("Swing H/L + BOS", shorttitle="Struct", overlay=true, format=format.price,
+     max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1) USER INPUTS (1:1 s S/D Pro — sekce „Swingy & BOS“)
+// ════════════════════════════════════════════════════════════════════════════
+gB = "1) Swingy & BOS"
+gV = "2) Vzhled"
+
+// === 1) Swingy & BOS — IDENTICKÉ s S/D Pro indikátorem ===
+int  uPivotBars        = input.int(5, "Pivot bars (L=R)", minval=2, maxval=20, group=gB,
+     tooltip="Šířka pivotního okna nalevo i napravo. 2–4 = citlivé, 5–8 = vyvážené, 9+ = jen velké swingy.")
+int  uSwingSensitivity = input.int(50, "Citlivost swingů (0–100)", minval=0, maxval=100, step=5, group=gB,
+     tooltip="0 = velmi přísný (jen velké pohyby), 100 = velmi citlivý (i drobné). Reguluje min. rozestup mezi po sobě jdoucími swingy.")
+bool uLocalExtMode     = input.bool(true, "Hledat lokální extrém kolem pivotu", group=gB,
+     tooltip="Před registrací swingu prohledá okno ±N barů a pivot posune na skutečný lokální extrém (vyšší high / nižší low).")
+int  uLocalExtRadius   = input.int(15, "Lokální okno (bary)", minval=3, maxval=80, group=gB,
+     tooltip="Šířka okna pro hledání lepšího kandidáta swingu zpět od původního pivotu.")
+int  uBosFollowBars    = input.int(2, "BOS follow-through (1–5)", minval=1, maxval=5, group=gB,
+     tooltip="1 = BOS čistě na close (1 close za hranou). 2–5 = počet po sobě jdoucích close za hranou (cena pokračuje ve směru BOS).")
+int  uBosLookbackBars  = input.int(200, "BOS lookback (bary)", minval=20, maxval=2000, group=gB,
+     tooltip="Maximální stáří swingu, který může být BOS kandidátem. Brání tomu, aby se BOS lámal proti několik let starým swingům. 200 ≈ relevantní recent struktura.")
+
+// === 2) Vzhled ===
+color uColSwingH    = input.color(color.new(#22c55e, 40), "Swing High dot", group=gV)
+color uColSwingL    = input.color(color.new(#3b82f6, 40), "Swing Low dot", group=gV)
+color uColBos       = input.color(color.new(#f59e0b, 0),  "BOS čára", group=gV)
+bool  uShowSwings   = input.bool(true,  "Body swingů", group=gV)
+bool  uShowBos      = input.bool(true,  "Zobrazit BOS čáry", group=gV)
+bool  uShowBosLabel = input.bool(true,  "Štítek BOS↑/↓ na čáře", group=gV,
+     tooltip="Malý popisek u začátku BOS čáry pro snadnou identifikaci směru.")
+bool  uShowTfLabel  = input.bool(true,  "Štítek TF vpravo", group=gV)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2) DERIVED — sensitivity → minimum bars between consecutive swings
+// ════════════════════════════════════════════════════════════════════════════
+// 0 % → 4× pivotBars (přísný), 100 % → 1× pivotBars (citlivý). Identický vzorec jako v S/D Pro.
+float sensFrac    = math.max(0.0, math.min(1.0, uSwingSensitivity / 100.0))
+int   minSwingGap = math.max(2, int(math.round(uPivotBars * (1.0 + (1.0 - sensFrac) * 3.0))))
+
+// Y-scale anchors (skoro neviditelné) — drží auto-scale grafu.
+plot(high,  title="(Y hi)", color=color.new(color.silver, 99), linewidth=1, display=display.all, editable=false)
+plot(low,   title="(Y lo)", color=color.new(color.silver, 99), linewidth=1, display=display.all, editable=false)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3) HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+// Čas na absolutním baru — kreslení přes `xloc.bar_time` (řeší RE10026 lookback limit;
+// box/label/line očekávají series int v `xloc.bar_time` módu).
+// Pine: operátor historie `series[offset]` přijímá offset jen 0..10000 (RE10007 při větší vzdálenosti).
+f_time_at_bar(int absBar) =>
+    int rel = bar_index - absBar
+    (rel < 0 or rel > 10000) ? int(na) : time[rel]
+
+// ════════════════════════════════════════════════════════════════════════════
+// 4) SWING DETECTION (lokální-extrém sweep + alternation) — IDENTICKÉ s S/D Pro
+// ════════════════════════════════════════════════════════════════════════════
+var array<float> swingPx  = array.new_float()
+var array<int>   swingBar = array.new_int()
+var array<int>   swingTyp = array.new_int()    // 1 = high, -1 = low
+
+var int    lastSwingBar  = -1000000
+var string lastSwingType = na
+
+// Native Pine pivots (potvrzeny uPivotBars do minulosti).
+ph = ta.pivothigh(high, uPivotBars, uPivotBars)
+pl = ta.pivotlow(low,   uPivotBars, uPivotBars)
+
+// Lokální sweep: prohledá okno [candBar-radius, candBar] (jen potvrzené bary)
+// a vrátí bar s nejvyšším / nejnižším extrémem. Tím vylepšíme major swingy
+// (skutečné lokální maxima/minima, ne jen „přísnější“ pivot).
+f_local_sweep_high(int candBar, int radius) =>
+    int loB = math.max(0, candBar - radius)
+    int hiB = math.min(bar_index - uPivotBars, candBar)
+    int candOff = bar_index - candBar
+    int   bestB = candBar
+    float bestP = candOff >= 0 ? high[candOff] : na
+    if hiB >= loB
+        for b = loB to hiB
+            int off = bar_index - b
+            if off < 0 or off > 5000
+                continue
+            float px = high[off]
+            if not na(px) and (na(bestP) or px > bestP or (px == bestP and b > bestB))
+                bestP := px
+                bestB := b
+    [bestB, bestP]
+
+f_local_sweep_low(int candBar, int radius) =>
+    int loB = math.max(0, candBar - radius)
+    int hiB = math.min(bar_index - uPivotBars, candBar)
+    int candOff = bar_index - candBar
+    int   bestB = candBar
+    float bestP = candOff >= 0 ? low[candOff] : na
+    if hiB >= loB
+        for b = loB to hiB
+            int off = bar_index - b
+            if off < 0 or off > 5000
+                continue
+            float px = low[off]
+            if not na(px) and (na(bestP) or px < bestP or (px == bestP and b > bestB))
+                bestP := px
+                bestB := b
+    [bestB, bestP]
+
+if barstate.isconfirmed and bar_index >= uPivotBars * 2
+    int pivBar = bar_index - uPivotBars
+
+    // Pivot HIGH kandidát.
+    if not na(ph)
+        int   finalBar = pivBar
+        float finalPx  = ph
+        if uLocalExtMode
+            [bb, bp] = f_local_sweep_high(pivBar, uLocalExtRadius)
+            finalBar := bb
+            finalPx  := bp
+        int n = array.size(swingBar)
+        if n > 0 and array.get(swingTyp, n - 1) == 1
+            // Stejný typ jako poslední — nahrad, pokud nový high je vyšší (oprava
+            // chronického problému: po pivotu může přijít vyšší high a my ho jinak ztratíme).
+            if finalPx > array.get(swingPx, n - 1)
+                array.set(swingPx,  n - 1, finalPx)
+                array.set(swingBar, n - 1, finalBar)
+                lastSwingBar := finalBar
+        else
+            if (finalBar - lastSwingBar) >= minSwingGap
+                array.push(swingBar, finalBar)
+                array.push(swingPx,  finalPx)
+                array.push(swingTyp, 1)
+                lastSwingBar  := finalBar
+                lastSwingType := "high"
+    else if not na(pl)
+        int   finalBar = pivBar
+        float finalPx  = pl
+        if uLocalExtMode
+            [bb, bp] = f_local_sweep_low(pivBar, uLocalExtRadius)
+            finalBar := bb
+            finalPx  := bp
+        int n = array.size(swingBar)
+        if n > 0 and array.get(swingTyp, n - 1) == -1
+            if finalPx < array.get(swingPx, n - 1)
+                array.set(swingPx,  n - 1, finalPx)
+                array.set(swingBar, n - 1, finalBar)
+                lastSwingBar := finalBar
+        else
+            if (finalBar - lastSwingBar) >= minSwingGap
+                array.push(swingBar, finalBar)
+                array.push(swingPx,  finalPx)
+                array.push(swingTyp, -1)
+                lastSwingBar  := finalBar
+                lastSwingType := "low"
+
+    while array.size(swingBar) > 300
+        array.shift(swingBar)
+        array.shift(swingPx)
+        array.shift(swingTyp)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 5) BOS STATE (broken-mark + frontier) — IDENTICKÉ s S/D Pro
+// ════════════════════════════════════════════════════════════════════════════
+var array<int> brokenHighBars = array.new_int()
+var array<int> brokenLowBars  = array.new_int()
+
+// Pozice (bar) posledního BOS swingu — slouží k tomu, aby se BOS lámal jen na
+// swinzích, které nastaly POZDĚJI než předchozí BOS. Tím se zabrání zavalení
+// grafu „phantom BOS" čárami u staré struktury, kterou už cena dávno prolomila.
+var int lastBosUpSwingBar = -1
+var int lastBosDnSwingBar = -1
+
+// Cap BOS line objektů — UI cleanliness.
+var array<line>  bosLines  = array.new_line()
+var array<label> bosLabels = array.new_label()
+int BOS_LINES_CAP = 30
+
+f_was_broken_h(int sb) => array.indexof(brokenHighBars, sb) >= 0
+f_was_broken_l(int sb) => array.indexof(brokenLowBars,  sb) >= 0
+
+// ════════════════════════════════════════════════════════════════════════════
+// 6) BOS DETECTION (potvrzení = N po sobě jdoucích close za hranou)
+// ──────────────────────────────────────────────────────────────────────
+// Klíčová pravidla relevance:
+//  • Kandidát musí být POZDĚJI než poslední BOS swing (lastBosUpSwingBar / Dn).
+//  • Stáří kandidáta ≤ uBosLookbackBars (relevantní recent struktura).
+//  • Kandidát musí ležet v „history-window" Pine [0..10000] (RE10007 safe).
+// Tím odpadne kreslení BOS proti několik let staré struktuře a zbytečné čáry.
+// ════════════════════════════════════════════════════════════════════════════
+if barstate.isconfirmed and bar_index >= uBosFollowBars
+    int A = uBosFollowBars
+    int bosBar = bar_index - A + 1     // první close streaku
+    int minRelevantBar = bar_index - uBosLookbackBars
+    int historyFloor   = bar_index - 10000  // RE10007 safety
+
+    // ── BOS up ──
+    float minCloseLastA = close
+    for k = 0 to A - 1
+        float c = close[k]
+        if not na(c) and c < minCloseLastA
+            minCloseLastA := c
+
+    int   bestHBar = na
+    float bestHPx  = na
+    int   nS = array.size(swingBar)
+    if nS > 0
+        for i = 0 to nS - 1
+            if array.get(swingTyp, i) == 1
+                int sb = array.get(swingBar, i)
+                float sp = array.get(swingPx, i)
+                bool relevant = sb > lastBosUpSwingBar and sb >= minRelevantBar and sb >= historyFloor
+                if relevant and sb <= bosBar - 1 and sp < minCloseLastA and not f_was_broken_h(sb)
+                    if na(bestHBar) or sp > bestHPx
+                        bestHBar := sb
+                        bestHPx  := sp
+
+    if not na(bestHBar)
+        // Označit jako broken všechny swing-highy ≤ bestHPx (potlačí re-fire na stejných úrovních).
+        for i = 0 to nS - 1
+            if array.get(swingTyp, i) == 1
+                int sb = array.get(swingBar, i)
+                float sp = array.get(swingPx, i)
+                if sp <= bestHPx and not f_was_broken_h(sb)
+                    array.push(brokenHighBars, sb)
+        // Posun „BOS frontier" — další BOS up bude jen na NOVĚJŠÍ swing.
+        lastBosUpSwingBar := bestHBar
+        if uShowBos
+            int tBosH = f_time_at_bar(bestHBar)
+            if not na(tBosH)
+                line ln = line.new(tBosH, bestHPx, time, bestHPx,
+                     xloc=xloc.bar_time, color=uColBos, width=1, style=line.style_dashed)
+                array.push(bosLines, ln)
+                if uShowBosLabel
+                    label lb = label.new(tBosH, bestHPx, xloc=xloc.bar_time, yloc=yloc.price,
+                         text="BOS↑", style=label.style_label_lower_right,
+                         color=color.new(uColBos, 30), textcolor=color.white, size=size.tiny,
+                         tooltip="Break of structure UP @ " + str.tostring(bestHPx))
+                    array.push(bosLabels, lb)
+                while array.size(bosLines) > BOS_LINES_CAP
+                    line.delete(array.shift(bosLines))
+                while array.size(bosLabels) > BOS_LINES_CAP
+                    label.delete(array.shift(bosLabels))
+
+    while array.size(brokenHighBars) > 200
+        array.shift(brokenHighBars)
+
+    // ── BOS down ──
+    float maxCloseLastA = close
+    for k = 0 to A - 1
+        float c = close[k]
+        if not na(c) and c > maxCloseLastA
+            maxCloseLastA := c
+
+    int   bestLBar = na
+    float bestLPx  = na
+    if nS > 0
+        for i = 0 to nS - 1
+            if array.get(swingTyp, i) == -1
+                int sb = array.get(swingBar, i)
+                float sp = array.get(swingPx, i)
+                bool relevant = sb > lastBosDnSwingBar and sb >= minRelevantBar and sb >= historyFloor
+                if relevant and sb <= bosBar - 1 and sp > maxCloseLastA and not f_was_broken_l(sb)
+                    if na(bestLBar) or sp < bestLPx
+                        bestLBar := sb
+                        bestLPx  := sp
+
+    if not na(bestLBar)
+        for i = 0 to nS - 1
+            if array.get(swingTyp, i) == -1
+                int sb = array.get(swingBar, i)
+                float sp = array.get(swingPx, i)
+                if sp >= bestLPx and not f_was_broken_l(sb)
+                    array.push(brokenLowBars, sb)
+        lastBosDnSwingBar := bestLBar
+        if uShowBos
+            int tBosL = f_time_at_bar(bestLBar)
+            if not na(tBosL)
+                line ln = line.new(tBosL, bestLPx, time, bestLPx,
+                     xloc=xloc.bar_time, color=uColBos, width=1, style=line.style_dashed)
+                array.push(bosLines, ln)
+                if uShowBosLabel
+                    label lb = label.new(tBosL, bestLPx, xloc=xloc.bar_time, yloc=yloc.price,
+                         text="BOS↓", style=label.style_label_upper_right,
+                         color=color.new(uColBos, 30), textcolor=color.white, size=size.tiny,
+                         tooltip="Break of structure DOWN @ " + str.tostring(bestLPx))
+                    array.push(bosLabels, lb)
+                while array.size(bosLines) > BOS_LINES_CAP
+                    line.delete(array.shift(bosLines))
+                while array.size(bosLabels) > BOS_LINES_CAP
+                    label.delete(array.shift(bosLabels))
+
+    while array.size(brokenLowBars) > 200
+        array.shift(brokenLowBars)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 7) SWING DOTS (vykreslení posledního zaregistrovaného swingu)
+// ════════════════════════════════════════════════════════════════════════════
+var array<label> swingLbls = array.new_label()
+var int prevTipBar = na
+
+if barstate.isconfirmed and uShowSwings
+    int nSL = array.size(swingBar)
+    if nSL > 0
+        int tip = array.get(swingBar, nSL - 1)
+        if na(prevTipBar) or tip != prevTipBar
+            int   typ = array.get(swingTyp, nSL - 1)
+            float px  = array.get(swingPx,  nSL - 1)
+            color cc  = typ == 1 ? uColSwingH : uColSwingL
+            int tx = f_time_at_bar(tip)
+            if not na(tx)
+                label lb  = label.new(tx, px, xloc=xloc.bar_time, yloc=yloc.price,
+                     style=label.style_circle, color=cc, size=size.tiny, text="")
+                array.push(swingLbls, lb)
+            prevTipBar := tip
+        while array.size(swingLbls) > 300
+            label.delete(array.shift(swingLbls))
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8) TF LABEL (vpravo, fixní informace o aktuálním TF)
+// ════════════════════════════════════════════════════════════════════════════
+var label tfLabel = na
+if barstate.islast
+    if uShowTfLabel
+        int nSwTotal = array.size(swingBar)
+        int nBosTotal = array.size(brokenHighBars) + array.size(brokenLowBars)
+        string txt = "TF: " + timeframe.period +
+             "  swings: " + str.tostring(nSwTotal) +
+             "  BOS: " + str.tostring(nBosTotal)
+        if na(tfLabel)
+            tfLabel := label.new(bar_index, high, xloc=xloc.bar_index, yloc=yloc.price,
+                 text=txt, style=label.style_label_left, color=color(na),
+                 textcolor=color.new(color.silver, 0), size=size.small,
+                 tooltip="TF + počet zaregistrovaných swingů a BOS eventů (cumulative).")
+        else
+            label.set_x(tfLabel, bar_index)
+            label.set_y(tfLabel, high)
+            label.set_text(tfLabel, txt)
+    else
+        if not na(tfLabel)
+            label.delete(tfLabel)
+            tfLabel := na

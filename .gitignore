@@ -1,2 +1,11 @@
 # Precomputed H/L + S/D artifacts (Parquet/JSON; can be large)
 .backtest_artifacts/
+
+# Massive FX OHLC Parquet cache (local)
+backend/data/massive_fx/
+
+# Secrets (MASSIVE_API_KEY, atd.)
+.env
+**/.env
+!.env.example
+!**/.env.example

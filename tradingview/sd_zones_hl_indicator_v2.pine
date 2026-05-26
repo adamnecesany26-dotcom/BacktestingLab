@@ -1,0 +1,352 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtesting_app — S/D market structure v2 (Swings + BOS + Liquidity + Range)
+//@version=6
+indicator("S/D market structure v2 (Swings+BOS+Liquidity+Range)", shorttitle="S/D MS v2", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=200, max_bars_back=5000)
+
+// ————————————————————————————————————————————————————————————————
+// Inputs (UX)
+// ————————————————————————————————————————————————————————————————
+string gS = "Structure"
+string gL = "Liquidity (Equal highs/lows)"
+string gR = "Range/Chop"
+string gV = "Display"
+
+int uSwingLR = input.int(4, "Swing sensitivity (pivot L/R)", minval=1, maxval=25, group=gS, tooltip="Pivot swing: high/low is confirmed after R bars. Higher = fewer, higher-quality swings, but more lag.")
+
+string uBufMode = input.string("Ticks", "BOS buffer mode", options=["Ticks", "ATR"], group=gS)
+float uBosBufTicks = input.float(0.0, "BOS buffer (ticks)", minval=0.0, step=0.25, group=gS, tooltip="Extra distance beyond swing level required on close (ticks). 0 = close just beyond level.")
+float uBosBufAtr = input.float(0.0, "BOS buffer (×ATR)", minval=0.0, step=0.05, group=gS, tooltip="Extra distance beyond swing level required on close (ATR multiple). 0 = close just beyond level.")
+int uBosCooldownBars = input.int(0, "BOS cooldown (bars)", minval=0, maxval=500, group=gS, tooltip="Optional: after BOS, ignore additional BOS for N bars (helps in very noisy conditions).")
+
+string uEqTolMode = input.string("ATR", "Equal tolerance mode", options=["Ticks", "ATR"], group=gL)
+float uEqTolTicks = input.float(4.0, "Equal tolerance (ticks)", minval=0.0, step=0.25, group=gL, tooltip="How close two swing highs/lows must be to be treated as the same liquidity level.")
+float uEqTolAtr = input.float(0.15, "Equal tolerance (×ATR)", minval=0.0, step=0.01, group=gL, tooltip="ATR-based tolerance for equal highs/lows.")
+int uEqMinCount = input.int(2, "Min swings for liquidity level", minval=2, maxval=10, group=gL, tooltip="Liquidity level becomes active after this many equal swings are clustered.")
+bool uConsumeOnce = input.bool(true, "Consume liquidity level after BOS", group=gL, tooltip="If enabled, a liquidity level can trigger BOS only once until it is replaced by a new level.")
+
+int uRangeLookback = input.int(80, "Range lookback (bars)", minval=20, maxval=500, group=gR)
+float uRangeMaxWidthAtr = input.float(2.5, "Range max width (×ATR)", minval=0.5, maxval=15.0, step=0.1, group=gR, tooltip="If (highest-high - lowest-low) over lookback <= this × ATR, market is considered in range.")
+bool uSuppressBosInRange = input.bool(true, "Suppress BOS inside range", group=gR, tooltip="If enabled, BOS is ignored while in range; only breakout BOS is emitted when price exits the range.")
+string uRangeBreakMode = input.string("ATR", "Range breakout buffer mode", options=["Ticks", "ATR"], group=gR)
+float uRangeBreakTicks = input.float(2.0, "Range breakout buffer (ticks)", minval=0.0, step=0.25, group=gR)
+float uRangeBreakAtr = input.float(0.10, "Range breakout buffer (×ATR)", minval=0.0, step=0.01, group=gR)
+
+bool uShowSwings = input.bool(true, "Show swings (H/L)", group=gV)
+bool uShowBos = input.bool(true, "Show BOS levels", group=gV)
+bool uShowLiquidity = input.bool(true, "Show liquidity levels", group=gV)
+bool uShowRange = input.bool(true, "Show range box", group=gV)
+bool uShowDebugText = input.bool(false, "Debug: show labels (reasons)", group=gV, tooltip="Adds extra labels; can hit label limits on long history.")
+
+color cSwingHigh = input.color(color.new(#22c55e, 0), "Swing High color", group=gV)
+color cSwingLow = input.color(color.new(#3b82f6, 0), "Swing Low color", group=gV)
+color cBosUp = input.color(color.new(#f59e0b, 0), "BOS Up color", group=gV)
+color cBosDn = input.color(color.new(#f97316, 0), "BOS Down color", group=gV)
+color cLiqHigh = input.color(color.new(#ef4444, 0), "Liquidity High color", group=gV)
+color cLiqLow = input.color(color.new(#06b6d4, 0), "Liquidity Low color", group=gV)
+color cRangeFill = input.color(color.new(#94a3b8, 86), "Range fill", group=gV)
+color cRangeBorder = input.color(color.new(#94a3b8, 55), "Range border", group=gV)
+int uMaxLinesKeep = input.int(120, "Max BOS/Liq lines kept", minval=20, maxval=450, group=gV, tooltip="To stay within TradingView object limits.")
+
+// ————————————————————————————————————————————————————————————————
+// Helpers
+// ————————————————————————————————————————————————————————————————
+float atr = ta.atr(14)
+float safeAtr = na(atr) or atr <= 0 ? syminfo.mintick : atr
+
+f_tol_eq() =>
+    uEqTolMode == "Ticks" ? (uEqTolTicks * syminfo.mintick) : (uEqTolAtr * safeAtr)
+
+f_buf_bos() =>
+    uBufMode == "Ticks" ? (uBosBufTicks * syminfo.mintick) : (uBosBufAtr * safeAtr)
+
+f_buf_range_break() =>
+    uRangeBreakMode == "Ticks" ? (uRangeBreakTicks * syminfo.mintick) : (uRangeBreakAtr * safeAtr)
+
+f_trim_lines(array<line> ls) =>
+    while array.size(ls) > uMaxLinesKeep
+        line.delete(array.shift(ls))
+
+f_trim_labels(array<label> ls, int cap) =>
+    while array.size(ls) > cap
+        label.delete(array.shift(ls))
+
+// ————————————————————————————————————————————————————————————————
+// State (swings + liquidity clusters)
+// ————————————————————————————————————————————————————————————————
+var array<int> swBar = array.new_int()
+var array<float> swPx = array.new_float()
+var array<int> swTyp = array.new_int() // 1=high, -1=low
+var array<label> swLbl = array.new_label()
+
+// Liquidity clusters (equal highs/lows)
+var array<float> liqPx = array.new_float()
+var array<int> liqTyp = array.new_int() // 1=high, -1=low
+var array<int> liqCnt = array.new_int()
+var array<bool> liqConsumed = array.new_bool()
+var array<line> liqLineByIx = array.new_line()
+// Pivot bar indices that formed this cluster (segment ends at last pivot, not at chart edge)
+var array<int> liqPivotBarLo = array.new_int()
+var array<int> liqPivotBarHi = array.new_int()
+// When uConsumeOnce: bar where BOS took this level (freeze right end)
+var array<int> liqBosEndBar = array.new_int()
+
+var array<line> bosLines = array.new_line()
+var array<line> liqLines = array.new_line()
+
+var float lastSwingHigh = na
+var int lastSwingHighBar = na
+var float lastSwingLow = na
+var int lastSwingLowBar = na
+
+// Per-swing BOS consume flag: prevents multiple BOS lines being stacked on the
+// same swing level while the swing is still the latest one (until a new pivot
+// of the same direction confirms).
+var bool lastSwingHighBosed = false
+var bool lastSwingLowBosed = false
+
+var int lastBosBar = na
+
+// ————————————————————————————————————————————————————————————————
+// 1) Swing detection (pivot L/R)
+// ————————————————————————————————————————————————————————————————
+int L = uSwingLR
+int R = uSwingLR
+float ph = ta.pivothigh(high, L, R)
+float pl = ta.pivotlow(low, L, R)
+
+if barstate.isconfirmed
+    if not na(ph)
+        int b = bar_index - R
+        float px = ph
+        array.push(swBar, b)
+        array.push(swPx, px)
+        array.push(swTyp, 1)
+        lastSwingHigh := px
+        lastSwingHighBar := b
+        lastSwingHighBosed := false
+        if uShowSwings
+            label lb = label.new(b, px, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, text="", size=size.tiny, color=color.new(cSwingHigh, 0), tooltip="Swing High")
+            array.push(swLbl, lb)
+    if not na(pl)
+        int b = bar_index - R
+        float px = pl
+        array.push(swBar, b)
+        array.push(swPx, px)
+        array.push(swTyp, -1)
+        lastSwingLow := px
+        lastSwingLowBar := b
+        lastSwingLowBosed := false
+        if uShowSwings
+            label lb = label.new(b, px, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, text="", size=size.tiny, color=color.new(cSwingLow, 0), tooltip="Swing Low")
+            array.push(swLbl, lb)
+
+    // Keep swing arrays bounded
+    while array.size(swBar) > 700
+        array.shift(swBar), array.shift(swPx), array.shift(swTyp)
+    f_trim_labels(swLbl, 450)
+
+// ————————————————————————————————————————————————————————————————
+// 2) Liquidity clustering (equal highs/lows)
+//    When a swing is added, merge it into an existing cluster if within tolerance.
+// ————————————————————————————————————————————————————————————————
+f_add_liq(int t, float px, int pivotBar) =>
+    float tol = f_tol_eq()
+    bool merged = false
+    int n = array.size(liqPx)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(liqTyp, i) != t
+                continue
+            float lp = array.get(liqPx, i)
+            if math.abs(lp - px) <= tol
+                int c = array.get(liqCnt, i)
+                float newLp = (lp * c + px) / (c + 1)
+                array.set(liqPx, i, newLp)
+                array.set(liqCnt, i, c + 1)
+                array.set(liqPivotBarLo, i, math.min(array.get(liqPivotBarLo, i), pivotBar))
+                array.set(liqPivotBarHi, i, math.max(array.get(liqPivotBarHi, i), pivotBar))
+                if uConsumeOnce
+                    array.set(liqConsumed, i, false)
+                    array.set(liqBosEndBar, i, na)
+                merged := true
+                break
+    if not merged
+        array.push(liqPx, px)
+        array.push(liqTyp, t)
+        array.push(liqCnt, 1)
+        array.push(liqConsumed, false)
+        array.push(liqLineByIx, na)
+        array.push(liqPivotBarLo, pivotBar)
+        array.push(liqPivotBarHi, pivotBar)
+        array.push(liqBosEndBar, na)
+
+// Feed new swings into liquidity clusters (use pivot events)
+if barstate.isconfirmed
+    if not na(ph)
+        f_add_liq(1, ph, bar_index - R)
+    if not na(pl)
+        f_add_liq(-1, pl, bar_index - R)
+    // Keep clusters bounded
+    while array.size(liqPx) > 200
+        // delete any associated line before shifting
+        line ln0 = array.shift(liqLineByIx)
+        if not na(ln0)
+            line.delete(ln0)
+        array.shift(liqPx), array.shift(liqTyp), array.shift(liqCnt), array.shift(liqConsumed)
+        array.shift(liqPivotBarLo), array.shift(liqPivotBarHi), array.shift(liqBosEndBar)
+
+// ————————————————————————————————————————————————————————————————
+// 3) Range detection
+// ————————————————————————————————————————————————————————————————
+float rHi = ta.highest(high, uRangeLookback)
+float rLo = ta.lowest(low, uRangeLookback)
+float rW = rHi - rLo
+bool inRange = rW <= uRangeMaxWidthAtr * safeAtr
+
+var box rangeBox = na
+if uShowRange and barstate.isconfirmed
+    int left = bar_index - uRangeLookback + 1
+    int right = bar_index
+    if na(rangeBox)
+        rangeBox := box.new(left, rHi, right, rLo, xloc=xloc.bar_index, bgcolor=cRangeFill, border_color=cRangeBorder)
+    else
+        box.set_left(rangeBox, left)
+        box.set_right(rangeBox, right)
+        box.set_top(rangeBox, rHi)
+        box.set_bottom(rangeBox, rLo)
+        box.set_bgcolor(rangeBox, inRange ? cRangeFill : color.new(cRangeFill, 96))
+        box.set_border_color(rangeBox, inRange ? cRangeBorder : color.new(cRangeBorder, 80))
+if (not uShowRange) and not na(rangeBox)
+    box.delete(rangeBox)
+    rangeBox := na
+
+// ————————————————————————————————————————————————————————————————
+// 4) BOS detection (close strength buffer + liquidity consumption + range suppression)
+// ————————————————————————————————————————————————————————————————
+bool cooldownOk = uBosCooldownBars <= 0 or na(lastBosBar) or (bar_index - lastBosBar) > uBosCooldownBars
+float bosBuf = f_buf_bos()
+float brkBuf = f_buf_range_break()
+
+bool bullBos = cooldownOk and not na(lastSwingHigh) and not lastSwingHighBosed and close > (lastSwingHigh + bosBuf)
+bool bearBos = cooldownOk and not na(lastSwingLow) and not lastSwingLowBosed and close < (lastSwingLow - bosBuf)
+
+// Range suppression: ignore BOS while in range; only fire when breaking out of range
+bool bullRangeBreak = close > (rHi + brkBuf)
+bool bearRangeBreak = close < (rLo - brkBuf)
+
+if uSuppressBosInRange and inRange
+    bullBos := false
+    bearBos := false
+else if uSuppressBosInRange and (not inRange)
+    // If range existed recently, we still only want a clean breakout BOS.
+    // Treat it as BOS only if breakout condition is met.
+    bullBos := bullBos and bullRangeBreak
+    bearBos := bearBos and bearRangeBreak
+
+// Liquidity rule: if BOS level is an equal-high/low cluster, only allow one BOS per cluster.
+f_find_liq_cluster(int t, float lvl) =>
+    float tol = f_tol_eq()
+    int out = na
+    int n = array.size(liqPx)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(liqTyp, i) != t
+                continue
+            float lp = array.get(liqPx, i)
+            if math.abs(lp - lvl) <= tol and array.get(liqCnt, i) >= uEqMinCount
+                out := i
+                break
+    out
+
+bool emitBull = bullBos
+bool emitBear = bearBos
+int liqIxBull = na
+int liqIxBear = na
+if emitBull
+    liqIxBull := f_find_liq_cluster(1, lastSwingHigh)
+    if not na(liqIxBull) and uConsumeOnce and array.get(liqConsumed, liqIxBull)
+        emitBull := false
+if emitBear
+    liqIxBear := f_find_liq_cluster(-1, lastSwingLow)
+    if not na(liqIxBear) and uConsumeOnce and array.get(liqConsumed, liqIxBear)
+        emitBear := false
+
+// Emit BOS events
+//   Line goes from the originating swing bar (left) to the BOS bar (right)
+//   and never extends — this is the *historical* break record, not a level.
+if barstate.isconfirmed and uShowBos
+    if emitBull
+        lastBosBar := bar_index
+        float lvl = lastSwingHigh
+        int xLeft = na(lastSwingHighBar) ? bar_index - 1 : lastSwingHighBar
+        int xRight = bar_index
+        line ln = line.new(xLeft, lvl, xRight, lvl, xloc=xloc.bar_index, extend=extend.none, color=cBosUp, width=2, style=line.style_solid)
+        array.push(bosLines, ln)
+        // mark this swing as already broken so we don't redraw on every bar
+        lastSwingHighBosed := true
+        if not na(liqIxBull) and uConsumeOnce
+            array.set(liqConsumed, liqIxBull, true)
+            array.set(liqBosEndBar, liqIxBull, bar_index)
+        if uShowDebugText
+            label.new(bar_index, high, xloc=xloc.bar_index, yloc=yloc.price, text="BOS↑", style=label.style_label_up, color=color.new(cBosUp, 70), textcolor=color.white, size=size.tiny, tooltip="lvl=" + str.tostring(lvl, format.mintick) + " swBar=" + str.tostring(lastSwingHighBar))
+    if emitBear
+        lastBosBar := bar_index
+        float lvl = lastSwingLow
+        int xLeft = na(lastSwingLowBar) ? bar_index - 1 : lastSwingLowBar
+        int xRight = bar_index
+        line ln = line.new(xLeft, lvl, xRight, lvl, xloc=xloc.bar_index, extend=extend.none, color=cBosDn, width=2, style=line.style_solid)
+        array.push(bosLines, ln)
+        lastSwingLowBosed := true
+        if not na(liqIxBear) and uConsumeOnce
+            array.set(liqConsumed, liqIxBear, true)
+            array.set(liqBosEndBar, liqIxBear, bar_index)
+        if uShowDebugText
+            label.new(bar_index, low, xloc=xloc.bar_index, yloc=yloc.price, text="BOS↓", style=label.style_label_down, color=color.new(cBosDn, 70), textcolor=color.white, size=size.tiny, tooltip="lvl=" + str.tostring(lvl, format.mintick) + " swBar=" + str.tostring(lastSwingLowBar))
+    f_trim_lines(bosLines)
+
+// Draw liquidity levels: segment from earliest → latest equal swing; if consumed, right end = BOS bar (frozen)
+if barstate.isconfirmed
+    int nL = array.size(liqPx)
+    if uShowLiquidity and nL > 0
+        for i = 0 to nL - 1
+            int t = array.get(liqTyp, i)
+            int c = array.get(liqCnt, i)
+            float lvl = array.get(liqPx, i)
+            bool active = c >= uEqMinCount
+            line ln = array.get(liqLineByIx, i)
+            if active
+                int xL = array.get(liqPivotBarLo, i)
+                int xR = array.get(liqPivotBarHi, i)
+                bool cons = array.get(liqConsumed, i)
+                int bosEnd = array.get(liqBosEndBar, i)
+                if cons and not na(bosEnd)
+                    xR := bosEnd
+                color lc = t == 1 ? cLiqHigh : cLiqLow
+                int w = cons ? 1 : 2
+                st = cons ? line.style_dotted : line.style_dashed
+                if na(ln)
+                    ln := line.new(xL, lvl, xR, lvl, xloc=xloc.bar_index, extend=extend.none, color=lc, width=w, style=st)
+                    array.set(liqLineByIx, i, ln)
+                else
+                    line.set_xy1(ln, xL, lvl)
+                    line.set_xy2(ln, xR, lvl)
+                    line.set_color(ln, lc)
+                    line.set_width(ln, w)
+                    line.set_style(ln, st)
+            else
+                if not na(ln)
+                    line.delete(ln)
+                    array.set(liqLineByIx, i, na)
+    else
+        // Hide liquidity: delete all lines
+        int n0 = array.size(liqLineByIx)
+        if n0 > 0
+            for i = 0 to n0 - 1
+                line ln = array.get(liqLineByIx, i)
+                if not na(ln)
+                    line.delete(ln)
+                    array.set(liqLineByIx, i, na)
+
+// Minimal status in Data Window
+plot(uShowDebugText ? float(array.size(swBar)) : na, title="dbg_swings_count", display=display.data_window, editable=false)
+plot(uShowDebugText ? float(array.size(liqPx)) : na, title="dbg_liquidity_clusters", display=display.data_window, editable=false)

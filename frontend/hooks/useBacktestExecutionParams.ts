@@ -1,39 +1,25 @@
 "use client";
 
 import { useState } from "react";
-import type { CommissionMode } from "@/components/BacktestSettings";
-import type { InstrumentType } from "@shared/types";
+import { getFuturesExecutionSpec } from "@/lib/futuresExecutionSpec";
 
 export type BacktestExecutionParamsState = {
   initialCapital: number;
   slippagePerc: number;
-  commissionPerc: number;
-  commissionMode: CommissionMode;
+  /** USD za kontrakt za stranu (vždy tento režim v UI). */
   commissionPerContract: number;
-  instrumentType: InstrumentType;
   tickSize?: number;
   valuePerTick?: number;
-  shareSize?: number;
-  lotSize?: number;
-  pipSize?: number;
-  pipValue?: number;
-  runTimeoutSec: number;
 };
+
+const _boot = getFuturesExecutionSpec("NQ");
 
 export const DEFAULT_BACKTEST_EXECUTION_PARAMS: BacktestExecutionParamsState = {
   initialCapital: 100000,
-  slippagePerc: 0.001,
-  commissionPerc: 0.0,
-  commissionMode: "percentage",
-  commissionPerContract: 2.25,
-  instrumentType: "futures",
-  tickSize: 0.25,
-  valuePerTick: 5,
-  shareSize: 100,
-  lotSize: 1,
-  pipSize: 0.0001,
-  pipValue: 10,
-  runTimeoutSec: 3600,
+  slippagePerc: _boot.defaultSlippagePerc,
+  commissionPerContract: 0,
+  tickSize: _boot.tickSize,
+  valuePerTick: _boot.valuePerTick,
 };
 
 /** Základní execution / broker parametry pro `RunRequest` (Basic panel). */

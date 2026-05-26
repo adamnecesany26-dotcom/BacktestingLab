@@ -11,7 +11,6 @@ import pytest
 _MOD_PATH = (
     Path(__file__).resolve().parents[2]
     / "strategies"
-    / "sd_zone_strategy"
     / "modules"
     / "Swing_HL.py"
 )

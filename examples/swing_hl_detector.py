@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-# FIRESTORE_SYNC — examples/swing_hl_detector.py — zástupný import — do Firestore vlož spíš strategies/sd_zone_strategy/modules/Swing_HL.py (tento soubor jen přeposílá).
+# FIRESTORE_SYNC — examples/swing_hl_detector.py — zástupný import — do Firestore vlož spíš strategies/modules/Swing_HL.py (tento soubor jen přeposílá).
 """
 Zástupný modul pro zpětnou kompatibilitu importů (`examples.swing_hl_detector`).
 
-Jediný zdroj implementace: ``strategies/sd_zone_strategy/modules/Swing_HL.py``.
+Jediný zdroj implementace: ``strategies/modules/Swing_HL.py``.
 Upravuj vždy tam; tento soubor jen přenačte ten modul pod jménem tohoto balíčku.
 """
 
@@ -13,13 +13,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-_CANONICAL = (
-    Path(__file__).resolve().parent.parent
-    / "strategies"
-    / "sd_zone_strategy"
-    / "modules"
-    / "Swing_HL.py"
-)
+_CANONICAL = Path(__file__).resolve().parent.parent / "strategies" / "modules" / "Swing_HL.py"
 if not _CANONICAL.is_file():
     raise ImportError(f"Swing HL canonical module not found: {_CANONICAL}")
 

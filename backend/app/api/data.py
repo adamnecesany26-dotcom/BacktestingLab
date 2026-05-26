@@ -19,6 +19,7 @@ _DATA_CACHE: dict[str, object] = {"signature": None, "payload": None}
 
 FUTURES_SYMBOL_METADATA: dict[str, str] = {
     "NQ": "Nasdaq-100 E-mini",
+    "MNQ": "Nasdaq-100 Micro E-mini",
     "ES": "S&P 500 E-mini",
     "CL": "Crude Oil WTI",
     "GC": "Gold",
@@ -49,11 +50,19 @@ def _get_data_dir() -> Path:
     # data.py is in backend/app/api/ -> parent.parent.parent = backend
     backend_root = Path(__file__).resolve().parent.parent.parent
     primary = backend_root.parent / "data"  # project root / data
-    if (primary / "mock").exists() or (primary / "futures_30m").exists():
+
+    def _has_market_data(d: Path) -> bool:
+        return (
+            (d / "mock").exists()
+            or (d / "futures_30m").exists()
+            or (d / "futures_mnq").exists()
+        )
+
+    if _has_market_data(primary):
         return primary
     # Fallback when backend runs from different cwd (e.g. project root)
     for candidate in [Path.cwd() / "data", Path.cwd().parent / "data"]:
-        if (candidate / "mock").exists() or (candidate / "futures_30m").exists():
+        if _has_market_data(candidate):
             return candidate
     return primary
 
@@ -187,11 +196,14 @@ def _build_data_signature(data_dir: Path) -> tuple:
     files: list[Path] = []
     mock_dir = data_dir / "mock"
     futures_30m_dir = data_dir / "futures_30m"
+    futures_mnq_dir = data_dir / "futures_mnq"
     if mock_dir.is_dir():
         files.extend(mock_dir.rglob("*.csv"))
     if futures_30m_dir.is_dir():
         files.extend(futures_30m_dir.glob("*.txt"))
         files.extend(futures_30m_dir.glob("*.parquet"))
+    if futures_mnq_dir.is_dir():
+        files.extend(futures_mnq_dir.glob("*.parquet"))
     out: list[tuple[str, int]] = []
     for f in sorted(files):
         try:
@@ -207,16 +219,21 @@ async def get_data_debug():
     data_dir = _get_data_dir()
     mock_dir = data_dir / "mock"
     futures_30m_dir = data_dir / "futures_30m"
+    futures_mnq_dir = data_dir / "futures_mnq"
     csv_files = list(mock_dir.glob("*.csv")) if mock_dir.exists() else []
     txt_files = list(futures_30m_dir.glob("*.txt")) if futures_30m_dir.exists() else []
+    pq_mnq = list(futures_mnq_dir.glob("*.parquet")) if futures_mnq_dir.exists() else []
     return {
         "data_dir": str(data_dir.absolute()),
         "mock_exists": mock_dir.exists(),
         "futures_30m_exists": futures_30m_dir.exists(),
+        "futures_mnq_exists": futures_mnq_dir.exists(),
         "csv_count": len(csv_files),
         "txt_count": len(txt_files),
+        "futures_mnq_parquet_count": len(pq_mnq),
         "csv_files": [f.name for f in csv_files[:20]],
         "txt_files": [f.name for f in txt_files[:20]],
+        "futures_mnq_parquet_files": [f.name for f in pq_mnq[:20]],
     }
 
 
@@ -225,7 +242,8 @@ async def get_available_data():
     """
     Scan data folder for available instruments.
     Returns list of { instrument, timeframe, minDate, maxDate, yearsAvailable, instrumentType, brokerConfig }.
-    instrumentType from folder: mock/*.csv → futures, mock/futures/ → futures, mock/stocks/ → stocks, mock/forex/ → forex.
+    instrumentType is always futures (contract backtests only). Data layout: mock/*.csv and mock/futures/ → futures;
+    futures_30m/, futures_mnq/ → futures.
     brokerConfig: { tick_size, tick_value, mult, margin, commission_per_contract } for futures.
     """
     try:
@@ -248,16 +266,18 @@ def _get_available_data_impl() -> dict:
 
     mock_dir = data_dir / "mock"
     futures_30m_dir = data_dir / "futures_30m"
+    futures_mnq_dir = data_dir / "futures_mnq"
     mock_ok = mock_dir.is_dir()
     fut_ok = futures_30m_dir.is_dir()
-    if not mock_ok and not fut_ok:
+    mnq_ok = futures_mnq_dir.is_dir()
+    if not mock_ok and not fut_ok and not mnq_ok:
         return {"instruments": results}
     signature = _build_data_signature(data_dir)
     if _DATA_CACHE.get("signature") == signature and _DATA_CACHE.get("payload") is not None:
         return _DATA_CACHE["payload"]
 
-    # Scan subfolders by type: mock/futures/, mock/stocks/, mock/forex/
-    for subdir, inst_type in [("futures", "futures"), ("stocks", "stocks"), ("forex", "forex")]:
+    # mock/futures/*.csv only (stocks/forex mock folders are not exposed as backtest sources)
+    for subdir, inst_type in [("futures", "futures")]:
         sub_path = mock_dir / subdir
         if mock_ok and sub_path.is_dir():
             for f in sub_path.glob("*.csv"):
@@ -293,6 +313,16 @@ def _get_available_data_impl() -> dict:
             if key in seen_files:
                 continue
             item = _process_parquet_file_to_instrument(f, "futures_30m/", "futures", "30m", broker_config)
+            if item:
+                seen_files.add(key)
+                results.append(item)
+
+    if mnq_ok:
+        for f in futures_mnq_dir.glob("*.parquet"):
+            key = f"futures_mnq/{f.name}"
+            if key in seen_files:
+                continue
+            item = _process_parquet_file_to_instrument(f, "futures_mnq/", "futures", "1m", broker_config)
             if item:
                 seen_files.add(key)
                 results.append(item)

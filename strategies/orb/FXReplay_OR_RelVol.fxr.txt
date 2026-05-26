@@ -1,0 +1,431 @@
+//@version=1
+/*****************************************************************************************
+ * OR Relative Volume — plot.line má vlastní dílčí podokno (hodnoty ~×100 nesměj na osu ceny).
+ *
+ * anchoredText jen volitelně (sandbox ho často bez API nemá — nelze spoléhat).
+ *
+ * RelVol = součet objemu v OR ÷ průměr součtů OR z minulých uzavřených záznamů (pole orVol).
+ *
+ * Vizualizace: anchoredText(time,price,text[,styles]); v TS je text před stylem.
+ *
+ * Session "0930-1600" = minuty v TZ dat grafu.
+ * Dokumentace: https://custom-indicators.gitbook.io/custom-indicators-docs/chart-drawing-tools/text-annotations/anchoredtext.md
+ *****************************************************************************************/
+
+/** @returns {number} minuty od půlnoci (0–1439) */
+function barOpenMinuteOfDay(_moment, unixMs) {
+  const m = _moment(typeof unixMs === 'bigint' ? Number(unixMs) : unixMs);
+  return m.minutes() + m.hours() * 60;
+}
+
+function parseSessionRange(s) {
+  const raw = String(s || '0930-1600').replace(/:/g, '').trim();
+  const [a, b] = raw.split('-');
+  const hm = (t) => {
+    const tt = String(t).padStart(4, '0').slice(-4);
+    const H = parseInt(tt.slice(0, 2), 10);
+    const M = parseInt(tt.slice(2, 4), 10);
+    return H * 60 + M;
+  };
+  return { startMin: hm(a), endMinExclusive: hm(b) };
+}
+
+function coerceSession(raw) {
+  if (typeof raw === 'string' && raw.length) return raw;
+  if (raw && typeof raw === 'object') {
+    if (typeof raw.value === 'string') return raw.value;
+    if (typeof raw.session === 'string') return raw.session;
+  }
+  return '0930-1600';
+}
+
+/** FX Replay: globální volume(index) */
+function volAt(i) {
+  try {
+    if (typeof volume !== 'function') return NaN;
+    const v = volume(i);
+    const n = Number(v);
+    return Number.isFinite(n) ? n : NaN;
+  } catch (_) {
+    return NaN;
+  }
+}
+
+/** @param {string[][]} rows */
+function rowsToMultiline(rows) {
+  const lines = [];
+  for (let r = 0; r < rows.length; r++) {
+    lines.push(rows[r].join('\t'));
+  }
+  return lines.join('\n');
+}
+
+/**
+ * @param {Array<{ day: number, relVol: number, orVol: number }>} rowsByDay
+ */
+function buildTableRows(rowsByDay, todayKey, todayFinalized, lastRelVol, colorHint) {
+  const rows = [];
+  rows.push(['Date (YYYYMMDD)', 'RelVol', '']);
+
+  for (let i = rowsByDay.length - 1; i >= 0; i--) {
+    const d = rowsByDay[i];
+    if (todayKey > 0 && d.day === todayKey) continue;
+    let tag = '';
+    if (colorHint) {
+      if (d.relVol > 1.2) tag = 'high';
+      else if (d.relVol < 0.8) tag = 'low';
+      else tag = 'mid';
+    }
+    rows.push([String(d.day), d.relVol.toFixed(2), tag]);
+  }
+
+  rows.push(['---', '---', '']);
+  if (todayKey > 0) {
+    const tv =
+      todayFinalized && typeof lastRelVol === 'number' && Number.isFinite(lastRelVol)
+        ? lastRelVol.toFixed(2)
+        : '—';
+    let tag = '';
+    if (colorHint && todayFinalized && typeof lastRelVol === 'number' && Number.isFinite(lastRelVol)) {
+      if (lastRelVol > 1.2) tag = 'high';
+      else if (lastRelVol < 0.8) tag = 'low';
+      else tag = 'mid';
+    }
+    rows.push(['TODAY', tv, tag]);
+  }
+
+  return rows;
+}
+
+/** Jedna grafická štítek — aktualizace maže předchozí kresbu */
+let anchoredDashboardDrawId = null;
+
+/**
+ * anchorTime / anchorPrice jako číslo (bigint z time rozpatlaný)
+ */
+function refreshAnchoredDashboard(anchorTime, anchorPrice, csvBody) {
+  const delFn = typeof deleteDrawingById === 'function' ? deleteDrawingById : null;
+
+  /** @type {(...args: unknown[]) => unknown} | null */
+  let anchoredFn = null;
+  if (typeof globalThis !== 'undefined') {
+    const alt = /** @type {Record<string, unknown>} */ (globalThis)['anchoredText'];
+    if (typeof alt === 'function') anchoredFn = alt;
+  }
+
+  /** Cena 0 nebo neměnná = štítek mimo platný cenový rozsah — nekreslit. */
+  if (
+    !anchoredFn ||
+    anchorTime == null ||
+    !Number.isFinite(anchorPrice) ||
+    anchorPrice === 0
+  ) {
+    return false;
+  }
+
+  try {
+    if (anchoredDashboardDrawId && delFn) delFn(anchoredDashboardDrawId);
+  } catch (_) {
+    /* */
+  }
+  anchoredDashboardDrawId = null;
+
+  const style = {
+    fillBackground: true,
+    backgroundColor: color.rgba(18, 22, 30, 0.94),
+    backgroundTransparency: 8,
+    drawBorder: true,
+    borderColor: color.rgba(100, 130, 200, 0.55),
+    color: color.rgba(230, 235, 250, 1),
+    fontsize: 11,
+    bold: false,
+    wordWrap: true,
+    wordWrapWidth: 320,
+    fixedSize: true,
+  };
+
+  try {
+    // Typy FX Replay: anchoredText(time, price, text, styles?) — ne (…, styles, text)
+    anchoredDashboardDrawId = anchoredFn(anchorTime, anchorPrice, csvBody, style);
+    return anchoredDashboardDrawId != null && anchoredDashboardDrawId !== '';
+  } catch (_) {
+    return false;
+  }
+}
+
+// --- Stav ---
+let lastBarOpenTime = null;
+
+/** Nesmí být `history` — koliduje s Window.history */
+/** @type {Array<{ day: number, relVol: number, orVol: number }>} */
+let closedOrDayRows = [];
+
+let orVolTodayAccum = 0;
+/** @type {number | null} */
+let calendarDaySeen = null;
+let orbFinalizedForDayKey = null;
+/** @type {number | null} */
+let lastRelVol = null;
+
+/** Dedup kreslení anchoredText při neměnícím se textu */
+let lastAnchoredMarkdown = '';
+
+/** Platná kotva ceny na grafu — nikdy nevraťme 0 (mimo měřítko u futures). */
+function resolveAnchorPrice() {
+  const n = (v) => {
+    const x = Number(v);
+    return Number.isFinite(x) ? x : NaN;
+  };
+  if (typeof high === 'function' && typeof low === 'function') {
+    try {
+      const px = (n(high(0)) + n(low(0))) / 2;
+      if (Number.isFinite(px) && px !== 0) return px;
+    } catch (_) {
+      /* */
+    }
+  }
+  /** @type {(((i: number) => unknown) | undefined)[]} */
+  const cands = [];
+  if (typeof high === 'function') cands.push(high);
+  if (typeof closeC === 'function') cands.push(closeC);
+  if (typeof close === 'function') cands.push(close);
+  if (typeof openC === 'function') cands.push(openC);
+  if (typeof low === 'function') cands.push(low);
+
+  for (let ci = 0; ci < cands.length; ci++) {
+    try {
+      const px = n(cands[ci](0));
+      if (Number.isFinite(px) && px !== 0) return px;
+    } catch (_) {
+      /* */
+    }
+  }
+  return NaN;
+}
+
+function plotSeriesLine(title, val, clr) {
+  const p =
+    typeof plot !== 'undefined' ? /** @type {Record<string, unknown>} */ (plot) : null;
+  if (!p) return;
+  const LN = 'line';
+  /** @type {unknown} */
+  const fn = p[LN];
+  if (typeof fn !== 'function') return;
+  try {
+    Function.prototype.call.call(fn, p, title, val, clr);
+  } catch (_) {
+    /* */
+  }
+}
+
+const G_SESSION = 'OR RelVol · Session OR';
+const G_TABLE = 'OR RelVol · Tabulka';
+const G_DEBUG = 'OR RelVol · Diagnostika';
+
+init = () => {
+  indicator({ onMainPanel: false, format: 'inherit' });
+
+  input.session(
+    'Trading Session (TV formát)',
+    '0930-1600',
+    'sess',
+    'Časovka = podle data grafu; pro NY RTH zarovnej timezone / session.',
+    G_SESSION,
+  );
+
+  input.int(
+    'OR délka (minuty)',
+    5,
+    'orMinutes',
+    1,
+    480,
+    1,
+    'Prvních N minut po startu session.',
+    G_SESSION,
+  );
+
+  input.int(
+    'Lookback (max. řádků historie)',
+    14,
+    'lookback',
+    5,
+    252,
+    1,
+    'Počet uzavřených dnů v tabulce (nejstarší vyřadí).',
+    G_TABLE,
+  );
+
+  input.bool('Sloupce high / mid / low (text)', true, 'colorHint', G_TABLE);
+
+  input.bool(
+    'Štítek na grafu (anchoredText) — bez API jen série',
+    false,
+    'showAnchoredDash',
+    G_TABLE,
+  );
+
+  input.bool('DEBUG: výpis session (console, nový bar)', false, 'dbgSession', G_DEBUG);
+
+  input.bool('DEBUG: rudá řada RelVol (+ stejně zelená)', false, 'dbgRedSeries', G_DEBUG);
+};
+
+onTick = (length, _moment, _, _ta, inputs) => {
+  const t0Raw = time(0);
+  const t1Raw = length > 1 ? time(1) : null;
+  const t0 = typeof t0Raw === 'bigint' ? Number(t0Raw) : +t0Raw;
+  const t1 = t1Raw == null ? null : typeof t1Raw === 'bigint' ? Number(t1Raw) : +t1Raw;
+
+  const isNewBar = lastBarOpenTime === null || t0 !== lastBarOpenTime;
+  lastBarOpenTime = t0;
+
+  const sess = coerceSession(inputs.sess);
+  const { startMin, endMinExclusive } = parseSessionRange(sess);
+  const orDur = parseInt(inputs.orMinutes, 10) || 5;
+  const orEndExclusive = startMin + orDur;
+
+  let dayKey = 0;
+  let modOpen = 0;
+  let modPrev = null;
+  try {
+    const m0 = _moment(t0);
+    dayKey = Number(m0.format('YYYYMMDD'));
+    modOpen = barOpenMinuteOfDay(_moment, t0);
+    if (t1 != null) {
+      modPrev = barOpenMinuteOfDay(_moment, /** @type {number} */ (t1));
+    }
+  } catch (_) {
+    dayKey = 0;
+    modOpen = 0;
+    modPrev = null;
+  }
+
+  const inSessionNow = modOpen >= startMin && modOpen < endMinExclusive;
+  const prevInSession =
+    modPrev !== null && modPrev >= startMin && modPrev < endMinExclusive;
+
+  const barOpensInsideOR =
+    inSessionNow && modOpen >= startMin && modOpen < orEndExclusive;
+
+  const vBar = volAt(0);
+
+  if (isNewBar && dayKey > 0) {
+    if (calendarDaySeen !== dayKey) {
+      calendarDaySeen = dayKey;
+      orVolTodayAccum = 0;
+      orbFinalizedForDayKey = null;
+      lastRelVol = null;
+    }
+
+    if (orbFinalizedForDayKey !== dayKey) {
+      if (barOpensInsideOR && Number.isFinite(vBar) && vBar >= 0) {
+        orVolTodayAccum += vBar;
+      }
+
+      const crossedOrEndInSession =
+        inSessionNow && modOpen >= orEndExclusive && modPrev !== null && modPrev < orEndExclusive;
+
+      const prevWasInOR =
+        prevInSession && modPrev !== null && modPrev >= startMin && modPrev < orEndExclusive;
+      const leftOrByBarClass = prevWasInOR && !barOpensInsideOR;
+
+      const sessionExitUnfinalized = prevInSession && !inSessionNow;
+
+      const shouldFinalize =
+        crossedOrEndInSession || leftOrByBarClass || sessionExitUnfinalized;
+
+      if (shouldFinalize) {
+        const lb = parseInt(inputs.lookback, 10) || 14;
+
+        let denom = 0;
+        if (closedOrDayRows.length > 0) {
+          let sumVol = 0;
+          for (let hi = 0; hi < closedOrDayRows.length; hi++) {
+            sumVol += closedOrDayRows[hi].orVol;
+          }
+          denom = sumVol / closedOrDayRows.length;
+        }
+
+        if (!closedOrDayRows.length || denom <= 0) {
+          lastRelVol = 1.0;
+        } else {
+          lastRelVol = orVolTodayAccum / denom;
+        }
+
+        closedOrDayRows.push({
+          day: dayKey,
+          relVol: lastRelVol,
+          orVol: orVolTodayAccum,
+        });
+        while (closedOrDayRows.length > lb) closedOrDayRows.shift();
+
+        orbFinalizedForDayKey = dayKey;
+      }
+    }
+  }
+
+  const todayFinalized = dayKey > 0 && orbFinalizedForDayKey === dayKey;
+  const rows = buildTableRows(
+    closedOrDayRows,
+    dayKey,
+    todayFinalized,
+    lastRelVol,
+    !!inputs.colorHint,
+  );
+
+  /** @type {number} anchor time pro kresbu (aktuální bar) */
+  const T =
+    typeof t0Raw === 'bigint' ? Number(t0Raw) : typeof time(0) === 'bigint' ? Number(time(0)) : +time(0);
+
+  if (inputs.dbgSession && isNewBar && typeof console !== 'undefined' && console.log) {
+    const G =
+      typeof globalThis !== 'undefined'
+        ? /** @type {Record<string, unknown>} */ (globalThis)
+        : null;
+    console.log('[OR RelVol session]', {
+      dayKey,
+      modOpen,
+      inSessionNow,
+      barOpensInsideOR,
+      orAccum: orVolTodayAccum,
+      anchoredTextFn: G ? typeof G['anchoredText'] : 'globalThis?',
+      plotLinePresent:
+        typeof plot !== 'undefined' && !!/** @type {Record<string, unknown>} */ (plot)['line'],
+    });
+  }
+
+  const anchorBase = resolveAnchorPrice();
+
+  /** 1) Vždy series v dílčím panelu (~100 = průměr před uzavřením OR použij 100). */
+  const ratioDisplay =
+    typeof lastRelVol === 'number' && Number.isFinite(lastRelVol) && lastRelVol > 0 ? lastRelVol : 1;
+  const yDisplay = ratioDisplay * 100;
+  plotSeriesLine('OR RelVol ×100 vs avg OR vol', yDisplay, '#22c55e');
+
+  if (inputs.dbgRedSeries) plotSeriesLine('DEBUG OR RelVol ×100', yDisplay, '#ff0000');
+
+  const body = rowsToMultiline(rows);
+
+  /** 2) Volitelný text na graf — jen pokud kotva existuje (ne 0, ne NaN). */
+  if (
+    inputs.showAnchoredDash &&
+    Number.isFinite(anchorBase) &&
+    anchorBase !== 0
+  ) {
+    const anchorY = anchorBase + Math.abs(anchorBase) * 0.0015;
+    const needRedraw = body !== lastAnchoredMarkdown || isNewBar;
+    if (needRedraw) {
+      const ok = refreshAnchoredDashboard(T, anchorY, body);
+      if (ok) lastAnchoredMarkdown = body;
+    }
+  }
+
+  if (!inputs.showAnchoredDash && anchoredDashboardDrawId && typeof deleteDrawingById === 'function') {
+    try {
+      deleteDrawingById(anchoredDashboardDrawId);
+    } catch (_) {
+      /* */
+    }
+    anchoredDashboardDrawId = null;
+    lastAnchoredMarkdown = '';
+  }
+};

@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ModuleOutputChart } from "@/components/charts/ModuleOutputChart";
 import { RunHistory } from "@/components/results/RunHistory";
 import { assessOverfitting, readinessFromSeverity } from "@/lib/overfittingSignals";
@@ -18,17 +18,18 @@ const TradeHighlight = dynamic(
 import { StatBlocks } from "@/components/results/StatBlocks";
 import { QualityGateBanner } from "@/components/results/QualityGateBanner";
 import { AnalyticsView } from "@/components/results/AnalyticsView";
-import type { ModuleOutput, RunResponse } from "@shared/types";
+import { ValidationResultsHero } from "@/components/results/ValidationResultsHero";
+import type { ModuleOutput, OhlcBar, RunResponse } from "@shared/types";
 import {
   computeDetailedChartWindow,
   filterModuleOutputToOhlcWindow,
   type DetailedViewMode,
 } from "@/lib/detailedTradesWindow";
 import { PriceContextChart } from "@/components/charts/PriceContextChart";
-import { getChartTfSelectOptions, resampleOhlcForChartChoice } from "@/lib/chartOhlcResample";
+import { getChartTfSelectOptions, resampleOhlcForChartChoice, defaultDetailedChartTfFromManifest, barPeriodMsForChartSelection } from "@/lib/chartOhlcResample";
+import { isFineOrNativeMinuteTf } from "@/lib/viewChartTimeframe";
 import { getViewData } from "@/lib/api";
 import { viewDataResponseToModuleOutput } from "@/lib/viewArtifactAdapter";
-import { effectiveViewDataTimeframe } from "@/lib/viewChartTimeframe";
 import { buildCumulativeREquityCurve, summarizeTradeRMultiples } from "@/lib/tradeMetrics";
 import type { SavedBacktestRun } from "@/lib/firestore";
 import { FieldHelpPopover } from "@/components/FieldHelpPopover";
@@ -37,11 +38,11 @@ import { backtestFieldHelp } from "@/components/backtestFieldMeta";
 type TabId = "equity" | "highlight" | "detailed" | "analytics" | "runHistory";
 
 const RESULT_TABS: { id: TabId; label: string; shortcut: string }[] = [
-  { id: "equity", label: "Equity", shortcut: "1" },
-  { id: "highlight", label: "Highlight", shortcut: "2" },
-  { id: "detailed", label: "Detailed", shortcut: "3" },
+  { id: "equity", label: "Křivky", shortcut: "1" },
+  { id: "highlight", label: "Obchody", shortcut: "2" },
+  { id: "detailed", label: "Graf detail", shortcut: "3" },
   { id: "analytics", label: "Analytics", shortcut: "4" },
-  { id: "runHistory", label: "Run history", shortcut: "5" },
+  { id: "runHistory", label: "Historie runů", shortcut: "5" },
 ];
 
 interface ResultsViewProps {
@@ -76,17 +77,23 @@ export function ResultsView({
   const [detailedPage, setDetailedPage] = useState(0);
   const [tradesPerView, setTradesPerView] = useState(15);
   const [monthsPerView, setMonthsPerView] = useState(3);
+  const [daysPerView, setDaysPerView] = useState(7);
   const [chartTf, setChartTf] = useState<string>("source");
   const [useArtifactLayersDetailed, setUseArtifactLayersDetailed] = useState(false);
   const [artifactDetailedOut, setArtifactDetailedOut] = useState<ModuleOutput | null>(null);
-  const [artifactDetailedLoading, setArtifactDetailedLoading] = useState(false);
-  const [artifactDetailedError, setArtifactDetailedError] = useState<string | null>(null);
   const [artifactDetailedBanner, setArtifactDetailedBanner] = useState<string | null>(null);
+  /** Plný OHLC výřez z /api/view (export z runu je globálně podvzorkovaný). */
+  const [detailedSliceOhlc, setDetailedSliceOhlc] = useState<OhlcBar[] | null>(null);
+  const [detailedSliceLoading, setDetailedSliceLoading] = useState(false);
+  const [detailedSliceError, setDetailedSliceError] = useState<string | null>(null);
   /** Index do `batchRuns` pro Equity / Detailed / Highlight / analytiku obchodů; poslední run = výchozí */
   const [batchViewIdx, setBatchViewIdx] = useState(0);
   const [runNote, setRunNote] = useState("");
   const [noteExpanded, setNoteExpanded] = useState(false);
-  const [bannerDismissed, setBannerDismissed] = useState<Record<string, boolean>>({});
+  /** Centrální hub upozornění: po zavření přes ikonu jdou ID do „seen“ a badge zmizí. */
+  const [alertsHubOpen, setAlertsHubOpen] = useState(false);
+  const [seenAlertIds, setSeenAlertIds] = useState<string[]>([]);
+  const alertsHubRef = useRef<HTMLDivElement>(null);
 
   const batchRuns = useMemo((): RunResponse[] | null => {
     const br = results?.batchRuns;
@@ -124,20 +131,81 @@ export function ResultsView({
       ? (batchSummaryRoot.aggregates as Record<string, unknown>)
       : null;
 
+  const manifestDataFileTf = useMemo((): string | null => {
+    const m = viewResults?.manifest;
+    if (!m || typeof m !== "object") return null;
+    const rec = m as Record<string, unknown>;
+    const src = String(rec.sourceTimeframe ?? "").trim();
+    if (src) return src;
+    return String(rec.timeframe ?? "").trim() || null;
+  }, [viewResults?.manifest]);
+
+  const isFineDetailedTf = useMemo(
+    () => isFineOrNativeMinuteTf(chartTf, manifestDataFileTf),
+    [chartTf, manifestDataFileTf]
+  );
+
+  const manifestWorkTf = useMemo((): string | null => {
+    const m = viewResults?.manifest;
+    if (!m || typeof m !== "object") return null;
+    const w = String((m as Record<string, unknown>).workTimeframe ?? "").trim();
+    return w || null;
+  }, [viewResults?.manifest]);
+
+  const preferredDetailedChartTf = useMemo(
+    () => defaultDetailedChartTfFromManifest(manifestDataFileTf, manifestWorkTf),
+    [manifestDataFileTf, manifestWorkTf]
+  );
+
   const baseOhlc = viewResults?.ohlc ?? [];
-  const chartTfOptions = useMemo(() => getChartTfSelectOptions(baseOhlc), [baseOhlc]);
+  const chartTfOptions = useMemo(
+    () => getChartTfSelectOptions(baseOhlc, manifestDataFileTf, manifestWorkTf),
+    [baseOhlc, manifestDataFileTf, manifestWorkTf]
+  );
+
+  useEffect(() => {
+    setChartTf(preferredDetailedChartTf);
+  }, [viewResults?.runId, batchViewIdx, preferredDetailedChartTf]);
+
+  useEffect(() => {
+    if (!chartTfOptions.some((o) => o.value === chartTf)) {
+      setChartTf(preferredDetailedChartTf);
+    }
+  }, [chartTfOptions, chartTf, preferredDetailedChartTf]);
+
+  useEffect(() => {
+    if (detailedMode === "by_days" && !isFineDetailedTf) {
+      setDetailedMode("by_months");
+    }
+  }, [detailedMode, isFineDetailedTf]);
 
   useEffect(() => {
     setDetailedPage(0);
-  }, [detailedMode, tradesPerView, monthsPerView]);
+  }, [detailedMode, tradesPerView, monthsPerView, daysPerView]);
 
   useEffect(() => {
     setDetailedPage(0);
   }, [batchViewIdx]);
 
   useEffect(() => {
-    setBannerDismissed({});
-  }, [results?.runId]);
+    setSeenAlertIds([]);
+    setAlertsHubOpen(false);
+  }, [results?.runId, batchViewIdx]);
+
+  useEffect(() => {
+    if (!alertsHubOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (alertsHubRef.current && !alertsHubRef.current.contains(e.target as Node)) {
+        setAlertsHubOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [alertsHubOpen]);
+
+  const manifestForView = viewResults?.manifest && typeof viewResults.manifest === "object"
+    ? (viewResults.manifest as Record<string, unknown>)
+    : null;
 
   const mergedOutput: ModuleOutput = useMemo(() => {
     if (!viewResults) return { markers: [], lines: [], zones: [] };
@@ -160,42 +228,64 @@ export function ResultsView({
       detailedMode,
       detailedPage,
       tradesPerView,
-      monthsPerView
+      monthsPerView,
+      daysPerView
     );
-  }, [viewResults?.trades, baseOhlc, detailedMode, detailedPage, tradesPerView, monthsPerView]);
+  }, [viewResults?.trades, baseOhlc, detailedMode, detailedPage, tradesPerView, monthsPerView, daysPerView]);
+
+  const ohlcBaseForDetailed = useMemo(() => {
+    if (detailedSliceOhlc && detailedSliceOhlc.length > 0) return detailedSliceOhlc;
+    return detailedWindow?.windowOhlc ?? [];
+  }, [detailedSliceOhlc, detailedWindow?.windowOhlc]);
 
   const chartOhlc = useMemo(() => {
-    if (!detailedWindow?.windowOhlc.length) return [];
-    return resampleOhlcForChartChoice(detailedWindow.windowOhlc, chartTf);
-  }, [detailedWindow?.windowOhlc, chartTf]);
+    if (!ohlcBaseForDetailed.length) return [];
+    return resampleOhlcForChartChoice(ohlcBaseForDetailed, chartTf, manifestDataFileTf);
+  }, [ohlcBaseForDetailed, chartTf, manifestDataFileTf]);
+
+  const detailedChartBarPeriodMs = useMemo(
+    () => barPeriodMsForChartSelection(chartTf, manifestDataFileTf),
+    [chartTf, manifestDataFileTf]
+  );
 
   const detailedChartOutput = useMemo(() => {
-    if (!detailedWindow?.windowOhlc.length) return mergedOutput;
-    return filterModuleOutputToOhlcWindow(mergedOutput, detailedWindow.windowOhlc);
-  }, [mergedOutput, detailedWindow]);
+    if (!ohlcBaseForDetailed.length) return mergedOutput;
+    return filterModuleOutputToOhlcWindow(mergedOutput, ohlcBaseForDetailed);
+  }, [mergedOutput, ohlcBaseForDetailed]);
 
   const contextChartOhlc = useMemo(() => {
-    const w = detailedWindow?.windowOhlc ?? [];
-    if (!baseOhlc.length || w.length < 2) return [];
+    const w = ohlcBaseForDetailed;
+    if (!detailedSliceOhlc?.length) {
+      if (!baseOhlc.length || w.length < 2) return [];
+      const loMs = Date.parse(w[0]!.date);
+      const hiMs = Date.parse(w[w.length - 1]!.date);
+      if (!Number.isFinite(loMs) || !Number.isFinite(hiMs)) return [];
+      const span = Math.max(hiMs - loMs, 24 * 3600 * 1000);
+      const lo2 = loMs - span;
+      const hi2 = hiMs + span;
+      const win = baseOhlc.filter((b) => {
+        const t = Date.parse(b.date);
+        return Number.isFinite(t) && t >= lo2 && t <= hi2;
+      });
+      return win.length ? win : baseOhlc;
+    }
+    if (w.length < 2) return detailedSliceOhlc;
     const loMs = Date.parse(w[0]!.date);
     const hiMs = Date.parse(w[w.length - 1]!.date);
-    if (!Number.isFinite(loMs) || !Number.isFinite(hiMs)) return [];
+    if (!Number.isFinite(loMs) || !Number.isFinite(hiMs)) return detailedSliceOhlc;
     const span = Math.max(hiMs - loMs, 24 * 3600 * 1000);
     const lo2 = loMs - span;
     const hi2 = hiMs + span;
-    const win = baseOhlc.filter((b) => {
+    return detailedSliceOhlc.filter((b) => {
       const t = Date.parse(b.date);
       return Number.isFinite(t) && t >= lo2 && t <= hi2;
     });
-    return win.length ? win : baseOhlc;
-  }, [baseOhlc, detailedWindow?.windowOhlc]);
+  }, [baseOhlc, ohlcBaseForDetailed, detailedSliceOhlc]);
 
   const contextTrade = useMemo(() => {
     const v = detailedWindow?.visibleTrades ?? [];
     if (!v.length) return null;
-    // Prefer trades that carry zoneMeta (S/D), since the user wants "zone + simulated R trade" context.
-    const withMeta = v.find((t) => t.zoneMeta != null);
-    return withMeta ?? v[0]!;
+    return v[0]!;
   }, [detailedWindow?.visibleTrades]);
 
   const detailedChartOutputEffective = useMemo(() => {
@@ -207,64 +297,71 @@ export function ResultsView({
 
   const rSummary = useMemo(() => summarizeTradeRMultiples(viewResults?.trades ?? []), [viewResults?.trades]);
 
-  const manifestForView = viewResults?.manifest && typeof viewResults.manifest === "object"
-    ? (viewResults.manifest as Record<string, unknown>)
-    : null;
-
   useEffect(() => {
-    if (!useArtifactLayersDetailed || activeTab !== "detailed") {
+    if (activeTab !== "detailed") {
+      setDetailedSliceOhlc(null);
+      setDetailedSliceError(null);
+      setDetailedSliceLoading(false);
       setArtifactDetailedOut(null);
-      setArtifactDetailedError(null);
       setArtifactDetailedBanner(null);
-      setArtifactDetailedLoading(false);
       return;
     }
+
     const dataFile = String(manifestForView?.dataFile ?? "").trim();
-    const wo = detailedWindow?.windowOhlc;
-    if (!dataFile || !wo?.length) {
+    const yearsRaw = Number(manifestForView?.years ?? 0);
+    const years = yearsRaw > 0 ? yearsRaw : 0.25;
+    const vf = detailedWindow?.viewFetchWindow;
+
+    if (!dataFile || !vf?.startIso || !vf?.endIso) {
+      setDetailedSliceOhlc(null);
+      setDetailedSliceError(
+        !dataFile ? "V manifestu chybí dataFile — graf použije řídký export z runu." : null
+      );
+      setDetailedSliceLoading(false);
       setArtifactDetailedOut(null);
-      setArtifactDetailedError(!dataFile ? "V manifestu chybí dataFile — nelze načíst artefakty." : null);
-      setArtifactDetailedLoading(false);
+      setArtifactDetailedBanner(null);
       return;
     }
+
     let cancelled = false;
     (async () => {
-      setArtifactDetailedLoading(true);
-      setArtifactDetailedError(null);
+      setDetailedSliceLoading(true);
+      setDetailedSliceError(null);
       setArtifactDetailedBanner(null);
       try {
-        const years = Math.max(0, Math.floor(Number(manifestForView?.years ?? 0)));
-        const nativeTf = String(manifestForView?.timeframe ?? "");
-        const chartParam = chartTf === "source" ? "native" : chartTf;
-        const chartTimeframeApi =
-          chartTf === "source" ? null : effectiveViewDataTimeframe(chartParam, nativeTf);
-        const win = { startIso: wo[0]!.date, endIso: wo[wo.length - 1]!.date };
-        const res = await getViewData(dataFile, years, null, null, null, chartTimeframeApi, win, {
-          useArtifacts: true,
-          artifactIncludeSd: true,
-        });
+        const win = { startIso: vf.startIso, endIso: vf.endIso };
+        const opts = useArtifactLayersDetailed
+          ? { useArtifacts: true as const, artifactIncludeSd: true as const, artifactIncludeHl: true as const }
+          : undefined;
+        const res = await getViewData(dataFile, years, null, null, null, null, win, opts);
         if (cancelled) return;
-        const mod = viewDataResponseToModuleOutput(res);
-        setArtifactDetailedOut(filterModuleOutputToOhlcWindow(mod, wo));
-        setArtifactDetailedBanner(res.artifact_banner ?? null);
+        const slice = res.ohlc ?? [];
+        setDetailedSliceOhlc(slice.length ? slice : null);
+        if (useArtifactLayersDetailed) {
+          const mod = viewDataResponseToModuleOutput(res);
+          setArtifactDetailedOut(filterModuleOutputToOhlcWindow(mod, slice));
+          setArtifactDetailedBanner(res.artifact_banner ?? null);
+        } else {
+          setArtifactDetailedOut(null);
+          setArtifactDetailedBanner(null);
+        }
       } catch (e) {
         if (cancelled) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        setDetailedSliceOhlc(null);
+        setDetailedSliceError(msg);
         setArtifactDetailedOut(null);
-        setArtifactDetailedError(e instanceof Error ? e.message : String(e));
+        setArtifactDetailedBanner(null);
       } finally {
-        if (!cancelled) setArtifactDetailedLoading(false);
+        if (!cancelled) {
+          setDetailedSliceLoading(false);
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [
-    useArtifactLayersDetailed,
-    activeTab,
-    manifestForView,
-    chartTf,
-    detailedWindow,
-  ]);
+  }, [activeTab, manifestForView, detailedWindow?.viewFetchWindow, useArtifactLayersDetailed]);
 
   const handleReproBundle = useCallback(async () => {
     if (!results) return;
@@ -341,12 +438,238 @@ export function ResultsView({
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  const { hubAlertItems, hubAlertIds } = useMemo(() => {
+    const empty: { hubAlertItems: { id: string; node: ReactNode }[]; hubAlertIds: string[] } = {
+      hubAlertItems: [],
+      hubAlertIds: [],
+    };
+    if (!results || !viewResults) return empty;
+
+    const items: { id: string; node: ReactNode }[] = [];
+
+    const prf = viewResults.propRedFlags as Record<string, unknown> | undefined;
+    const trust = prf ? String(prf.trustLevel ?? "") : "";
+    const trustLabel = prf ? String(prf.trustLabel ?? "") : "";
+    const cc = Number(prf?.criticalCount ?? 0);
+    const wc = Number(prf?.warningCount ?? 0);
+    const valModeTrust = String((viewResults.validation as Record<string, unknown> | undefined)?.mode ?? "single");
+    if (trust && (cc > 0 || wc > 0)) {
+      const bg =
+        trust === "not_trustworthy"
+          ? "bg-rose-500/15 border-rose-600/40"
+          : trust === "low_trust"
+            ? "bg-amber-500/10 border-amber-500/30"
+            : "bg-yellow-500/8 border-yellow-500/25";
+      const tc =
+        trust === "not_trustworthy"
+          ? "text-rose-200"
+          : trust === "low_trust"
+            ? "text-amber-200"
+            : "text-yellow-200";
+      items.push({
+        id: "prop-trust",
+        node: (
+          <div className={`rounded-xl border shadow-lg shadow-black/10 px-3 py-2.5 text-xs ${bg} ${tc}`}>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="font-medium uppercase tracking-wider text-[10px]">Trust: {trust.replace(/_/g, " ")}</span>
+              <span>{trustLabel}</span>
+              {cc > 0 && <span className="text-rose-300">{cc} critical</span>}
+              {wc > 0 && <span className="text-amber-300">{wc} warning{wc > 1 ? "s" : ""}</span>}
+              {valModeTrust === "single" && (
+                <span className="text-zinc-400">Tip: zapni OOS/WF validaci pro vyšší důvěryhodnost.</span>
+              )}
+            </div>
+          </div>
+        ),
+      });
+    }
+
+    const m = viewResults.metrics as unknown as Record<string, unknown> | undefined;
+    const tradeCount = Number(m?.tradeCount ?? 0);
+    const execSummary = viewResults.executionSummary as Record<string, unknown> | undefined;
+    const execEnabled = execSummary ? Boolean(execSummary.enabled) : false;
+    const valObj = viewResults.validation as Record<string, unknown> | undefined;
+    const valMode = String(valObj?.mode ?? "single");
+    const pnlD = viewResults.tradePnlDistribution as Record<string, unknown> | undefined;
+    const conc = pnlD?.concentration as Record<string, unknown> | undefined;
+    const top5 = Number(conc?.top5PnlPct ?? NaN);
+
+    const realityLines: { id: string; text: string }[] = [];
+    if (tradeCount > 0 && tradeCount < 30) {
+      realityLines.push({
+        id: "reality:low-trade-sample",
+        text: `Pouze ${tradeCount} obchodů — statisticky nedostatečný vzorek.`,
+      });
+    }
+    if (!execEnabled) {
+      realityLines.push({
+        id: "reality:exec-off",
+        text: "Execution model vypnutý — výsledky nezahrnují slippage, spread ani latenci.",
+      });
+    }
+    if (valMode === "single" && tradeCount > 0) {
+      realityLines.push({
+        id: "reality:single-no-oos",
+        text: "Jediný run bez OOS/WF validace — přetrénování nelze detekovat.",
+      });
+    }
+    if (Number.isFinite(top5) && top5 > 60) {
+      realityLines.push({
+        id: "reality:pnl-top5",
+        text: `Top 5 obchodů nese ${top5.toFixed(0)} % celkového PnL — edge závisí na pár výjimkách.`,
+      });
+    }
+    if (realityLines.length > 0) {
+      items.push({
+        id: "reality-check",
+        node: (
+          <div
+            className="rounded-xl border border-amber-600/45 bg-amber-950/30 shadow-lg shadow-black/10 px-3 py-2.5 text-xs text-amber-200 space-y-0.5"
+          >
+            <div className="font-semibold uppercase tracking-wider text-[10px] text-amber-400/90 mb-1">Reality check</div>
+            {realityLines.map((row) => (
+              <div key={row.id} className="flex items-start gap-1.5">
+                <span className="text-amber-500 shrink-0 mt-px">&#9888;</span>
+                <span>{row.text}</span>
+              </div>
+            ))}
+          </div>
+        ),
+      });
+    }
+
+    if (batchRunCount > 1) {
+      items.push({
+        id: "batch-multi",
+        node: (
+          <div className="rounded-xl border border-amber-500/35 bg-amber-500/10 shadow-lg shadow-black/10 px-3 py-2.5 text-xs text-amber-100 leading-relaxed">
+            Dávka: <strong>{batchRunCount}</strong> runů. Grafy a záložky Křivky / Obchody / Graf detail / Analytics
+            odpovídají <strong>vybranému instrumentu</strong> níže. Celkový souhrn přes všechny běhy je v blocích metrik a v
+            Analytics (tabulka + agregace).
+          </div>
+        ),
+      });
+    }
+
+    const qg = viewResults.qualityGate;
+    if (qg && typeof qg === "object") {
+      const passed = qg.passed === true;
+      const failed = qg.passed === false;
+      if (passed || failed) {
+        items.push({
+          id: "quality-gate",
+          node: <QualityGateBanner qualityGate={qg} />,
+        });
+      }
+    }
+
+    const mc = viewResults.monteCarlo as Record<string, unknown> | undefined;
+    const rob = viewResults.robustness as Record<string, unknown> | undefined;
+    const valSummary = valObj?.summary as Record<string, unknown> | undefined;
+    const qgRec = viewResults.qualityGate as Record<string, unknown> | undefined;
+    const ovSig = viewResults.overfittingSignals as Record<string, unknown> | undefined;
+    const bsc = viewResults.batchSummary as Record<string, unknown> | undefined;
+    const assessment = assessOverfitting({
+      validationMode: String(valObj?.mode ?? "single"),
+      tradeCount: Number(m?.tradeCount ?? 0),
+      riskOfRuin: Number(mc?.riskOfRuin ?? NaN),
+      qualityGatePassed: qgRec ? (typeof qgRec.passed === "boolean" ? (qgRec.passed as boolean) : null) : null,
+      avgDegradation: Number(valSummary?.avgDegradation ?? 0),
+      foldsFailedGates: Number(valSummary?.foldsFailedGates ?? 0),
+      guardHintCount: Array.isArray((valObj?.guardrails as Record<string, unknown> | undefined)?.possibleLeakageHints)
+        ? ((valObj?.guardrails as Record<string, unknown>).possibleLeakageHints as unknown[]).length
+        : 0,
+      sweepTested: Number(rob?.tested ?? 0),
+      stabilityScore: Number(rob?.stabilityScore ?? NaN),
+      batchRunCount: Number(bsc?.runCount ?? 0),
+      paramTestRuns: Number(valSummary?.paramTestTotalRuns ?? 0),
+      profitFactor: m?.profitFactor != null ? Number(m.profitFactor) : null,
+      profitFactorStatus: typeof m?.profitFactorStatus === "string" ? (m.profitFactorStatus as string) : null,
+      trialCount: Number(ovSig?.trialCount ?? 1),
+      naiveAdjustedAlpha: ovSig?.naiveAdjustedAlpha != null ? Number(ovSig.naiveAdjustedAlpha) : null,
+    });
+    const tier = readinessFromSeverity(assessment.severityScore);
+    if (tier !== "ready" || assessment.warnings.length > 0) {
+      const tierColor =
+        tier === "ready"
+          ? "border-emerald-600/50 bg-emerald-950/20 text-emerald-200"
+          : tier === "caution"
+            ? "border-amber-600/50 bg-amber-950/20 text-amber-200"
+            : "border-rose-600/50 bg-rose-950/20 text-rose-200";
+      const tierDot = tier === "ready" ? "bg-emerald-500" : tier === "caution" ? "bg-amber-500" : "bg-rose-500";
+      const mcRan = mc != null && Number(mc.simulations ?? 0) > 0;
+      const manifest = viewResults.manifest as Record<string, unknown> | undefined;
+      const inst = String(manifest?.instrument ?? "");
+      const dataFile = String(manifest?.dataFile ?? "");
+      const shortFile = dataFile.split("/").pop()?.split("\\").pop() ?? dataFile;
+      const execOn = execSummary ? Boolean(execSummary.enabled) : false;
+      const topWarnings = assessment.warnings.slice(0, 3);
+      items.push({
+        id: "readiness-card",
+        node: (
+          <div className={`rounded-xl border shadow-lg shadow-black/15 px-3 py-2.5 text-xs ${tierColor} space-y-1`}>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="flex items-center gap-1.5">
+                <span className={`inline-block w-2 h-2 rounded-full ${tierDot}`} />
+                <span className="font-medium text-[11px]">{assessment.readinessLabel}</span>
+              </span>
+              <span className="text-zinc-500">|</span>
+              <span className="text-zinc-400">
+                {valMode === "single"
+                  ? "Single run"
+                  : valMode === "oos_split"
+                    ? "OOS"
+                    : valMode === "walk_forward"
+                      ? "WF"
+                      : valMode === "param_test"
+                        ? "Param test"
+                        : valMode}
+              </span>
+              <span className="text-zinc-400">MC: {mcRan ? "yes" : "no"}</span>
+              <span className="text-zinc-400">Exec: {execOn ? "on" : "off"}</span>
+              {inst && <span className="text-zinc-400">{inst}</span>}
+              {shortFile && <span className="text-zinc-500 truncate max-w-[180px]">{shortFile}</span>}
+              <span className="text-zinc-500 ml-auto">score {assessment.severityScore}</span>
+            </div>
+            {topWarnings.length > 0 && (
+              <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] opacity-90">
+                {topWarnings.map((w, i) => (
+                  <span key={i}>{w}</span>
+                ))}
+                {assessment.warnings.length > 3 && (
+                  <span className="text-zinc-500">+{assessment.warnings.length - 3} more in Analytics</span>
+                )}
+              </div>
+            )}
+          </div>
+        ),
+      });
+    }
+
+    return { hubAlertItems: items, hubAlertIds: items.map((x) => x.id) };
+  }, [results, viewResults, batchRunCount]);
+
+  const hubUnreadCount = useMemo(
+    () => hubAlertIds.filter((id) => !seenAlertIds.includes(id)).length,
+    [hubAlertIds, seenAlertIds]
+  );
+
+  const handleAlertsHubToggle = useCallback(() => {
+    setAlertsHubOpen((open) => {
+      if (open) {
+        setSeenAlertIds((prev) => Array.from(new Set(prev.concat(hubAlertIds))));
+        return false;
+      }
+      return true;
+    });
+  }, [hubAlertIds]);
+
   if (!results) {
     return (
       <div className="flex flex-col flex-1 p-6">
         <div className="flex justify-between items-center mb-4">
-          <button onClick={onBack} className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm">
-            ← Zpět na editor
+          <button onClick={onBack} className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm border border-zinc-700/60">
+            ← Zpět
           </button>
         </div>
         <div className="flex-1 flex items-center justify-center text-zinc-500">Žádné výsledky</div>
@@ -354,19 +677,96 @@ export function ResultsView({
     );
   }
 
+  /** Varování, souhrnné metriky a kontextové grafy jen na záložce Křivky. */
+  const showCurvesTabChrome = activeTab === "equity";
+
   return (
     <div className="flex flex-col flex-1 min-h-0 overflow-auto">
-      <div className="flex justify-between items-center p-6 pb-4 shrink-0">
-        <button
-          onClick={onBack}
-          className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-sm"
-        >
-          ← Zpět na editor
-        </button>
-        <div className="flex gap-2">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 px-6 pb-4 shrink-0 border-b border-zinc-800/80">
+        <div className="flex flex-wrap items-center gap-3 min-w-0">
+          <button
+            onClick={onBack}
+            className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm text-zinc-200 border border-zinc-700/60 shrink-0"
+          >
+            ← Zpět
+          </button>
+          <div className="min-w-0">
+            <h1 className="text-base sm:text-lg font-semibold text-zinc-100 tracking-tight truncate">
+              Výsledky backtestu
+            </h1>
+            <p className="text-xs text-zinc-500 truncate">
+              {strategyName ? (
+                <>
+                   <span className="text-zinc-400">{strategyName}</span>
+                   {viewResults?.runId != null && (
+                     <span className="text-zinc-600 font-mono ml-2">
+                       · {String(viewResults.runId).slice(0, 12)}
+                       {String(viewResults.runId).length > 12 ? "…" : ""}
+                     </span>
+                   )}
+                </>
+              ) : (
+                 "Souhrn metrik a grafů pro aktuální běh"
+              )}
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2 shrink-0 items-center">
+          <div className="relative flex flex-col items-center" ref={alertsHubRef}>
+            {hubUnreadCount > 0 && (
+              <span className="mb-0.5 flex h-[16px] min-w-[16px] items-center justify-center rounded-full bg-amber-400 px-1 text-[10px] font-bold leading-none text-zinc-950 shadow-sm">
+                {hubUnreadCount > 9 ? "9+" : hubUnreadCount}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleAlertsHubToggle}
+              title={
+                hubAlertItems.length === 0
+                  ? "Upozornění — zatím žádná"
+                  : hubUnreadCount > 0
+                    ? `${hubUnreadCount} nepřečtených položek — zobrazit`
+                    : "Vše přečteno — zobrazit znovu"
+              }
+              className={`relative flex h-9 w-9 items-center justify-center rounded-lg border text-sm transition-colors ${
+                hubUnreadCount > 0
+                  ? "border-amber-500/50 bg-amber-500/10 text-amber-300 hover:bg-amber-500/15"
+                  : hubAlertItems.length > 0
+                    ? "border-zinc-600 bg-zinc-800/80 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                    : "border-zinc-700 bg-zinc-800/50 text-zinc-500 hover:border-zinc-600 hover:text-zinc-400"
+              }`}
+            >
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"
+                />
+              </svg>
+            </button>
+            {alertsHubOpen && (
+              <div className="absolute right-0 top-full z-50 mt-2 max-h-[min(70vh,520px)] w-[min(calc(100vw-2rem),420px)] overflow-y-auto rounded-xl border border-zinc-600/80 bg-zinc-900 shadow-2xl shadow-black/40">
+                <div className="sticky top-0 z-10 flex items-center justify-between border-b border-zinc-700/80 bg-zinc-900/95 px-3 py-2 backdrop-blur-sm">
+                  <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-400">Upozornění</span>
+                  <span className="text-[10px] text-zinc-500">
+                    Zavření přes ikonu označí jako přečtené
+                  </span>
+                </div>
+                {hubAlertItems.length === 0 ? (
+                  <div className="px-3 py-6 text-center text-sm text-zinc-500">Žádná upozornění pro tento náhled.</div>
+                ) : (
+                  <div className="space-y-3 p-3">
+                    {hubAlertItems.map((a) => (
+                      <div key={a.id}>{a.node}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           <button
             onClick={onExport}
-            className="px-4 py-2 rounded-lg bg-zinc-700 hover:bg-zinc-600 font-medium text-sm"
+            className="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 font-medium text-sm text-zinc-200 border border-zinc-700/60"
           >
             Export JSON
           </button>
@@ -374,35 +774,35 @@ export function ResultsView({
             type="button"
             onClick={() => void handleReproBundle()}
             disabled={bundleBusy}
-            className="px-4 py-2 rounded-lg bg-emerald-800/60 hover:bg-emerald-700/70 font-medium text-sm disabled:opacity-50"
+            className="px-4 py-2 rounded-lg bg-emerald-800/50 hover:bg-emerald-700/60 font-medium text-sm text-emerald-100 border border-emerald-700/40 disabled:opacity-50"
           >
-            {bundleBusy ? "…" : "Repro bundle (ZIP)"}
+            {bundleBusy ? "…" : "Repro ZIP"}
           </button>
           <button
             type="button"
             onClick={() => setNoteExpanded((p) => !p)}
-            className="px-3 py-2 rounded-lg bg-zinc-700/60 hover:bg-zinc-600/70 text-sm text-zinc-300"
+            className="px-3 py-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-sm text-zinc-300 border border-zinc-700/50"
             title="Poznámka k runu"
           >
-            {noteExpanded ? "Skrýt poznámku" : "📝 Poznámka"}
+            {noteExpanded ? "Skrýt poznámku" : "Poznámka"}
           </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-5 gap-px px-6 shrink-0 rounded-t-xl overflow-hidden border border-zinc-700/70 border-b-0 bg-zinc-800/80">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-1 px-6 shrink-0 rounded-t-xl overflow-hidden border border-zinc-700/70 border-b-0 bg-zinc-900/50 mt-2">
         {RESULT_TABS.map(({ id, label, shortcut }) => (
           <button
             key={id}
             type="button"
             onClick={() => setActiveTab(id)}
-            className={`w-full py-3 text-[15px] font-medium transition-colors flex items-center justify-center gap-1.5 ${
+            className={`w-full py-2.5 sm:py-3 text-xs sm:text-[13px] font-medium transition-colors flex flex-col sm:flex-row items-center justify-center gap-0.5 sm:gap-1.5 border-b-2 ${
               activeTab === id
-                ? "bg-zinc-900/95 text-emerald-400 border-b-2 border-emerald-500"
-                : "bg-zinc-800/60 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/90"
+                ? "bg-zinc-900 text-emerald-400 border-emerald-500"
+                : "bg-transparent text-zinc-500 hover:text-zinc-200 border-transparent hover:bg-zinc-800/40"
             }`}
           >
             <span>{label}</span>
-            <kbd className="text-[11px] text-zinc-500 font-mono font-normal">{shortcut}</kbd>
+            <kbd className="hidden sm:inline text-[10px] text-zinc-600 font-mono font-normal">{shortcut}</kbd>
           </button>
         ))}
       </div>
@@ -418,108 +818,75 @@ export function ResultsView({
         </div>
       )}
 
-      <div className="px-6 pt-3 space-y-2 shrink-0">
-        {(() => {
-          if (bannerDismissed.trust) return null;
-          const prf = viewResults?.propRedFlags as Record<string, unknown> | undefined;
-          const trust = prf ? String(prf.trustLevel ?? "") : "";
-          const label = prf ? String(prf.trustLabel ?? "") : "";
-          const cc = Number(prf?.criticalCount ?? 0);
-          const wc = Number(prf?.warningCount ?? 0);
-          const valMode = String((viewResults?.validation as Record<string, unknown> | undefined)?.mode ?? "single");
-          if (!trust || (cc === 0 && wc === 0)) return null;
-          const bg =
-            trust === "not_trustworthy"
-              ? "bg-rose-500/15 border-rose-600/40"
-              : trust === "low_trust"
-                ? "bg-amber-500/10 border-amber-500/30"
-                : "bg-yellow-500/8 border-yellow-500/25";
-          const tc =
-            trust === "not_trustworthy" ? "text-rose-200" : trust === "low_trust" ? "text-amber-200" : "text-yellow-200";
-          return (
-            <div className={`relative rounded-xl border shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs ${bg} ${tc}`}>
-              <button
-                type="button"
-                onClick={() => setBannerDismissed((p) => ({ ...p, trust: true }))}
-                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-zinc-200 border border-zinc-600/50"
-              >
-                Schovat
-              </button>
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="font-medium uppercase tracking-wider text-[10px]">Trust: {trust.replace(/_/g, " ")}</span>
-                <span>{label}</span>
-                {cc > 0 && <span className="text-rose-300">{cc} critical</span>}
-                {wc > 0 && <span className="text-amber-300">{wc} warning{wc > 1 ? "s" : ""}</span>}
-                {valMode === "single" && (
-                  <span className="text-zinc-400">Tip: zapni OOS/WF validaci pro vyšší důvěryhodnost.</span>
-                )}
-              </div>
-            </div>
-          );
-        })()}
-
-        {(() => {
-          if (bannerDismissed.reality) return null;
-          const m = viewResults?.metrics as unknown as Record<string, unknown> | undefined;
-          const tradeCount = Number(m?.tradeCount ?? 0);
-          const execSummary = viewResults?.executionSummary as Record<string, unknown> | undefined;
-          const execEnabled = execSummary ? Boolean(execSummary.enabled) : false;
-          const valObj = viewResults?.validation as Record<string, unknown> | undefined;
-          const valMode = String(valObj?.mode ?? "single");
-          const pnlD = viewResults?.tradePnlDistribution as Record<string, unknown> | undefined;
-          const conc = pnlD?.concentration as Record<string, unknown> | undefined;
-          const top5 = Number(conc?.top5PnlPct ?? NaN);
-
-          const warnings: string[] = [];
-          if (tradeCount > 0 && tradeCount < 30)
-            warnings.push(`Pouze ${tradeCount} obchodů — statisticky nedostatečný vzorek.`);
-          if (!execEnabled)
-            warnings.push("Execution model vypnutý — výsledky nezahrnují slippage, spread ani latenci.");
-          if (valMode === "single" && tradeCount > 0)
-            warnings.push("Jediný run bez OOS/WF validace — přetrénování nelze detekovat.");
-          if (Number.isFinite(top5) && top5 > 60)
-            warnings.push(`Top 5 obchodů nese ${top5.toFixed(0)} % celkového PnL — edge závisí na pár výjimkách.`);
-
-          if (warnings.length === 0) return null;
-          return (
-            <div className="relative rounded-xl border border-amber-600/45 bg-amber-950/30 shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs text-amber-200 space-y-0.5">
-              <button
-                type="button"
-                onClick={() => setBannerDismissed((p) => ({ ...p, reality: true }))}
-                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-amber-100 border border-amber-700/40"
-              >
-                Schovat
-              </button>
-              <div className="font-semibold uppercase tracking-wider text-[10px] text-amber-400/90 mb-1">Reality check</div>
-              {warnings.map((w, i) => (
-                <div key={i} className="flex items-start gap-1.5">
-                  <span className="text-amber-500 shrink-0 mt-px">&#9888;</span>
-                  <span>{w}</span>
+      {viewResults.propFirmBacktest && (
+        <div className="mx-6 mt-3 rounded-xl border border-violet-500/35 bg-violet-950/15 px-4 py-3 text-xs text-zinc-300 space-y-2 shrink-0">
+          <div className="text-[11px] font-semibold uppercase tracking-wide text-violet-300/90">Prop firm backtest</div>
+          {typeof viewResults.propFirmBacktest === "object" &&
+          viewResults.propFirmBacktest !== null &&
+          "skipped" in viewResults.propFirmBacktest &&
+          (viewResults.propFirmBacktest as { skipped?: boolean }).skipped ? (
+            <p className="text-zinc-500">
+              {(viewResults.propFirmBacktest as { reason?: string }).reason ?? "Přeskočeno."}
+            </p>
+          ) : typeof viewResults.propFirmBacktest === "object" &&
+            viewResults.propFirmBacktest !== null &&
+            "error" in viewResults.propFirmBacktest ? (
+            <p className="text-rose-300">
+              {String((viewResults.propFirmBacktest as { error?: unknown }).error ?? "Chyba simulace")}
+            </p>
+          ) : (
+            (() => {
+              const pf = viewResults.propFirmBacktest as Record<string, unknown>;
+              const s = (pf.summary ?? {}) as Record<string, unknown>;
+              const segs = Array.isArray(pf.segments) ? pf.segments.length : 0;
+              return (
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div className="space-y-1">
+                    <div>
+                      Pass rate (eval):{" "}
+                      <span className="text-zinc-100 font-medium tabular-nums">
+                        {s.evaluationPassRate != null ? `${(Number(s.evaluationPassRate) * 100).toFixed(1)} %` : "—"}
+                      </span>
+                    </div>
+                    <div>
+                      Pokusy:{" "}
+                      <span className="text-zinc-200 tabular-nums">{String(s.evaluationAttempts ?? "—")}</span> · Pass:{" "}
+                      <span className="text-emerald-400 tabular-nums">{String(s.evaluationPassed ?? 0)}x</span> / fail:{" "}
+                      <span className="text-rose-300 tabular-nums">{String(s.evaluationFailed ?? 0)}x</span>
+                      {Number(s.evaluationIncomplete ?? 0) > 0 ? (
+                        <span className="text-zinc-500">
+                          {" "}
+                          · nedokončeno: {String(s.evaluationIncomplete)}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="text-zinc-500">
+                      Segmentů celkem: {segs} · max série pass:{" "}
+                      <span className="text-zinc-300">{String(s.maxConsecutiveEvaluationPasses ?? "—")}</span> · max série
+                      fail: <span className="text-zinc-300">{String(s.maxConsecutiveEvaluationFails ?? "—")}</span>
+                    </div>
+                  </div>
+                  <div className="text-zinc-500 leading-relaxed">
+                    Režim: <span className="text-zinc-300">{String(pf.mode ?? "")}</span>
+                    {s.meanPerformanceReturnPct != null ? (
+                      <>
+                        <br />
+                        Prům. výnos PA (%):{" "}
+                        <span className="text-zinc-200 tabular-nums">
+                          {Number(s.meanPerformanceReturnPct).toFixed(2)} %
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
                 </div>
-              ))}
-            </div>
-          );
-        })()}
-      </div>
+              );
+            })()
+          )}
+        </div>
+      )}
 
       {batchRunCount > 1 && (
         <div className="px-6 pt-2 shrink-0 space-y-2">
-          {!bannerDismissed.batch && (
-            <div className="relative rounded-xl border border-amber-500/35 bg-amber-500/10 shadow-lg shadow-black/10 px-3 py-2.5 pr-20 text-xs text-amber-100 leading-relaxed">
-              <button
-                type="button"
-                onClick={() => setBannerDismissed((p) => ({ ...p, batch: true }))}
-                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-amber-100 border border-amber-600/40"
-              >
-                Schovat
-              </button>
-              <div>
-                Dávka: <strong>{batchRunCount}</strong> runů. Grafy a záložky Equity / Highlight / Detailed / S/D analytika
-                odpovídají <strong>vybranému instrumentu</strong> níže. Celkový souhrn přes všechny běhy je v blocích metrik a v
-                Analytics (tabulka + agregace).
-              </div>
-            </div>
-          )}
           {batchRuns && batchRuns.length > 1 ? (
             <div className="flex flex-wrap items-center gap-2 text-sm">
               <label htmlFor="batch-instrument-select" className="text-zinc-400 shrink-0">
@@ -552,129 +919,35 @@ export function ResultsView({
         </div>
       )}
 
-      {viewResults.qualityGate != null && !bannerDismissed.qualityGate && (
-        <div className="px-6 pt-2 shrink-0">
-          <QualityGateBanner
-            qualityGate={viewResults.qualityGate}
-            onDismiss={() => setBannerDismissed((p) => ({ ...p, qualityGate: true }))}
-          />
-        </div>
-      )}
-
-      {(() => {
-        if (bannerDismissed.readiness) return null;
-        const m = viewResults?.metrics as unknown as Record<string, unknown> | undefined;
-        const valObj = viewResults?.validation as Record<string, unknown> | undefined;
-        const mc = viewResults?.monteCarlo as Record<string, unknown> | undefined;
-        const rob = viewResults?.robustness as Record<string, unknown> | undefined;
-        const valSummary = valObj?.summary as Record<string, unknown> | undefined;
-        const qg = viewResults?.qualityGate as Record<string, unknown> | undefined;
-        const ovSig = viewResults?.overfittingSignals as Record<string, unknown> | undefined;
-        const bsc = viewResults?.batchSummary as Record<string, unknown> | undefined;
-        const assessment = assessOverfitting({
-          validationMode: String(valObj?.mode ?? "single"),
-          tradeCount: Number(m?.tradeCount ?? 0),
-          riskOfRuin: Number(mc?.riskOfRuin ?? NaN),
-          qualityGatePassed: qg ? (typeof qg.passed === "boolean" ? (qg.passed as boolean) : null) : null,
-          avgDegradation: Number(valSummary?.avgDegradation ?? 0),
-          foldsFailedGates: Number(valSummary?.foldsFailedGates ?? 0),
-          guardHintCount: Array.isArray((valObj?.guardrails as Record<string, unknown> | undefined)?.possibleLeakageHints)
-            ? ((valObj?.guardrails as Record<string, unknown>).possibleLeakageHints as unknown[]).length : 0,
-          sweepTested: Number(rob?.tested ?? 0),
-          stabilityScore: Number(rob?.stabilityScore ?? NaN),
-          batchRunCount: Number(bsc?.runCount ?? 0),
-          paramTestRuns: Number(valSummary?.paramTestTotalRuns ?? 0),
-          profitFactor: m?.profitFactor != null ? Number(m.profitFactor) : null,
-          profitFactorStatus: typeof m?.profitFactorStatus === "string" ? m.profitFactorStatus as string : null,
-          trialCount: Number(ovSig?.trialCount ?? 1),
-          naiveAdjustedAlpha: ovSig?.naiveAdjustedAlpha != null ? Number(ovSig.naiveAdjustedAlpha) : null,
-        });
-        const tier = readinessFromSeverity(assessment.severityScore);
-        const tierColor = tier === "ready" ? "border-emerald-600/50 bg-emerald-950/20 text-emerald-200"
-          : tier === "caution" ? "border-amber-600/50 bg-amber-950/20 text-amber-200"
-          : "border-rose-600/50 bg-rose-950/20 text-rose-200";
-        const tierDot = tier === "ready" ? "bg-emerald-500" : tier === "caution" ? "bg-amber-500" : "bg-rose-500";
-        const valMode = String(valObj?.mode ?? "single");
-        const mcRan = mc != null && Number(mc.simulations ?? 0) > 0;
-        const manifest = viewResults?.manifest as Record<string, unknown> | undefined;
-        const inst = String(manifest?.instrument ?? "");
-        const dataFile = String(manifest?.dataFile ?? "");
-        const shortFile = dataFile.split("/").pop()?.split("\\").pop() ?? dataFile;
-        const execSummary = viewResults?.executionSummary as Record<string, unknown> | undefined;
-        const execOn = execSummary ? Boolean(execSummary.enabled) : false;
-        const topWarnings = assessment.warnings.slice(0, 3);
-        return (
-          <div className="px-6 pt-2 shrink-0">
-            <div className={`relative rounded-xl border shadow-lg shadow-black/15 px-3 py-2.5 pr-20 text-xs ${tierColor} space-y-1`}>
-              <button
-                type="button"
-                onClick={() => setBannerDismissed((p) => ({ ...p, readiness: true }))}
-                className="absolute top-2 right-2 z-10 px-2 py-1 rounded-md bg-black/25 hover:bg-black/40 text-[11px] text-zinc-200 border border-zinc-600/50"
-              >
-                Schovat
-              </button>
-              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                <span className="flex items-center gap-1.5">
-                  <span className={`inline-block w-2 h-2 rounded-full ${tierDot}`} />
-                  <span className="font-medium text-[11px]">{assessment.readinessLabel}</span>
-                </span>
-                <span className="text-zinc-500">|</span>
-                <span className="text-zinc-400">
-                  {valMode === "single"
-                    ? "Single run"
-                    : valMode === "oos_split"
-                      ? "OOS"
-                      : valMode === "walk_forward"
-                        ? "WF"
-                        : valMode === "param_test"
-                          ? "Param test"
-                          : valMode}
-                </span>
-                <span className="text-zinc-400">MC: {mcRan ? "yes" : "no"}</span>
-                <span className="text-zinc-400">Exec: {execOn ? "on" : "off"}</span>
-                {inst && <span className="text-zinc-400">{inst}</span>}
-                {shortFile && <span className="text-zinc-500 truncate max-w-[180px]">{shortFile}</span>}
-                <span className="text-zinc-500 ml-auto">score {assessment.severityScore}</span>
-              </div>
-              {topWarnings.length > 0 && (
-                <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] opacity-90">
-                  {topWarnings.map((w, i) => (
-                    <span key={i}>{w}</span>
-                  ))}
-                  {assessment.warnings.length > 3 && (
-                    <span className="text-zinc-500">+{assessment.warnings.length - 3} more in Analytics</span>
-                  )}
-                </div>
-              )}
-            </div>
+      {showCurvesTabChrome && (
+      <div className="px-6 pt-2 shrink-0 space-y-3">
+        <ValidationResultsHero results={viewResults} variant="compact" />
+        <div className="rounded-xl border border-zinc-700/60 bg-gradient-to-b from-zinc-900/60 to-zinc-950/40 overflow-hidden shadow-lg shadow-black/20">
+          <div className="px-4 py-3 border-b border-zinc-800/80 bg-zinc-900/50">
+            <h2 className="text-sm font-semibold text-zinc-200">Statistiky a metriky</h2>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              Klíčové ukazatele nahoře, níže kompletní přehled podle kategorií. Zapni „Metodika“ pro kontext u jednotlivých položek.
+            </p>
           </div>
-        );
-      })()}
-
-      <details className="mx-6 mt-2 mb-1 shrink-0 rounded-xl border border-zinc-700/50 bg-gradient-to-br from-zinc-900/40 via-zinc-950/30 to-zinc-950/50 shadow-lg shadow-black/15 overflow-hidden">
-        <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-zinc-300 hover:text-zinc-100 select-none list-none [&::-webkit-details-marker]:hidden flex items-center justify-between gap-2 border-b border-zinc-800/50">
-          <span>Metriky runu</span>
-          <span className="text-xs text-zinc-500 font-normal">Kliknutím rozbalit / sbalit</span>
-        </summary>
-        <div className="px-4 py-3 border-t border-zinc-800/40">
-          <StatBlocks results={viewResults} batchAggregates={batchRunCount > 1 ? batchAggregates : null} />
+          <div className="px-4 py-4">
+            <StatBlocks results={viewResults} batchAggregates={batchRunCount > 1 ? batchAggregates : null} />
+          </div>
         </div>
         {contextTrade && contextChartOhlc.length > 0 && (
-          <div className="px-4 pb-4">
-            <div className="rounded-lg border border-zinc-700/50 bg-zinc-900/50 p-3">
-              <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">
-                Price context (LW chart) — 2× historie · marker: entry
-              </div>
-              <PriceContextChart
-                ohlc={contextChartOhlc}
-                entryIso={String(contextTrade.entryDate ?? contextTrade.date ?? "")}
-                side={contextTrade.type === "sell" ? "short" : "long"}
-                height={300}
-              />
+          <div className="rounded-xl border border-zinc-700/50 bg-zinc-900/40 p-4">
+            <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">
+              Kontext ceny (výřez) — vstup obchodu
             </div>
+            <PriceContextChart
+              ohlc={contextChartOhlc}
+              entryIso={String(contextTrade.entryDate ?? contextTrade.date ?? "")}
+              side={contextTrade.type === "sell" ? "short" : "long"}
+              height={280}
+            />
           </div>
         )}
-      </details>
+      </div>
+      )}
 
       <div
         className={`flex-1 px-6 mt-2 rounded-b-xl overflow-hidden bg-zinc-900/80 border border-zinc-800 ${
@@ -690,7 +963,7 @@ export function ResultsView({
           <div className="space-y-4 py-2">
             <div>
               <div className="text-[10px] uppercase tracking-wider text-zinc-500 px-1 mb-1 inline-flex items-center gap-1">
-                Equity — účet
+                Equity ($) — účet
                 <FieldHelpPopover help={backtestFieldHelp.resultsEquityUsd} />
               </div>
               <EquityChart
@@ -726,7 +999,7 @@ export function ResultsView({
                   fillRgba="rgba(245, 158, 11, 0.28)"
                   footerHint={
                     rSummary != null
-                      ? `Obchodů s odhadnutým R: ${rSummary.count} z ${viewResults.trades?.length ?? 0} (ze zoneMeta: stop, vstup, velikost).`
+                      ? `Obchodů s odhadnutým R: ${rSummary.count} z ${viewResults.trades?.length ?? 0} (initialRiskUsd nebo odvozené riziko).`
                       : null
                   }
                 />
@@ -734,7 +1007,7 @@ export function ResultsView({
                 <div className="h-[200px] rounded-lg bg-zinc-900 flex flex-col items-center justify-center text-zinc-500 text-sm px-4 text-center gap-1">
                   <span>Křivka R není k dispozici.</span>
                   <span className="text-xs text-zinc-600">
-                    Potřeba jsou uzavřené obchody s PnL a v zoneMeta platný stopPrice od strategie.
+                    Potřeba jsou uzavřené obchody s PnL a známé počáteční riziko (initialRiskUsd / metadata).
                   </span>
                 </div>
               )}
@@ -784,9 +1057,7 @@ export function ResultsView({
             })()}
           </div>
         )}
-        {activeTab === "highlight" && (
-          <TradeHighlight ohlc={viewResults.ohlc ?? []} trades={viewResults.trades} chartHeight={360} />
-        )}
+        {activeTab === "highlight" && <TradeHighlight trades={viewResults.trades ?? []} />}
         {activeTab === "detailed" &&
           (viewResults.ohlc && detailedWindow ? (
             <div className="py-4 h-full overflow-auto">
@@ -800,13 +1071,18 @@ export function ResultsView({
                   >
                     <option value="by_trades">Počet obchodů</option>
                     <option value="by_months">Období (měsíce)</option>
+                    {isFineDetailedTf ? <option value="by_days">Období (3 / 7 / 14 dní)</option> : null}
                   </select>
                   <span className="text-zinc-500 shrink-0">TF grafu:</span>
                   <select
                     value={chartTf}
                     onChange={(e) => setChartTf(e.target.value)}
                     className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200"
-                    title="Agregace svíček z dat runu. Pro přesnou osu použij „Zdroj“. Žlutě obrys = zóna z zoneMeta u daného obchodu; ostatní obdélníky = všechny zóny z modulu v okně."
+                    title={
+                      manifestWorkTf
+                        ? `Agregace svíček. Dataset = nativní soubor (${manifestDataFileTf ?? "?"}), výchozí TF = strategie (${manifestWorkTf}) dle manifestu workTimeframe.`
+                        : "Agregace svíček z načteného výřezu (plné OHLC z API, ne řídký export runu kde je to možné)."
+                    }
                   >
                     {chartTfOptions.map((o) => (
                       <option key={o.value} value={o.value}>
@@ -825,6 +1101,19 @@ export function ResultsView({
                         onChange={(e) => setTradesPerView(Math.min(100, Math.max(1, Number(e.target.value) || 15)))}
                         className="w-16 bg-zinc-800 border border-zinc-600 rounded px-2 py-1 text-zinc-200"
                       />
+                    </label>
+                  ) : detailedMode === "by_days" ? (
+                    <label className="flex items-center gap-1.5">
+                      <span className="text-zinc-500">Okno</span>
+                      <select
+                        value={daysPerView}
+                        onChange={(e) => setDaysPerView(Number(e.target.value) || 7)}
+                        className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200"
+                      >
+                        <option value={14}>2 týdny</option>
+                        <option value={7}>1 týden</option>
+                        <option value={3}>3 dny</option>
+                      </select>
                     </label>
                   ) : (
                     <label className="flex items-center gap-1.5">
@@ -875,18 +1164,22 @@ export function ResultsView({
                     </span>
                   </span>
                 </label>
-                {artifactDetailedLoading ? (
-                  <p className="text-xs text-amber-200/90">Načítám artefakty pro výřez…</p>
+                {detailedSliceLoading ? (
+                  <p className="text-xs text-amber-200/90">
+                    {useArtifactLayersDetailed
+                      ? "Načítám artefakty a plné OHLC pro výřez…"
+                      : "Načítám plné OHLC pro výřez (export z runu je zjednodušený)…"}
+                  </p>
                 ) : null}
-                {artifactDetailedError ? (
-                  <p className="text-xs text-rose-400">{artifactDetailedError}</p>
+                {detailedSliceError ? (
+                  <p className="text-xs text-rose-400">{detailedSliceError}</p>
                 ) : null}
                 {useArtifactLayersDetailed && artifactDetailedBanner ? (
                   <p className="text-xs text-zinc-500">{artifactDetailedBanner}</p>
                 ) : null}
                 <p className="text-xs text-zinc-500">{detailedWindow.summary}</p>
                 <ModuleOutputChart
-                  ohlc={chartOhlc.length ? chartOhlc : detailedWindow.windowOhlc}
+                  ohlc={chartOhlc.length > 0 ? chartOhlc : detailedWindow.windowOhlc}
                   moduleName="Detailed"
                   output={detailedChartOutputEffective}
                   trades={detailedWindow.visibleTrades}
@@ -894,6 +1187,7 @@ export function ResultsView({
                   orderLevelsMode
                   rrrTradeStyle={false}
                   showZoneTouchByIndex={chartTf === "source"}
+                  candleBarPeriodMs={detailedChartBarPeriodMs}
                 />
               </div>
             </div>

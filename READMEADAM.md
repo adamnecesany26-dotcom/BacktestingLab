@@ -38,19 +38,22 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
 1. **Levý panel (Sidebar)**  
    Výběr typu položky (strategie / indikátory / moduly), seznam entit, soubory u otevřené strategie. Vytváření strategie, přidání souboru.
 
-2. **Střed**  
+2. **Hlavní záložky**  
+   **Backtest / Editor / View / Monte Carlo** — Monte Carlo používáš po uložení runu (shuffle obchodů, prop simulace v prohlížeči), ne jako součást pravého menu.
+
+3. **Střed**  
    - **Editor** — kód `main.py`, indikátorů, modulů.  
    - **View** — svíčky + struktura (H/L, BOS, trend, S/D zóny) **bez** backtestu. Buď **live** přepočet modulu, nebo **z cache** (`.backtest_artifacts`) po **Build features** — stejná data/`years` jako u View. Řádek *Cache (dataset)* ukáže Fresh / Stale / chybí H|S/D.
 
    **S/D modul (`S_D_Zones` / `SD_identificator`):** Jeden zdroj kódu je [`examples/sd_zones.py`](examples/sd_zones.py) — vlož ho do obou názvů modulu v aplikaci, pokud používáš oba. Modul načítá swingy/BOS z **`HL_identificator` před `Swing_HL`** (`_load_swing_hl_module`). Strategie [`sd_zone_strategy`](strategies/sd_zone_strategy/main.py) používá **stejné pořadí** při importu z `modules/`, aby při dvou kopiích swing modulu View a backtest nečetly rozdílné swingy/BOS.
 
-3. **Pravý panel (`BacktestSettings`)**  
+4. **Pravý panel (`BacktestSettings`)**  
    Veškerá konfigurace backtestu, edge finding, Run.
 
-4. **Spodní panel (`LogPanel`)**  
+5. **Spodní panel (`LogPanel`)**  
    Logy ze serveru / engine procesu během běhu, progress.
 
-5. **Po Runu**  
+6. **Po Runu**  
    Přepne se na **Results** (`ResultsView`): záložky Equity → Highlight → Detailed → Analytics → Run history, exporty.
 
 ---
@@ -60,8 +63,8 @@ Při větší změně produktu aktualizuj konzistentně **README.md** (technick�
 ### Guided mode (beginner)
 
 - Checklist: instrument + roky → realistická simulace → validace ne single → quality gates.  
-- **Varování** (žlutý text): single run, sweep bez OOS/WF, nízký min trades, vypnuté MC, kombinace fixní seed + sweep na single.  
-- Tlačítko *Beginner defaults* nastaví rozumný výchozí edge profil (OOS, MC, …).
+- **Varování** (žlutý text): např. single run, sweep bez OOS/WF, nízký min trades. (Monte Carlo řeší samostatná záložka — není v tomto checklistu.)
+- Tlačítko *Beginner defaults* nastaví rozumný výchozí edge profil (OOS nebo WF, brány, …).
 
 ### Basic
 
@@ -102,22 +105,20 @@ Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|
 
 | Oblast | Co to dělá |
 |--------|------------|
-| **Rychlé profily** | Safe / Balanced / Explore / **Prop conservative** — přednastavení validace, sweep, MC, execution. Prop conservative: WF 5 folds, min 50 obchodů, max DD 15 %, PF ≥ 1.5, MC 1000 sims (block_bootstrap), execution se spread 1.5 bps, slippage ×vol 2, latence 1 bar, stress multiplier 1.5×, param test train-only. |
-| **Validation mode** | `single` (rychlé, nejnižší důvěra) / `oos_split` / `walk_forward` / **`param_test`** (citlivost vybraných číselných parametrů strategie na stejných datech; výstup `paramTest` + grafy v Analytics). |
-| **OOS ratio** | Velikost hold-out části (např. 0.25) — u OOS split. |
+| **Rychlé profily** | Safe / Balanced / Explore / **Prop conservative** / **Pessimist** (jen execution). Prop conservative: WF 5 foldů, min 50 obchodů, max DD 15 %, PF ≥ 1.5, sweep vypnutý, execution (spread 1.5 bps, slippage ×vol 2, latence 1 bar, stress 1.5×), param test **train-only**. |
+| **Validation mode** | `single` / `oos_split` / `walk_forward` / **`param_test`**. |
+| **OOS ratio** | Podíl hold-outu u OOS split. |
 | **WF folds / test ratio** | Počet oken a podíl testu ve walk-forward. |
-| **Param test** | V `validation_config`: rozpočet běhů, zaškrtnuté rozsahy u číselných klíčů z `PARAMS`; není náhrada OOS. Podporuje **train-only** režim (`train_only: true`): OAT sweep jen na trénovací části dat, automatická holdout evaluace nejlepšího parametru. |
-| **Quality gates** | Min trades, max DD %, min PF — engine vyhodnotí PASS/FAIL. |
-| **Fixní run seed** | Zapneš-li, stejný seed → reprodukovatelné MC, sweep, block bootstrap (`experiment.seed` → `RUN_SEED`). Bez zaškrtnutí náhodný seed každý run. Batch: stejný seed pro všechny dílčí runy z jednoho requestu. |
-| **Experiment** | Hypotéza, tagy (CSV), **Run branch** (seskupení runů). |
-| **Promote when gates pass** | Logický příznak v experimentu pro workflow (kandidát po splnění gate). |
-| **Sweep** | `none` / `random` / `grid` + počet vzorků — citlivost na parametry (s OOS/WF mnohem bezpečnější). |
-| **Monte Carlo** | Zap/vyp, počet simulací, **režim**: `iid_trade` vs `block_bootstrap` (serialita PnL). |
-| **Regime segmentation** | Zapíná regime analýzu v engine (pokud je v datech/strategii podporováno). |
-| **Portfolio backtest** | Více instrumentů v jednom requestu (JSON konfigurace) — **nepoužívat současně s batch** (UI to hlásí). |
-| **Batch / matrix** | Pole `items` v JSON — stejná strategie, různé overrides (instrument, data_file, …); sekvenční runy, souhrn v `batchSummary` + varování multiple testing. |
-| **Execution model** | Spread (bps), slippage × vola, latence v barech, **stress multiplier** (nové vstupní pole v UI — násobí slippage/spread penaltu; > 1 = horší podmínky plnění, např. 1.5× v Prop conservative presetu). |
-| **Forward bridge** | Paper/live shadow režim + baseline equity pro srovnání driftu (metriky v `executionSummary`). |
+| **Param test** | OAT na číselných `PARAMS`; train-only + holdout v Analytics. |
+| **Quality gates** | Min trades, max DD %, min PF. |
+| **Fixní run seed** | `experiment.seed` → `RUN_SEED` (sweep / náhodné části engine). |
+| **Experiment** | Hypotéza, tagy (CSV), **Run branch**. |
+| **Promote when gates pass** | Metadata workflow po PASS branách. |
+| **Sweep** | `none` / `random` / `grid` + počet vzorků — jen **jeden instrument** na run. |
+| **Execution model** | Spread, slippage × vol, latence, **stress multiplier**. |
+| **Forward bridge** | Paper/shadow metadata + baseline equity. |
+
+**Co v pravém menu už není:** Monte Carlo jako součást requestu, regime segmentation, portfolio víc nástrojů, batch/matrix — produkt je záměrně **jedna strategie + jeden symbol** na Run. Analýzy náhodného pořadí obchodů spouštěj v záložce **Monte Carlo** po uložení výsledku. API klienti mohou teoreticky posílat starší pole (`monte_carlo`, `batch_config`, …); desktop je neposílá.
 
 ---
 
@@ -133,7 +134,7 @@ Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|
 
 - Mřížka klíčových metrik + ⓘ tooltips (omezení interpretace Sharpe/Sortino/PF/…). Pořadí zvýrazňuje **%** a Win rate; **Return USD / Final equity** jsou na konci skupiny PnL.  
 - Blok **R-multiple (obchody)** — průměr, medián, percentily z obchodů, kde jde spočítat R ze `zoneMeta` + PnL.  
-- Pokud běžel MC: řádek s **risk of ruin** (odhad) a **mode**.
+- Pokud odpověď obsahuje `monteCarlo` (některé API běhy): řádek s **risk of ruin** (odhad) a **mode**.
 - **DD Duration** — maximální trvání drawdownu v barech a dnech (jak dlouho trvalo dostat se z vrcholu na dno).
 - **Recovery** — čas k zotavení: kolik barů/dnů od dna zpět na nový peak equity (nebo „—" pokud ještě nedošlo k obnově).
 - **Top 5 PnL %** — kolik procent celkového zisku pochází z pěti nejlepších obchodů (vysoká koncentrace = strategie závisí na pár outlierech).
@@ -171,7 +172,7 @@ Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|
 - **Konfigurace běhu** — horní strip z `manifest.analysis` (co bylo ve skutečnosti zapnuté v requestu).  
 - **S/D zóny** — záložka s `SdZoneAnalytics` (obchody s `zoneMeta`: Demand/Supply, inducement, base, impulse, …); slovník polí u ikony válce.  
 - **Param test** — pokud běžel režim `param_test`, grafy/metriky v `ParamTestAnalytics`. Při **train-only** režimu (`train_only: true`) sweep probíhá jen na trénovací části dat a nejlepší parametr se automaticky vyhodnotí na hold-out — v UI je zobrazení holdout výsledků.
-- **Bootstrap CI karty** — 95% intervaly spolehlivosti pro mean PnL, total return a trade-level Sharpe (1 000 bootstrap resamplingů uzavřených obchodů). Pokud proběhlo víc pokusů (sweep, batch, folds), zobrazuje **upravenou α** (Bonferroni: 0.05 / K).
+- **Bootstrap CI karty** — 95% intervaly spolehlivosti pro mean PnL, total return a trade-level Sharpe (1 000 bootstrap resamplingů uzavřených obchodů). Pokud proběhlo víc dílčích pokusů (sweep, walk-forward foldy, případně batch z API), zobrazuje **upravenou α** (Bonferroni: 0.05 / K).
 - **Edge decomposition** — sekce rozkladu edge: win rate vs payoff ratio, rovnice WR×AvgWin − LR×AvgLoss, Kelly frakce. Vizuální přehled toho, z čeho se skládá ziskovost strategie.
 - **Multiple testing awareness strip** — řádek s počtem pokusů K a naivní Bonferroni korigovanou α (0.05 / K). Připomínka, že čím víc kombinací zkoušíš, tím spíš najdeš „šťastný" výsledek.
 - **Drawdown analysis** — sekce s podrobnou analýzou drawdownu: maximální a průměrná doba trvání (bary + dny), čas k recovery, procento barů pod equity high (underwater %), počet drawdown epizod.
@@ -181,7 +182,7 @@ Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|
 - **Sharpe frequency context strip** — řádek pod Sharpe metrikou vysvětlující frekvenci annualizace (kolik period za rok engine použil pro výpočet).
 - **Prop red flags** — barevně kódovaná sekce s výsledky automatické kontroly z `_compute_prop_red_flags` v engine. Každý flag má **severity badge** (critical = červený, warning = žlutý) a vysvětlení. Kontrolované vzory: extrémně vysoký Sharpe s málo obchody, příliš málo obchodů (< 10 critical, < 30 warning), nulové ztráty / win rate > 95 %, nedefinovaný PF, single run bez validace, vypnutý execution model, single + no execution = minimální věrohodnost, podezřele nízký DD, příliš hladká equity (> 92 % barů roste), bootstrap CI protínající nulu, koncentrace PnL (top 5 > 80 %).
 - **„Not a broker" disclaimer** — v sekci execution summary: upozornění, že execution model je **zjednodušená aproximace** (lineární slippage, bez market impact, bez modelování kapacity a book depth). Výsledky nelze přímo srovnávat s reálným plněním od brokera.
-- **Obecná analytika** — rozbalovací blok: **readiness / overfitting** (severity + varování, `overfittingSignals.ts`), validace, foldy, guardrails, robustnost / heatmapa sweepu, Monte Carlo, režimy, **cost attribution**, forward bridge, batch summary, quality gate, experiment (run diff, promote evidence, …).
+- **Obecná analytika** — rozbalovací blok: **readiness / overfitting**, validace, foldy, guardrails, robustnost / heatmapa sweepu, případně `monteCarlo` / regime / portfolio / batch bloky ze starších nebo API odpovědí, **cost attribution**, forward bridge, quality gate, experiment (run diff, promote evidence, …).
 
 ### Run history
 
@@ -229,10 +230,10 @@ Z kořene repa: `python scripts/audit_market_data.py` — projde `data/**/*.txt|
 Shrnutí toho, co často chybí v hlavě po rychlém vývoji:
 
 - **Cost attribution** v execution summary + zobrazení v Analytics.  
-- **Monte Carlo** s volitelným **block bootstrap** a texty `method` / `mode` / `note` v payloadu.  
+- **Monte Carlo (záložka):** náhodné přeřazení obchodů / prop-firm scénáře z **uloženého** runu v prohlížeči — není součástí pravého menu Edge finding. Starší uložené runy mohou mít serverové pole `monteCarlo` v JSON.
 - **Walk-forward / OOS** s fold tabulkou a **guardrails** (heuristiky, ne důkaz).  
 - **Param test** v Edge finding + výstupy v Analytics.  
-- **Batch/matrix** běhy s `batchSummary` a varováním na multiple testing.  
+- **API batch/matrix** zůstává v engine (`batchSummary`) pro skripty; desktop je neposílá.  
 - **Fixní seed** v UI a manifestu.  
 - **Repro ZIP** z výsledků.  
 - **Overfitting / readiness** sdílené mezi Analytics a Run history.  
@@ -251,7 +252,7 @@ Shrnutí toho, co často chybí v hlavě po rychlém vývoji:
 - **Payoff decomposition** v Analytics — rozklad edge: win rate vs payoff ratio, rovnice WR×AvgWin − LR×AvgLoss, Kelly frakce.
 - **Payoff Ratio, Edge / trade, Kelly %** v StatBlocks — nové metriky vedle existujících.
 - **Multiple testing awareness strip** — řádek v Analytics s počtem pokusů K a korigovanou Bonferroni α.
-- **Trial count** v manifestu — počet nezávislých pokusů (sweep × batch × folds) pro korekci multiple testing.
+- **Trial count** v manifestu — násobení sweepu, případných API batch dílčích běhů a foldů (u běžného desktop uživatele typicky bez batch).
 - **Param test train-only** režim — OAT sweep jen na train části, automatická holdout evaluace nejlepšího parametru; zobrazení v ParamTestAnalytics.
 - **Nová pole v `BacktestMetrics`:** `payoffRatio`, `edgePerTrade`, `kellyFraction`.
 - **Nová pole v `RunResponse`:** `bootstrapCI`, `payoffDecomposition`, `overfittingSignals` (top-level).
@@ -260,7 +261,7 @@ Shrnutí toho, co často chybí v hlavě po rychlém vývoji:
 - **Prop-level red flags** v engine (`_compute_prop_red_flags`) — automatický sken výsledků na podezřelé vzory: vysoký Sharpe s málo obchody, nulové ztráty, příliš hladká equity, koncentrovaný PnL, single run bez validace, vypnutý execution model aj.
 - **Trust banner** v ResultsView — barevný pruh pod exportem zobrazující `trustLevel` (not_trustworthy / low_trust / cautious / acceptable), počet critical/warning flagů a validační tip.
 - **Detailní red flags sekce** v AnalyticsView — jednotlivé flagy s severity badge a vysvětlením.
-- **Prop conservative preset** v Edge finding — WF 5 folds, min 50 obchodů, max DD 15 %, PF ≥ 1.5, MC 1000 block_bootstrap, execution se spread 1.5 bps, slippage ×vol 2, latence 1 bar, stress multiplier 1.5×, param test train-only.
+- **Prop conservative preset** v Edge finding — WF 5 foldů, min 50 obchodů, max DD 15 %, PF ≥ 1.5, execution (spread 1.5 bps, slippage ×vol 2, latence 1 bar, stress 1.5×), param test train-only (Monte Carlo zvlášť v záložce).
 - **Stress multiplier UI** — nové vstupní pole v sekci Execution Model (Edge finding).
 - **„Not a broker" disclaimer** — v execution summary sekci Analytics: vysvětlení zjednodušeného slippage modelu.
 - **Nové pole v `RunResponse`:** `propRedFlags` (trustLevel, flags, criticalCount, warningCount, tip).
@@ -280,7 +281,7 @@ Shrnutí toho, co často chybí v hlavě po rychlém vývoji:
 1. Úprava kódu → uložit.  
 2. (Pro S/D shodu View ↔ backtest) **Build features** ve View nebo CLI precompute; ve View zapnout cache; ve strategii `use_sd_artifacts=1`.  
 3. View: ověřit logiku (live nebo z cache).  
-4. Nastavit Edge: aspoň OOS nebo WF pro „vážné“ rozhodnutí; zapnout MC; uvážit execution model.  
+4. Nastavit Edge: aspoň OOS nebo WF pro „vážné“ rozhodnutí; zapnout execution model; po uložení runu případně **Monte Carlo** záložku pro shuffle / prop simulaci.  
 5. Run → logy → Results → Analytics (readiness) → případně Run history compare.  
 6. Při potřebě sdílet kontext: Export JSON nebo Repro bundle.
 
@@ -310,7 +311,7 @@ Tahle část je **pro tebe, když se v pravém panelu ztrácíš**. Představ si
 **Co to je:** Malý „trenér“ uvnitř aplikace. Nekontroluje strategii za tebe — jen říká: *„Udělal jsi základní kroky, aby výsledek dával aspoň trochu smysl?“*
 
 - **Checklist (odškrtávací body):** máš vybraný instrument a roky, rozumné nastavení simulace (kapitál, poplatky), zapnutou **validaci** něco jiného než čistý *single run*, a nastavené **quality gates** (minimální počet obchodů a rozumný minimální profit factor).
-- **Tlačítko „Použít doporučené defaulty“:** Jedním klikem nastaví rozumný výchozí stav (např. OOS validace, Monte Carlo zapnuté, rozumné brány). Hodí se, když nevíš, kde začít.
+- **Tlačítko „Použít doporučené defaulty“:** Jedním klikem nastaví rozumný výchozí stav (např. OOS nebo WF validace, brány). Hodí se, když nevíš, kde začít.
 - **Žlutá pole „Guardrails“:** To nejsou chyby v kódu — jsou to **upozornění**. Např. *sweep bez OOS*, *málo obchodů v gate*, *vypnuté MC*. Mentor ti říká: „Takhle můžeš snadno přehlédnout, že tě oklamala náhoda.“
 
 **Kdy to řešit:** Vždy na začátku; když spěcháš, aspoň přečti guardrails.
@@ -372,7 +373,7 @@ Tady nejde o jedno číslo, ale o **disciplínu**. Představ si to jako laborato
 
 #### 6a) Úvodní text a profily Safe / Balanced / Explore
 
-Krátký text v panelu ti připomene souvislosti (validace, brány, sweep, MC, execution). **Profily** jsou zkratky: jedním klikem nastavíš styl testu (opatrný / střední / průzkumný). Pořád můžeš vše ručně přebít.
+Krátký text v panelu ti připomene souvislosti (validace, brány, sweep, execution). **Profily** jsou zkratky: jedním klikem nastavíš styl testu (opatrný / střední / průzkumný / prop / pesimistická exekuce). Pořád můžeš vše ručně přebít.
 
 #### 6b) Validation mode (režim validace)
 
@@ -394,7 +395,7 @@ Po běhu engine zkontroluje hrubé limity:
 
 #### 6d) Fixní run seed
 
-**Seed** je „semínko“ náhody. Když je zapnuté, části běhu, které používají náhodu (Monte Carlo, některé sweep režimy, bootstrap), budou při **stejném vstupu** opakovatelné — hodí se na ladění a sdílení výsledků. Když chceš vidět rozptyl náhody, seed nemusíš fixovat.
+**Seed** je „semínko“ náhody. Když je zapnuté, části běhu, které používají náhodu (náhodný sweep, bootstrap v engine pokud je v requestu), budou při **stejném vstupu** opakovatelné — hodí se na ladění a sdílení výsledků. Když chceš vidět rozptyl náhody, seed nemusíš fixovat.
 
 #### 6e) Experiment (hypotéza, tagy, větev)
 
@@ -410,24 +411,21 @@ Když projdou brány, run se může označit jako **kandidát** k dalšímu sled
 
 Engine zkouší **víc kombinací čísel** z parametrů strategie. **Random** = rychlý průzkum prostoru, **Grid** = systematičtější mřížka. **Bez validace (OOS/WF)** je sweep nebezpečný — snadno najdeš „šťastné číslo“ jen na jednom kusu dat. **Počet vzorků** = kolik kombinací (víc = pomalejší, ale lepší pokrytí).
 
-#### 6h) Monte Carlo
+#### 6h) Monte Carlo (záložka v aplikaci)
 
-**Po dokončení backtestu** engine vezme **uzavřené obchody** a mnohokrát je **náhodně přeskupí** (bootstrap), aby ukázal rozptyl drawdownu, konečného účtu a odhad **risk of ruin**. **Neběží paralelně s grafem svíček** — je to druhá fáze stejného Runu. Výsledky uvidíš v **Analytics / metrikách** pod `monteCarlo`.
+**Po uložení výsledku** přepni hlavní záložku **Monte Carlo**: vybereš run, nastavíš typ simulace (např. shuffle pořadí obchodů nebo prop-firm scénář) a počet iterací — běží v prohlížeči nad uloženými obchody. Tím se oddělí „dokončit backtest“ od „hrát si s rozptylem výsledků“. Starší odpovědi z API mohou stále obsahovat pole `monteCarlo` přímo v JSON.
 
-- **IID trade:** losuje jednotlivé obchody (ignoruje krátkodobé „slepení“ výsledků).
-- **Block bootstrap:** bere **bloky** obchodů po sobě — vhodnější, když výsledky v čase souvisí (řada ztrát po sobě).
+#### 6i) Regime / portfolio / batch (z pohledu desktop UI)
 
-#### 6i) Regime segmentation
+**Nepřepínaš je v pravém panelu** — zaměřujeme se na jednu strategii a jeden instrument. V Analytics se může u starších nebo API runů objevit regime tabulka, portfolio banner nebo batch summary; to jsou výstupy z odpovědi, ne z aktuálního menu.
 
-Po běhu engine **štítkuje obchody** podle jednoduchých pravidel z cen (krátká vs dlouhá průměrná cena + vysoká vs nízká volatilita) a podle **hodiny vstupu** (asie / evropa / US). **Nerozpozná slovy „bull/bear“** — jde o hrubé přihrádky „trend vs range“ a „hluk vs klid“, abys viděl, kde strategie vydělává a kde krvácí.
+#### 6j) (rezervováno — dříve portfolio)
 
-#### 6j) Portfolio backtest
+Více instrumentů v jednom desktop requestu se v tomto produktu nekonfiguruje. Ověř strategii nejdřív na jednom trhu.
 
-Více instrumentů v jednom nastavení (JSON seznam). **Nelze kombinovat s batch režimem** — aplikace to hlásí. Nejdřív si ověř strategii na jednom trhu, portfolio je složitější krok.
+#### 6k) (rezervováno — dříve batch)
 
-#### 6k) Batch / matrix runs
-
-Jeden request spustí **víc běhů za sebou** se stejnou strategií, ale jinými položkami (např. jiný instrument v JSON poli). Šetří klikání, ale **čím víc pokusů, tím víc rizika náhodného „úspěchu“** — ve výsledku bývá varování na *multiple testing*. Drž počet variant nízko, dokud nemáš jasnou hypotézu pro každou.
+Hromadné běhy zůstávají možné přes **API** (`batch_config`). Desktop je nepoužívá; riziko multiple testing řešíš hlavně **sweepem + WF/OOS**.
 
 #### 6l) Realistic execution model
 
@@ -449,7 +447,7 @@ Záložky **Strategy** vs jednotlivé **moduly**. Hodnoty odpovídají slovník�
 
 ### 8) Run
 
-Spustí celý řetězec: příprava souborů → engine subprocess → (validace, sweep, MC, režimy…) → výsledek do **Results**. Logy a progress jsou dole v **LogPanelu**. **Zastavit** přeruší běh (můžeš vidět exit 130 / přerušení — není to chyba pandas).
+Spustí celý řetězec: příprava souborů → engine → (validace, sweep, foldy…) → výsledek do **Results**. Logy a progress jsou dole v **LogPanelu**. **Zastavit** přeruší běh (můžeš vidět exit 130 / přerušení — není to chyba pandas). Monte Carlo nad obchody spouštíš **až po uložení** v záložce Monte Carlo.
 
 **Časový limit:** V sekci **Simulation** je **Max. doba běhu (s)** — kolik sekund smí backend čekat na dokončení engine (výchozí 3600). Při pomalém stroji nebo síti zvyš (např. 7200–14400). Na serveru jde globálně nastavit i `RUN_TIMEOUT_SEC` a `RUN_STREAM_IDLE_TIMEOUT_SEC` (viz `backend/app/services/runner.py`).
 
@@ -496,7 +494,7 @@ Engine sjednocuje **Trade count** s počtem záznamů v `trades`, které posíl�
 | Co se změnilo | Praktický dopad |
 |---|---|
 | **In-process engine** nyní výchozí | Odpadá startování nového Python procesu na každý run. Param test / sweep s 24 sub-runy ušetří ~2–5 s × 24 = **desítky sekund**. |
-| **Lightweight mode** pro sub-runy | Param test, sweep, WF fold a portfolio sub-runy přeskočí bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition a export OHLC/equity dat. **~30–60 % úspora CPU** na každém sub-runu. |
+| **Lightweight mode** pro sub-runy | Param test, sweep a WF fold sub-runy přeskočí bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition a export OHLC/equity dat. **~30–60 % úspora CPU** na každém sub-runu. |
 | **Result cache** (256 slotů) | Opakovaný run se stejným kódem + parametry + daty vrátí výsledek okamžitě z paměti. |
 | **Fast data fingerprint** | Rutinní `datasetFingerprint` nepoužívá plný SHA-256 celého souboru — místo toho `mtime + size` hash. Eliminuje druhé čtení GB CSV. |
 | **Vectorized OHLC/equity export** | Pandas vectorizace místo row-by-row `iloc`. ~10× rychlejší serializace. |

@@ -34,6 +34,14 @@ const METH_TIPS: Partial<Record<string, string>> = {
     "Kolik % celkov\u00e9ho zisku generuje top 5 obchod\u016f. Vysok\u00e1 koncentrace = edge z\u00e1vis\u00ed na p\u00e1r v\u00fdjime\u010dn\u00fdch vstupech, ne na systematick\u00e9m procesu.",
   payoffRatio:
     "AvgWin / AvgLoss \u2014 kolikr\u00e1t je pr\u016fm\u011brn\u00fd zisk v\u011bt\u0161\u00ed ne\u017e pr\u016fm\u011brn\u00e1 ztr\u00e1ta. PayoffRatio < 1 vy\u017eaduje win rate > 50% pro pozitivn\u00ed edge.",
+  ulcerIndex:
+    "Ulcer Index — měří hloubku a délku drawdownů (nižší je lépe).",
+  marRatio:
+    "Return / max drawdown (MAR) — podobná myšlenka jako Calmar; závisí na volbě metrik v engine.",
+  calmarRatio:
+    "CAGR / |max drawdown| — návratnost vs. nejhorší propad; užitečné pro srovnání strategií, stále závislé na délce vzorku.",
+  cagr:
+    "Složená roční míra růstu z equity křivky — interpretuj jen při dostatečně dlouhém a reprezentativním období.",
   kellyFraction:
     "Kelly = WR - LR/PayoffRatio. Teoretick\u00fd optim\u00e1ln\u00ed pod\u00edl kapit\u00e1lu za p\u0159edpokladu i.i.d. Re\u00e1ln\u00fd sizing by m\u011bl b\u00fdt v\u00fdrazn\u011b men\u0161\u00ed (half-Kelly nebo m\u00e9n\u011b).",
 };
@@ -49,26 +57,34 @@ function MethTip({ text }: { text: string }) {
 type StatItem = { key: string; label: string; format: (v: number) => string; group: "pnl" | "risk" | "activity" };
 
 const STAT_ITEMS: StatItem[] = [
-  { key: "totalReturn", label: "Return %", format: (v) => `${v}%`, group: "pnl" },
-  { key: "winRate", label: "Win Rate", format: (v) => `${v}%`, group: "pnl" },
-  { key: "profitFactor", label: "Profit Factor", format: (v) => v.toFixed(2), group: "pnl" },
-  { key: "expectancyUsd", label: "Expect. USD", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
-  { key: "expectancyR", label: "Expect. R", format: (v) => v.toFixed(2), group: "pnl" },
-  { key: "payoffRatio", label: "Payoff Ratio", format: (v) => v.toFixed(2), group: "pnl" },
-  { key: "kellyFraction", label: "Kelly %", format: (v) => `${(v * 100).toFixed(1)}%`, group: "pnl" },
-  { key: "finalEquity", label: "Final Equity", format: (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2 }), group: "pnl" },
-  { key: "totalReturnUsd", label: "Return USD", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
+  { key: "totalReturn", label: "N\u00e1vratnost %", format: (v) => `${v}%`, group: "pnl" },
+  { key: "winRate", label: "Win rate", format: (v) => `${v}%`, group: "pnl" },
+  { key: "profitFactor", label: "Profit factor", format: (v) => v.toFixed(2), group: "pnl" },
+  { key: "expectancyUsd", label: "Expectancy $", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
+  { key: "expectancyR", label: "Expectancy R", format: (v) => v.toFixed(2), group: "pnl" },
+  { key: "payoffRatio", label: "Payoff (W/L)", format: (v) => v.toFixed(2), group: "pnl" },
+  { key: "kellyFraction", label: "Kelly (teor.)", format: (v) => `${(v * 100).toFixed(1)}%`, group: "pnl" },
+  { key: "finalEquity", label: "Kone\u010dn\u00e9 equity", format: (v) => v.toLocaleString("en-US", { minimumFractionDigits: 2 }), group: "pnl" },
+  { key: "totalReturnUsd", label: "Zisk / ztr\u00e1ta $", format: (v) => `$${v.toLocaleString("en-US", { minimumFractionDigits: 2 })}`, group: "pnl" },
   { key: "sharpeRatio", label: "Sharpe", format: (v) => v.toFixed(2), group: "risk" },
   { key: "sortinoRatio", label: "Sortino", format: (v) => v.toFixed(2), group: "risk" },
-  { key: "maxDrawdown", label: "Max DD %", format: (v) => `${v.toFixed(2)}%`, group: "risk" },
-  { key: "maxDrawdownDuration", label: "DD Duration", format: () => "", group: "risk" },
-  { key: "timeToRecovery", label: "Recovery", format: () => "", group: "risk" },
-  { key: "pnlConcentration", label: "Top 5 PnL %", format: () => "", group: "risk" },
-  { key: "tradeCount", label: "Trades", format: (v) => String(v), group: "activity" },
-  { key: "longShort", label: "L / S", format: () => "", group: "activity" },
+  { key: "calmarRatio", label: "Calmar", format: (v) => v.toFixed(2), group: "risk" },
+  { key: "marRatio", label: "MAR", format: (v) => v.toFixed(2), group: "risk" },
+  { key: "cagr", label: "CAGR %", format: (v) => `${v.toFixed(2)}%`, group: "risk" },
+  { key: "ulcerIndex", label: "Ulcer", format: (v) => v.toFixed(2), group: "risk" },
+  { key: "maxDrawdown", label: "Max drawdown %", format: (v) => `${v.toFixed(2)}%`, group: "risk" },
+  { key: "maxDrawdownDuration", label: "Trv\u00e1n\u00ed DD", format: () => "", group: "risk" },
+  { key: "timeToRecovery", label: "N\u00e1vrat z DD", format: () => "", group: "risk" },
+  { key: "pnlConcentration", label: "Top 5 obchod\u016f % PnL", format: () => "", group: "risk" },
+  { key: "tradeCount", label: "Po\u010det obchod\u016f", format: (v) => String(v), group: "activity" },
+  { key: "longShort", label: "Long / Short", format: () => "", group: "activity" },
 ];
 
-const GROUP_LABELS: Record<string, string> = { pnl: "PnL", risk: "Risk", activity: "Activity" };
+const GROUP_LABELS: Record<string, string> = {
+  pnl: "V\u00fdkonnost",
+  risk: "Riziko a drawdown",
+  activity: "Aktivita",
+};
 
 function formatAggNum(v: unknown, digits = 2): string {
   if (v == null || Number.isNaN(Number(v))) return "\u2014";
@@ -81,6 +97,28 @@ function formatDuration(bars: number | null | undefined, days: number | null | u
   if (bars != null) parts.push(`${bars} bars`);
   if (days != null) parts.push(`${days.toFixed(0)}d`);
   return parts.join(" / ") || "\u2014";
+}
+
+function HeroKpiCard({
+  label,
+  value,
+  sub,
+  valueClass,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  valueClass?: string;
+}) {
+  return (
+    <div className="rounded-2xl border border-zinc-600/40 bg-gradient-to-b from-zinc-800/90 to-zinc-900/95 px-3 py-2.5 sm:px-4 sm:py-3 min-h-[4.5rem] flex flex-col justify-between shadow-md shadow-black/20">
+      <span className="text-[10px] sm:text-[11px] text-zinc-500 uppercase tracking-wider font-medium leading-tight">{label}</span>
+      <span className={`font-mono text-lg sm:text-xl font-semibold tracking-tight truncate ${valueClass ?? "text-zinc-50"}`}>
+        {value}
+      </span>
+      {sub ? <span className="text-[10px] text-zinc-600 leading-tight truncate">{sub}</span> : null}
+    </div>
+  );
 }
 
 export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
@@ -126,7 +164,7 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
       return formatDuration(m.maxDrawdownDurationBars as number | null, m.maxDrawdownDurationDays as number | null);
     if (key === "timeToRecovery") {
       const rBars = m.timeToRecoveryBars;
-      return rBars == null ? "\u26a0 not recovered" : formatDuration(rBars as number, m.timeToRecoveryDays as number | null);
+      return rBars == null ? "\u26a0 bez n\u00e1vratu k peak" : formatDuration(rBars as number, m.timeToRecoveryDays as number | null);
     }
     if (key === "pnlConcentration") return Number.isFinite(top5Pct) ? `${top5Pct.toFixed(1)}%` : "\u2014";
     if (key === "payoffRatio" || key === "kellyFraction") {
@@ -161,7 +199,7 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
 
   const validationMode = String(results.validation?.mode ?? "single");
   const showFullSampleScopeNote =
-    validationMode === "oos_split" || validationMode === "walk_forward";
+    validationMode === "oos_split" || validationMode === "walk_forward" || validationMode === "param_test";
 
   return (
     <div className="space-y-3">
@@ -170,9 +208,21 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
           className="rounded-xl border border-amber-800/40 bg-amber-950/25 px-3 py-2.5 text-[11px] text-amber-100/90 leading-snug shadow-md shadow-black/10"
           title="viz manifest.primaryMetricsSource a methodology.primaryRunScope"
         >
-          <span className="font-medium text-amber-200">Hlavní čísla (equity, obchody): </span>
-          vždy z <span className="text-amber-100">jednoho</span> plného backtestu na <span className="text-amber-100">celých</span> datech.
-          OOS / walk-forward přidává jen dodatečné lehké běhy v záložce Analytics (foldy) — proto se shodují se single runem.
+          {validationMode === "param_test" ? (
+            <>
+              <span className="font-medium text-amber-200">Hlavní čísla (equity, obchody): </span>
+              odpovídají <span className="text-amber-100">jednomu</span> baseline běhu s aktuálními PARAMS na{' '}
+              <span className="text-amber-100">celém</span> úseku dat. Sekce „Param test“ v analytice ukazuje{' '}
+              <span className="text-amber-100">další</span> lehké běhy (OAT sweep) — ty nemění čísla v této tabulce.
+            </>
+          ) : (
+            <>
+              <span className="font-medium text-amber-200">Hlavní čísla (equity, obchody): </span>
+              vždy z <span className="text-amber-100">jednoho</span> plného backtestu na <span className="text-amber-100">celých</span> datech.
+              OOS / walk-forward přidává jen dodatečné lehké běhy v záložce Analytics (foldy) — proto se horní metriky mohou shodovat
+              s tím samým nastavením v režimu „jen jeden běh“.
+            </>
+          )}
         </div>
       )}
       {aggItems.length > 0 && (
@@ -191,9 +241,71 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
           </div>
         </div>
       )}
-      <div className="flex items-center justify-between px-0.5">
+      <div className="rounded-2xl border border-zinc-700/60 bg-zinc-950/40 p-3 sm:p-4 shadow-lg shadow-black/25">
+        <div className="text-[11px] uppercase tracking-wider text-emerald-500/90 font-medium mb-3">Kl\u00ed\u010dov\u00e9 ukazatele</div>
+        <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-2 sm:gap-3">
+          <HeroKpiCard
+            label="N\u00e1vratnost"
+            value={Number.isFinite(Number(m.totalReturn)) ? `${Number(m.totalReturn).toFixed(2)} %` : "\u2014"}
+            sub="celkov\u00fd v\u00fdsledek obdob\u00ed"
+            valueClass={
+              Number(m.totalReturn) > 0
+                ? "text-emerald-400"
+                : Number(m.totalReturn) < 0
+                  ? "text-rose-400"
+                  : "text-zinc-300"
+            }
+          />
+          <HeroKpiCard
+            label="P / L (\u0024)"
+            value={
+              m.totalReturnUsd != null && Number.isFinite(Number(m.totalReturnUsd))
+                ? `${Number(m.totalReturnUsd) >= 0 ? "+" : ""}${Number(m.totalReturnUsd).toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 0 })}`
+                : "\u2014"
+            }
+            sub="realizovan\u00fd na \u00fa\u010dtu"
+            valueClass={
+              Number(m.totalReturnUsd) > 0
+                ? "text-emerald-400"
+                : Number(m.totalReturnUsd) < 0
+                  ? "text-rose-400"
+                  : "text-zinc-300"
+            }
+          />
+          <HeroKpiCard
+            label="Profit factor"
+            value={formatProfitFactorDisplay(
+              m.profitFactor,
+              typeof m.profitFactorStatus === "string" ? m.profitFactorStatus : undefined,
+            )}
+          />
+          <HeroKpiCard
+            label="Win rate"
+            value={Number.isFinite(Number(m.winRate)) ? `${Number(m.winRate).toFixed(1)} %` : "\u2014"}
+          />
+          <HeroKpiCard
+            label="Max drawdown"
+            value={
+              Number.isFinite(Number(m.maxDrawdownPct ?? m.maxDrawdown))
+                ? `${Number(m.maxDrawdownPct ?? m.maxDrawdown).toFixed(2)} %`
+                : "\u2014"
+            }
+            valueClass="text-rose-300/95"
+          />
+          <HeroKpiCard
+            label="Obchody \u00b7 equity"
+            value={`${m.tradeCount ?? 0}`}
+            sub={
+              m.finalEquity != null && Number.isFinite(Number(m.finalEquity))
+                ? `konec: ${Number(m.finalEquity).toLocaleString("en-US", { maximumFractionDigits: 0 })}`
+                : undefined
+            }
+          />
+        </div>
+      </div>
+      <div className="flex items-center justify-between px-0.5 pt-1">
         <span className="text-[11px] uppercase tracking-wider text-zinc-500">
-          {aggItems.length > 0 ? "Vybran\u00fd instrument" : "Metriky runu"}
+          {aggItems.length > 0 ? "Vybran\u00fd instrument \u2014 detail" : "Kompletn\u00ed sada metrik"}
         </span>
         <button
           type="button"
@@ -206,9 +318,9 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
       {groups.map((g) => {
         const items = STAT_ITEMS.filter((s) => s.group === g);
         return (
-          <div key={g}>
-            <div className="text-[9px] uppercase tracking-widest text-zinc-600 mb-1 px-0.5">{GROUP_LABELS[g]}</div>
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(7.5rem,1fr))] gap-2">
+          <div key={g} className="rounded-2xl border border-zinc-800/90 bg-zinc-900/35 p-3 sm:p-4">
+            <div className="text-[10px] uppercase tracking-widest text-zinc-500 mb-3 font-semibold">{GROUP_LABELS[g]}</div>
+            <div className="grid grid-cols-[repeat(auto-fill,minmax(8rem,1fr))] gap-2 sm:gap-2.5">
               {items.map(({ key, label, format }) => {
                 const value = resolveValue(key, format);
                 const alert = alertBorderFor(key);
@@ -236,24 +348,24 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
         );
       })}
       {tradeRSummary != null && (
-        <div>
-          <div className="text-[9px] uppercase tracking-widest text-zinc-600 mb-1 px-0.5 flex items-center gap-1">
-            R-multiple (obchody)
+        <div className="rounded-2xl border border-emerald-900/50 bg-emerald-950/20 p-3 sm:p-4">
+          <div className="text-[10px] uppercase tracking-widest text-emerald-600/90 mb-3 font-semibold flex items-center gap-1 flex-wrap">
+            R-multiple (odhad z rizika)
             <FieldHelpPopover help={backtestFieldHelp.resultsRMultipleStats} />
             {showTips ? (
-              <MethTip text="Z uzavřených obchodů, kde jde z zoneMeta odvodit vstup a stop: R = PnL / (|entry\u2212stop|\u00d7|size|). Chybí-li stop v metadatech, obchod se do statistiky nepočítá." />
+              <MethTip text="Z uzavřených obchodů s odvozeným počátečním rizikem nebo stop v metadatech: R = PnL / (|entry\u2212stop|\u00d7|size|). Bez potřebných údajů se obchod do statistiky nepočítá." />
             ) : null}
           </div>
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(7.5rem,1fr))] gap-2">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             {[
-              { label: "Počet R", value: `${tradeRSummary.count} / ${results.trades?.length ?? 0}` },
-              { label: "Pr\u016fm\u011br R", value: tradeRSummary.mean.toFixed(2) },
-              { label: "Medi\u00e1n R", value: tradeRSummary.median.toFixed(2) },
-              { label: "5\u201395 %", value: `${tradeRSummary.p5.toFixed(2)} \u2026 ${tradeRSummary.p95.toFixed(2)}` },
+              { label: "Obchodů s R", value: `${tradeRSummary.count} / ${results.trades?.length ?? 0}` },
+              { label: "Průměr R", value: tradeRSummary.mean.toFixed(2) },
+              { label: "Medián R", value: tradeRSummary.median.toFixed(2) },
+              { label: "P5 – P95", value: `${tradeRSummary.p5.toFixed(2)} \u2026 ${tradeRSummary.p95.toFixed(2)}` },
             ].map(({ label, value }) => (
               <div
                 key={label}
-                className="rounded-xl px-2.5 py-2 min-w-0 min-h-[58px] flex flex-col justify-between shadow-sm shadow-black/10 bg-emerald-950/25 border border-emerald-800/40"
+                className="rounded-xl px-2.5 py-2 min-w-0 min-h-[58px] flex flex-col justify-between shadow-sm shadow-black/10 bg-emerald-950/30 border border-emerald-800/35"
               >
                 <span className="text-[10px] text-emerald-600/90 uppercase tracking-wider truncate">{label}</span>
                 <span className="font-mono text-[15px] text-emerald-100/95 truncate">{value}</span>
@@ -263,18 +375,18 @@ export function StatBlocks({ results, batchAggregates }: StatBlocksProps) {
         </div>
       )}
       {mc != null && Number.isFinite(ror) && (
-        <div className="rounded-lg bg-zinc-800/60 border border-zinc-700/40 px-3 py-2 text-xs text-zinc-400 space-y-1">
-          <div className="flex flex-wrap gap-x-3 gap-y-1 items-center">
-            <span className="text-zinc-500 uppercase tracking-wider">Monte Carlo</span>
+        <div className="rounded-2xl bg-zinc-800/50 border border-zinc-700/50 px-3 py-3 text-xs text-zinc-400 space-y-2">
+          <div className="flex flex-wrap gap-x-3 gap-y-1 items-center text-zinc-300">
+            <span className="text-zinc-500 uppercase tracking-wider font-medium">Monte Carlo</span>
             <span>
-              Risk of ruin (est.): <span className="text-zinc-200 font-mono">{ror.toFixed(4)}</span>
+              Risk of ruin: <span className="text-zinc-100 font-mono">{ror.toFixed(4)}</span>
             </span>
             <span>
-              Mode: <span className="text-zinc-200 font-mono">{mcMode}</span>
+              Režim: <span className="text-zinc-100 font-mono">{mcMode}</span>
             </span>
             {mcMethod && (
               <span>
-                Method: <span className="text-zinc-200 font-mono">{mcMethod}</span>
+                Metoda: <span className="text-zinc-100 font-mono">{mcMethod}</span>
               </span>
             )}
           </div>

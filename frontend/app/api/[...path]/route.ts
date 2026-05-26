@@ -23,9 +23,10 @@ const DEFAULT_LONG_FETCH_MS = 48 * 60 * 60 * 1000;
 
 /**
  * Next.js (a Vercel) omezují dobu běhu route handleru v sekundách.
- * Nastav ≥ než BACKEND_PROXY_FETCH_TIMEOUT_MS / 1000. Na Vercelu platí strop plánu.
+ * Musí být číselný literál — výraz (např. 48 * 60 * 60) Next v dev buildu neparsuje a padá konfigurace.
+ * 172800 s = 48 h. Nastav ≥ než BACKEND_PROXY_FETCH_TIMEOUT_MS / 1000. Na Vercelu platí strop plánu.
  */
-export const maxDuration = 48 * 60 * 60;
+export const maxDuration = 172800;
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";

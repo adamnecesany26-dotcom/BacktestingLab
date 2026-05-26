@@ -5,11 +5,19 @@ Handles CORS, routes, and startup/shutdown events.
 
 import os
 import re
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Načte backend/.env (a volitelně .env v kořenu projektu).
+_backend_dir = Path(__file__).resolve().parent.parent
+load_dotenv(_backend_dir / ".env", override=False)
+load_dotenv(_backend_dir.parent / ".env", override=False)
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import run, data, chart, view, artifacts, sd_zone_test, sd_zone_saved_runs
+from app.api import run, data, chart, view, artifacts
 from app.security import require_api_access
 
 app = FastAPI(
@@ -77,5 +85,3 @@ app.include_router(data.router, prefix="/api", tags=["data"], dependencies=[Depe
 app.include_router(chart.router, prefix="/api", tags=["chart"], dependencies=[Depends(require_api_access)])
 app.include_router(view.router, prefix="/api", tags=["view"], dependencies=[Depends(require_api_access)])
 app.include_router(artifacts.router, prefix="/api", tags=["artifacts"], dependencies=[Depends(require_api_access)])
-app.include_router(sd_zone_test.router, prefix="/api", tags=["sd-zone-test"], dependencies=[Depends(require_api_access)])
-app.include_router(sd_zone_saved_runs.router, prefix="/api", tags=["sd-zone-test"], dependencies=[Depends(require_api_access)])

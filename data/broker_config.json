@@ -6,6 +6,13 @@
     "margin": 20000,
     "commission_per_contract": 2.5
   },
+  "MNQ": {
+    "tick_size": 0.25,
+    "tick_value": 0.5,
+    "mult": 2,
+    "margin": 2000,
+    "commission_per_contract": 1.1
+  },
   "ES": {
     "tick_size": 0.25,
     "tick_value": 12.5,
@@ -27,9 +34,16 @@
     "margin": 12000,
     "commission_per_contract": 2.5
   },
+  "6E": {
+    "tick_size": 0.00005,
+    "tick_value": 6.25,
+    "mult": 125000,
+    "margin": 4500,
+    "commission_per_contract": 2.5
+  },
   "EU": {
-    "tick_size": 0.0001,
-    "tick_value": 12.5,
+    "tick_size": 0.00005,
+    "tick_value": 6.25,
     "mult": 125000,
     "margin": 4500,
     "commission_per_contract": 2.5

@@ -28,6 +28,7 @@ import type { OhlcBar } from "@shared/types";
 import {
   buildViewChartTimeframeOptionsCoarseFirst,
   effectiveViewDataTimeframe,
+  isFineOrNativeMinuteTf,
   shuffleWindowBarCount,
 } from "@/lib/viewChartTimeframe";
 import {
@@ -44,7 +45,9 @@ import {
   groupIndexedTrendSegments,
 } from "@/lib/viewChartLines";
 import { FieldHelpPopover } from "@/components/FieldHelpPopover";
-import { backtestFieldHelp } from "@/components/backtestFieldMeta";
+import { backtestFieldHelp, getParamFallbackHelp } from "@/components/backtestFieldMeta";
+import type { BacktestFieldHelp } from "@/components/backtestFieldMeta";
+import { StrategyConfigModal, StrategyParamsFieldList } from "@/components/StrategyParamsEditor";
 import { ViewLikeChart } from "@/components/charts/ViewLikeChart";
 import { DEFAULT_VISIBILITY, type VisibilityKey } from "@/components/charts/viewLikeChartSpec";
 
@@ -371,6 +374,15 @@ const VIEW_DISPLAY_PERIODS = [
   { label: "1M", years: 0.083 },
 ] as const;
 
+/** Jen při TF 1m / 5m / 15m — kratší okna než měsíc (roky jako zlomek při ~365.25 dnech). */
+const VIEW_DISPLAY_PERIODS_FINE_EXTRA = [
+  { label: "2T", years: 14 / 365.25 },
+  { label: "1T", years: 7 / 365.25 },
+  { label: "3D", years: 3 / 365.25 },
+] as const;
+
+const VIEW_EXTRA_SHORT_YEARS = new Set(VIEW_DISPLAY_PERIODS_FINE_EXTRA.map((p) => p.years));
+
 /** Výchozí View: 6M, denní svíčky (když TF v žebříku není — např. nativně denní data — efekt přepne na native). */
 const VIEW_DEFAULT_DISPLAY_YEARS = 0.5;
 const VIEW_DEFAULT_CHART_TIMEFRAME = "1D";
@@ -572,6 +584,26 @@ export function StrategyViewChart({
     viewParamsRef.current = viewParamsValues;
   }, [viewParamsValues]);
 
+  const getViewParamHelp = useCallback(
+    (paramName: string): BacktestFieldHelp => {
+      const meta = viewParamsMeta[paramName];
+      const fallback = getParamFallbackHelp(paramName, "VIEW_PARAMS");
+      if (!meta) return fallback;
+      return {
+        ...fallback,
+        title: meta.title ?? fallback.title,
+        whatItMeans: meta.whatItMeans ?? fallback.whatItMeans,
+        whyItMatters: meta.whyItMatters ?? fallback.whyItMatters,
+        howToUse: meta.howToUse && meta.howToUse.length > 0 ? meta.howToUse : fallback.howToUse,
+        recommendedDefault: meta.recommendedDefault ?? fallback.recommendedDefault,
+        withoutIt: meta.withoutIt ?? fallback.withoutIt,
+        bestPractices:
+          meta.bestPractices && meta.bestPractices.length > 0 ? meta.bestPractices : fallback.bestPractices,
+      };
+    },
+    [viewParamsMeta],
+  );
+
   const valuesCounts = useMemo(() => {
     const zonesAny = zones ?? [];
     const markersAny = (markers as any[]) ?? [];
@@ -639,6 +671,23 @@ export function StrategyViewChart({
     [selectedInstrument?.timeframe]
   );
 
+  const viewDisplayPeriodChoices = useMemo(() => {
+    const base = [...VIEW_DISPLAY_PERIODS];
+    if (isFineOrNativeMinuteTf(chartTimeframe, selectedInstrument?.timeframe)) {
+      return [...base, ...VIEW_DISPLAY_PERIODS_FINE_EXTRA];
+    }
+    return base;
+  }, [chartTimeframe, selectedInstrument?.timeframe]);
+
+  useEffect(() => {
+    if (
+      !isFineOrNativeMinuteTf(chartTimeframe, selectedInstrument?.timeframe) &&
+      VIEW_EXTRA_SHORT_YEARS.has(years)
+    ) {
+      setYears(1 / 12);
+    }
+  }, [chartTimeframe, selectedInstrument?.timeframe, years]);
+
   const needsDemoStyleClientSlice = useMemo(() => {
     return (
       selectedInstrument?.viewDemo === true ||
@@ -686,8 +735,12 @@ export function StrategyViewChart({
   }, [dataFile]);
 
   useEffect(() => {
+    if (!useArtifactLayer) {
+      setArtifactStatus(null);
+      return;
+    }
     void refreshArtifactStatus();
-  }, [refreshArtifactStatus]);
+  }, [useArtifactLayer, refreshArtifactStatus]);
 
   useEffect(() => {
     if (!chartTfOptions.some((o) => o.value === chartTimeframe)) {
@@ -1343,7 +1396,11 @@ export function StrategyViewChart({
     fetchData();
   }, [fetchData]);
 
-  const inputClass = "px-3 py-1.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm";
+  const selectClass =
+    "w-full min-h-[2.5rem] px-3 py-2 rounded-lg bg-zinc-950/90 border border-zinc-700/60 text-zinc-100 text-sm shadow-inner shadow-black/20 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500/40 transition-[box-shadow,border-color] disabled:opacity-45 disabled:cursor-not-allowed disabled:bg-zinc-900/50";
+
+  const inputClass =
+    "min-h-[2.25rem] px-3 py-2 rounded-lg bg-zinc-950/90 border border-zinc-700/60 text-zinc-100 text-sm shadow-inner shadow-black/20 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500/40 transition-[box-shadow,border-color] disabled:opacity-45 disabled:cursor-not-allowed";
 
   // Chart rendering moved to shared `ViewLikeChart` to ensure identical visuals across View and S/D results.
   const highMarkers = useMemo(() => markers.filter((m) => m.type === "high"), [markers]);
@@ -1359,327 +1416,411 @@ export function StrategyViewChart({
 
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex flex-wrap items-end gap-3 pb-3 shrink-0 border-b border-zinc-800/60">
-        <div className="min-w-[14rem] flex-1">
-          <label className="text-xs text-zinc-500 block mb-1">Instrument</label>
-          <select
-            value={dataFile}
-            onChange={(e) => setDataFile(e.target.value)}
-            className={`${inputClass} w-full max-w-xl`}
-            disabled={instruments.length === 0}
-            title="Build features i běh modulu používají tento data_file. Pro shodu s backtestem zvol stejný soubor jako v Basic."
-          >
-            {instruments.map((i) => (
-              <option key={i.file} value={i.file}>
-                {i.instrument} — {i.displayName} ({i.timeframe})
-              </option>
-            ))}
-          </select>
-          {instruments.length === 0 ? (
-            <p className="text-xs text-amber-400/90 mt-1 max-w-xl">
-              Katalog je prázdný — zkontrolujte backend a složku <code className="text-zinc-400">data/</code>.
-            </p>
-          ) : null}
-        </div>
-        <div>
-          <label
-            className="text-xs text-zinc-500 block mb-1"
-            title="Agregace OHLC na serveru. Pořadí od hrubších svíček k původnímu rozlišení souboru."
-          >
-            Timeframe svíček
-          </label>
-          <select
-            value={chartTimeframe}
-            onChange={(e) => setChartTimeframe(e.target.value)}
-            className={inputClass}
-          >
-            {chartTfOptions.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label
-            className="text-xs text-zinc-500 block mb-1"
-            title="Max = celá řada v souboru. Kratší = poslední roky/měsíce (server); u krátkého demo souboru může následovat ještě klientský ořez okna."
-          >
-            Období zobrazení
-          </label>
-          <select
-            value={years}
-            onChange={(e) => setYears(parseFloat(e.target.value))}
-            className={inputClass}
-          >
-            {VIEW_DISPLAY_PERIODS.map((tf) => (
-              <option key={tf.label} value={tf.years}>
-                {tf.label}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="min-w-[12rem]">
-          <label className="text-xs text-zinc-500 block mb-1">Modul / indikátor / strategie</label>
-          <select
-            value={selectedItemId ? `${selectedItemType}:${selectedItemId}` : ""}
-            onChange={(e) => {
-              const v = e.target.value;
-              if (!v) {
-                setSelectedItemId(null);
-                return;
-              }
-              const [type, id] = v.split(":");
-              setSelectedItemType(type as ViewItemType);
-              setSelectedItemId(id);
-            }}
-            className={`${inputClass} w-full max-w-sm`}
-          >
-            <option value="">— Žádný —</option>
-            {strategies.map((s) => (
-              <option key={`strategy:${s.id}`} value={`strategy:${s.id}`}>
-                📋 {s.name}
-              </option>
-            ))}
-            {modules.map((m) => (
-              <option key={`module:${m.id}`} value={`module:${m.id}`}>
-                📦 {m.name}
-              </option>
-            ))}
-            {indicators.map((i) => (
-              <option key={`indicator:${i.id}`} value={`indicator:${i.id}`}>
-                📊 {i.name}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="flex items-center gap-1 pb-0.5">
-          <label
-            className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer select-none max-w-[13rem] leading-snug"
-            title="Při zvoleném modulu S/D zón z cache jen zóny (bez swingů/BOS/trend z H/L). Badge Fresh u datasetu může platit z dřívějšího H/L buildu."
-          >
-            <input
-              type="checkbox"
-              className="rounded border-zinc-600 shrink-0"
-              checked={useArtifactLayer}
-              onChange={(e) => setUseArtifactLayer(e.target.checked)}
-            />
-            H/L + S/D z&nbsp;cache
-          </label>
-          <FieldHelpPopover help={backtestFieldHelp.artifactViewHlSdCache} />
-        </div>
-        <div className="flex items-end gap-2 flex-wrap">
-          <button
-            onClick={fetchData}
-            disabled={loading || !dataFile}
-            className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
-          >
-            {loading ? "Načítám..." : "Obnovit"}
-          </button>
-          <button
-            onClick={handleShuffle}
-            disabled={loading || years <= 0}
-            title={
-              years <= 0
-                ? "Shuffle je vypnutý při období Max — zvolte kratší okno."
-                : needsDemoStyleClientSlice
-                  ? "Náhodný výřez stejné šířky jako období uvnitř načtené řady (demo: celý soubor na serveru, pak výřez)."
-                  : "Širší načtení, výpočet modulu na delší historii, pak náhodné okno šířky zvoleného období (~15 pokusů s obsahem)."
-            }
-            className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm disabled:opacity-50"
-          >
-            Shuffle
-          </button>
-          <button
-            onClick={() => setVisibilityPanelOpen(true)}
-            title="Viditelnost prvků"
-            className="p-2 rounded text-zinc-300 disabled:opacity-50 bg-zinc-700 hover:bg-zinc-600"
-          >
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="18"
-              height="18"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-              <circle cx="12" cy="12" r="3" />
-            </svg>
-          </button>
-          {selectedItemId && (
-            <button
-              onClick={() => setParamsDrawerOpen(true)}
-              title="View params"
-              className={`p-2 rounded text-zinc-300 disabled:opacity-50 ${
-                Object.keys(viewParamsSchema).length > 0
-                  ? "bg-zinc-700 hover:bg-zinc-600"
-                  : "bg-zinc-800 hover:bg-zinc-700"
-              }`}
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                width="18"
-                height="18"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
+      <div className="flex flex-col gap-4 pb-4 shrink-0 border-b border-zinc-800/60">
+        {/* —— Data: instrument + co se vykresluje —— */}
+        <div className="rounded-xl border border-zinc-800/80 bg-gradient-to-b from-zinc-900/55 via-zinc-900/35 to-zinc-950/50 p-4 sm:p-4 shadow-md shadow-black/25">
+          <div className="flex flex-wrap items-center gap-2 mb-3">
+            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-emerald-400/95">
+              Data a skript
+            </span>
+            <span className="h-px flex-1 min-w-[2rem] bg-gradient-to-r from-zinc-700/50 to-transparent" />
+            <span className="text-[10px] text-zinc-600 hidden sm:inline">Build i modul používají zvolený soubor</span>
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 lg:gap-6">
+            <div className="min-w-0">
+              <label
+                className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-400 mb-1.5"
+                htmlFor="view-instrument-select"
               >
-                <line x1="4" y1="6" x2="20" y2="6" />
-                <line x1="4" y1="12" x2="20" y2="12" />
-                <line x1="4" y1="18" x2="20" y2="18" />
-                <circle cx="4" cy="6" r="1.5" fill="currentColor" />
-                <circle cx="4" cy="12" r="1.5" fill="currentColor" />
-                <circle cx="4" cy="18" r="1.5" fill="currentColor" />
-              </svg>
-            </button>
-          )}
-          <button
-            onClick={() => setValuesModalOpen(true)}
-            title="Zobrazit hodnoty z algoritmu"
-            className="px-4 py-1.5 rounded bg-zinc-700 hover:bg-zinc-600 text-sm text-zinc-300 disabled:opacity-50"
-          >
-            Values
-          </button>
+                Instrument
+              </label>
+              <select
+                id="view-instrument-select"
+                value={dataFile}
+                onChange={(e) => setDataFile(e.target.value)}
+                className={selectClass}
+                disabled={instruments.length === 0}
+                title="Build features i běh modulu používají tento data_file. Pro shodu s backtestem zvol stejný soubor jako v Basic."
+              >
+                {instruments.map((i) => (
+                  <option key={i.file} value={i.file}>
+                    {i.instrument} — {i.displayName} ({i.timeframe})
+                  </option>
+                ))}
+              </select>
+              {instruments.length === 0 ? (
+                <p className="text-xs text-amber-400/90 mt-2 max-w-xl leading-relaxed">
+                  Katalog je prázdný — zkontrolujte backend a složku <code className="text-zinc-400">data/</code>.
+                </p>
+              ) : null}
+            </div>
+            <div className="min-w-0">
+              <label
+                className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-400 mb-1.5"
+                htmlFor="view-item-select"
+              >
+                Modul / indikátor / strategie
+              </label>
+              <select
+                id="view-item-select"
+                value={selectedItemId ? `${selectedItemType}:${selectedItemId}` : ""}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) {
+                    setSelectedItemId(null);
+                    return;
+                  }
+                  const [type, id] = v.split(":");
+                  setSelectedItemType(type as ViewItemType);
+                  setSelectedItemId(id);
+                }}
+                className={selectClass}
+              >
+                <option value="">— Žádný —</option>
+                {strategies.map((s) => (
+                  <option key={`strategy:${s.id}`} value={`strategy:${s.id}`}>
+                    📋 {s.name}
+                  </option>
+                ))}
+                {modules.map((m) => (
+                  <option key={`module:${m.id}`} value={`module:${m.id}`}>
+                    📦 {m.name}
+                  </option>
+                ))}
+                {indicators.map((i) => (
+                  <option key={`indicator:${i.id}`} value={`indicator:${i.id}`}>
+                    📊 {i.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* —— Časové okno + vrstvy + akce —— */}
+        <div className="flex flex-col xl:flex-row gap-4 xl:items-stretch">
+          <div className="flex-1 min-w-0 rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-4 shadow-sm shadow-black/20">
+            <div className="flex flex-wrap items-center gap-2 mb-3">
+              <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500">
+                Časové okno a vrstvy
+              </span>
+              <span className="h-px flex-1 min-w-[2rem] bg-zinc-800/70" />
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="min-w-0">
+                <label
+                  className="block text-[11px] font-medium text-zinc-400 mb-1.5"
+                  title="Agregace OHLC na serveru. Pořadí od hrubších svíček k původnímu rozlišení souboru."
+                  htmlFor="view-chart-tf"
+                >
+                  Timeframe svíček
+                </label>
+                <select
+                  id="view-chart-tf"
+                  value={chartTimeframe}
+                  onChange={(e) => setChartTimeframe(e.target.value)}
+                  className={selectClass}
+                >
+                  {chartTfOptions.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="min-w-0">
+                <label
+                  className="block text-[11px] font-medium text-zinc-400 mb-1.5"
+                  title="Max = celá řada v souboru. Kratší = poslední roky/měsíce (server); u krátkého demo souboru může následovat ještě klientský ořez okna."
+                  htmlFor="view-display-period"
+                >
+                  Období zobrazení
+                </label>
+                <select
+                  id="view-display-period"
+                  value={years}
+                  onChange={(e) => setYears(parseFloat(e.target.value))}
+                  className={selectClass}
+                >
+                  {viewDisplayPeriodChoices.map((tf) => (
+                    <option key={tf.label} value={tf.years}>
+                      {tf.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="min-w-0 sm:col-span-2 xl:col-span-1">
+                <label
+                  className="flex items-center gap-1.5 text-[11px] font-medium text-zinc-400 mb-1.5"
+                  htmlFor="view-layers"
+                >
+                  Vrstvy
+                  <FieldHelpPopover help={backtestFieldHelp.artifactViewHlSdCache} />
+                </label>
+                <select
+                  id="view-layers"
+                  value={useArtifactLayer ? "artifacts" : "live"}
+                  onChange={(e) => setUseArtifactLayer(e.target.value === "artifacts")}
+                  className={selectClass}
+                  title="Živě = výstup z aktuálního kódu modulu nad načtenými daty. Artefakty = H/L a S/D z .backtest_artifacts (stejné zóny jako USE_SD_ARTIFACTS po buildu)."
+                >
+                  <option value="live">Živý výpočet modulu</option>
+                  <option value="artifacts">Předpočtené artefakty</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div className="shrink-0 xl:w-[min(100%,22rem)] rounded-xl border border-zinc-800/80 bg-zinc-950/30 p-4 shadow-sm shadow-black/20 flex flex-col justify-center">
+            <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-zinc-500 mb-3 xl:text-center">
+              Akce nad grafem
+            </div>
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={fetchData}
+                  disabled={loading || !dataFile}
+                  className="flex-1 min-w-[7.5rem] inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium bg-emerald-600/90 text-white border border-emerald-500/50 shadow-sm shadow-emerald-950/30 hover:bg-emerald-500 disabled:opacity-45 disabled:cursor-not-allowed disabled:shadow-none transition-colors"
+                >
+                  {loading ? (
+                    <>
+                      <span className="inline-block size-4 border-2 border-white/30 border-t-white rounded-full animate-spin shrink-0" />
+                      Načítám…
+                    </>
+                  ) : (
+                    <>
+                      <svg className="size-4 opacity-90 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                        <path d="M21 12a9 9 0 11-9-9c2.5 0 4.8 1 6.4 2.6" strokeLinecap="round" />
+                        <path d="M21 3v6h-6" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      Obnovit
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleShuffle}
+                  disabled={loading || years <= 0}
+                  title={
+                    years <= 0
+                      ? "Shuffle je vypnutý při období Max — zvolte kratší okno."
+                      : needsDemoStyleClientSlice
+                        ? "Náhodný výřez stejné šířky jako období uvnitř načtené řady (demo: celý soubor na serveru, pak výřez)."
+                        : "Širší načtení, výpočet modulu na delší historii, pak náhodné okno šířky zvoleného období (~15 pokusů s obsahem)."
+                  }
+                  className="flex-1 min-w-[7.5rem] inline-flex items-center justify-center px-4 py-2.5 rounded-lg text-sm font-medium bg-zinc-800/90 text-zinc-200 border border-zinc-600/60 hover:bg-zinc-700/90 hover:border-zinc-500/60 disabled:opacity-45 disabled:cursor-not-allowed transition-colors"
+                >
+                  Shuffle
+                </button>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 justify-center xl:justify-stretch">
+                <div className="inline-flex rounded-lg border border-zinc-700/70 overflow-hidden shadow-sm">
+                  <button
+                    type="button"
+                    onClick={() => setVisibilityPanelOpen(true)}
+                    title="Viditelnost prvků"
+                    className="p-2.5 text-zinc-300 bg-zinc-800/80 hover:bg-zinc-700 transition-colors border-r border-zinc-700/70"
+                  >
+                    <svg
+                      xmlns="http://www.w3.org/2000/svg"
+                      width="18"
+                      height="18"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      aria-hidden
+                    >
+                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                      <circle cx="12" cy="12" r="3" />
+                    </svg>
+                  </button>
+                  {selectedItemId ? (
+                    <button
+                      type="button"
+                      onClick={() => setParamsDrawerOpen(true)}
+                      title="Parametry zobrazení (VIEW_PARAMS)"
+                      className={`p-2.5 text-zinc-300 transition-colors border-r border-zinc-700/70 last:border-r-0 ${
+                        Object.keys(viewParamsSchema).length > 0
+                          ? "bg-zinc-800/80 hover:bg-zinc-700"
+                          : "bg-zinc-900/80 hover:bg-zinc-800"
+                      }`}
+                    >
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        aria-hidden
+                      >
+                        <line x1="4" y1="6" x2="20" y2="6" />
+                        <line x1="4" y1="12" x2="20" y2="12" />
+                        <line x1="4" y1="18" x2="20" y2="18" />
+                        <circle cx="4" cy="6" r="1.5" fill="currentColor" />
+                        <circle cx="4" cy="12" r="1.5" fill="currentColor" />
+                        <circle cx="4" cy="18" r="1.5" fill="currentColor" />
+                      </svg>
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    onClick={() => setValuesModalOpen(true)}
+                    title="Zobrazit hodnoty z algoritmu"
+                    className="px-3 py-2 text-xs font-medium text-zinc-300 bg-zinc-800/80 hover:bg-zinc-700 transition-colors disabled:opacity-50"
+                  >
+                    Values
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
       </div>
 
-      <div className="flex flex-col gap-2 py-2 px-2 shrink-0 rounded-md border border-zinc-800/60 bg-zinc-900/35 mb-2">
-        <p className="text-xs text-zinc-400 leading-relaxed border-l-2 border-violet-600/45 pl-2">
-          <span className="text-zinc-300 font-medium">Zdroj vrstev: </span>
-          {viewDataSourceHint}
-          {useArtifactLayer && artifactBanner ? (
-            <span className="text-amber-200/85"> — {artifactBanner}</span>
-          ) : null}
-        </p>
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs text-zinc-500 shrink-0 inline-flex items-center gap-1">
-            Artefakty (dataset)
-            <FieldHelpPopover help={backtestFieldHelp.artifactViewDatasetStatus} />
-          </span>
-          <span
-            className={`text-xs px-2 py-0.5 rounded border shrink-0 ${artifactOverallBadgeClass(
-              artifactDatasetBadge.pseudoOverall ?? artifactStatus?.overall
-            )}`}
-            title={artifactDatasetBadge.title}
-          >
-            {artifactStatusLoading
-              ? "Načítám stav…"
-              : artifactBuilding
-                ? "Building…"
-                : artifactDatasetBadge.label ?? artifactStatus?.overall_label ?? artifactStatus?.overall ?? "—"}
-          </span>
-          {artifactStatus?.dataset_id ? (
-            <code
-              className="text-[10px] text-zinc-500 font-mono truncate max-w-[12rem]"
-              title={artifactStatus.dataset_id}
+      <p className="shrink-0 text-[11px] text-zinc-500 leading-snug rounded-lg border border-zinc-800/60 bg-zinc-950/40 px-3 py-2 mt-1">
+        <span className="text-zinc-400 font-medium">Zdroj: </span>
+        {viewDataSourceHint}
+        {useArtifactLayer && artifactBanner ? (
+          <span className="text-amber-200/85"> — {artifactBanner}</span>
+        ) : null}
+      </p>
+
+      {useArtifactLayer ? (
+        <div className="flex flex-col gap-2 py-2 px-3 shrink-0 rounded-lg border border-violet-900/40 bg-violet-950/10 mb-2">
+          <div className="text-[10px] uppercase tracking-wider text-violet-400/90 font-medium">
+            Artefakty — build a předpočet
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-zinc-500 shrink-0 inline-flex items-center gap-1">
+              Dataset
+              <FieldHelpPopover help={backtestFieldHelp.artifactViewDatasetStatus} />
+            </span>
+            <span
+              className={`text-xs px-2 py-0.5 rounded border shrink-0 ${artifactOverallBadgeClass(
+                artifactDatasetBadge.pseudoOverall ?? artifactStatus?.overall
+              )}`}
+              title={artifactDatasetBadge.title}
             >
-              {artifactStatus.dataset_id.slice(0, 14)}…
-            </code>
-          ) : null}
-          <span className="inline-flex items-center gap-1 shrink-0">
+              {artifactStatusLoading
+                ? "Načítám stav…"
+                : artifactBuilding
+                  ? "Building…"
+                  : artifactDatasetBadge.label ?? artifactStatus?.overall_label ?? artifactStatus?.overall ?? "—"}
+            </span>
+            {artifactStatus?.dataset_id ? (
+              <code
+                className="text-[10px] text-zinc-500 font-mono truncate max-w-[12rem]"
+                title={artifactStatus.dataset_id}
+              >
+                {artifactStatus.dataset_id.slice(0, 14)}…
+              </code>
+            ) : null}
+            <span className="inline-flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleBuildArtifacts()}
+                disabled={
+                  artifactBuilding ||
+                  artifactStatusLoading ||
+                  !dataFile ||
+                  (!artifactBuildIncludeHl && !artifactBuildIncludeSd)
+                }
+                title={artifactBuildButtonTitle}
+                className="px-3 py-1.5 rounded bg-violet-700 hover:bg-violet-600 text-xs font-medium disabled:opacity-50"
+              >
+                {artifactBuilding ? "Build…" : artifactBuildButtonLabel}
+              </button>
+              <FieldHelpPopover help={backtestFieldHelp.artifactViewBuildFeatures} />
+            </span>
             <button
               type="button"
-              onClick={() => void handleBuildArtifacts()}
-              disabled={
-                artifactBuilding ||
-                artifactStatusLoading ||
-                !dataFile ||
-                (!artifactBuildIncludeHl && !artifactBuildIncludeSd)
-              }
-              title={artifactBuildButtonTitle}
-              className="px-3 py-1.5 rounded bg-violet-700 hover:bg-violet-600 text-xs font-medium disabled:opacity-50"
+              onClick={() => void refreshArtifactStatus()}
+              disabled={artifactStatusLoading || artifactBuilding}
+              className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-400 disabled:opacity-50 shrink-0"
             >
-              {artifactBuilding ? "Build…" : artifactBuildButtonLabel}
+              Obnovit stav
             </button>
-            <FieldHelpPopover help={backtestFieldHelp.artifactViewBuildFeatures} />
-          </span>
-          <button
-            type="button"
-            onClick={() => void refreshArtifactStatus()}
-            disabled={artifactStatusLoading || artifactBuilding}
-            className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-[11px] text-zinc-400 disabled:opacity-50 shrink-0"
-          >
-            Obnovit stav
-          </button>
-          {artifactBuildError ? (
-            <span className="text-xs text-rose-400 shrink-0 max-w-md truncate" title={artifactBuildError}>
-              {artifactBuildError}
-            </span>
-          ) : null}
-        </div>
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pl-0.5 border-t border-zinc-800/50 pt-2 mt-0.5">
-          <span className="text-[10px] text-zinc-500 shrink-0">Kroky buildu (multiselect):</span>
-          <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
-              checked={artifactBuildIncludeHl}
-              disabled={artifactBuilding || artifactStatusLoading}
-              onChange={(e) => {
-                const v = e.target.checked;
-                if (!v && !artifactBuildIncludeSd) return;
-                setArtifactBuildIncludeHl(v);
-              }}
-            />
-            H/L
-          </label>
-          <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
-              checked={artifactBuildIncludeSd}
-              disabled={artifactBuilding || artifactStatusLoading}
-              onChange={(e) => {
-                const v = e.target.checked;
-                if (!v && !artifactBuildIncludeHl) return;
-                setArtifactBuildIncludeSd(v);
-              }}
-            />
-            S/D zóny
-          </label>
-        </div>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 border-t border-zinc-800/40 pt-2 mt-0.5">
-          <span className="text-[10px] text-zinc-500 shrink-0">
-            TF precomputu
-            {!artifactBuildIncludeHl && artifactBuildIncludeSd
-              ? " (S/D)"
-              : artifactBuildIncludeHl && !artifactBuildIncludeSd
-                ? " (H/L)"
-                : " (H/L + S/D)"}
-            :
-          </span>
-          <button
-            type="button"
-            className="text-[10px] text-violet-400 hover:text-violet-300 disabled:opacity-50"
-            onClick={selectAllArtifactBuildTfs}
-            disabled={artifactBuilding || artifactStatusLoading}
-          >
-            Vše
-          </button>
-          {ARTIFACT_PRECOMPUTE_TF_OPTIONS.map((tf) => (
-            <label
-              key={tf}
-              className="inline-flex items-center gap-1 text-[10px] text-zinc-400 cursor-pointer select-none"
-            >
+            {artifactBuildError ? (
+              <span className="text-xs text-rose-400 shrink-0 max-w-md truncate" title={artifactBuildError}>
+                {artifactBuildError}
+              </span>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 pl-0.5 border-t border-zinc-800/50 pt-2">
+            <span className="text-[10px] text-zinc-500 shrink-0">Kroky buildu:</span>
+            <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
               <input
                 type="checkbox"
-                className="rounded border-zinc-600 bg-zinc-900"
-                checked={artifactBuildTimeframes.includes(tf)}
-                onChange={() => toggleArtifactBuildTf(tf)}
+                className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
+                checked={artifactBuildIncludeHl}
                 disabled={artifactBuilding || artifactStatusLoading}
+                onChange={(e) => {
+                  const v = e.target.checked;
+                  if (!v && !artifactBuildIncludeSd) return;
+                  setArtifactBuildIncludeHl(v);
+                }}
               />
-              {tf}
+              H/L
             </label>
-          ))}
+            <label className="inline-flex items-center gap-1.5 text-[10px] text-zinc-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="rounded border-zinc-600 bg-zinc-800 text-violet-600 focus:ring-violet-500"
+                checked={artifactBuildIncludeSd}
+                disabled={artifactBuilding || artifactStatusLoading}
+                onChange={(e) => {
+                  const v = e.target.checked;
+                  if (!v && !artifactBuildIncludeHl) return;
+                  setArtifactBuildIncludeSd(v);
+                }}
+              />
+              S/D zóny
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pl-0.5 border-t border-zinc-800/40 pt-2">
+            <span className="text-[10px] text-zinc-500 shrink-0">
+              TF precomputu
+              {!artifactBuildIncludeHl && artifactBuildIncludeSd
+                ? " (S/D)"
+                : artifactBuildIncludeHl && !artifactBuildIncludeSd
+                  ? " (H/L)"
+                  : " (H/L + S/D)"}
+              :
+            </span>
+            <button
+              type="button"
+              className="text-[10px] text-violet-400 hover:text-violet-300 disabled:opacity-50"
+              onClick={selectAllArtifactBuildTfs}
+              disabled={artifactBuilding || artifactStatusLoading}
+            >
+              Vše
+            </button>
+            {ARTIFACT_PRECOMPUTE_TF_OPTIONS.map((tf) => (
+              <label
+                key={tf}
+                className="inline-flex items-center gap-1 text-[10px] text-zinc-400 cursor-pointer select-none"
+              >
+                <input
+                  type="checkbox"
+                  className="rounded border-zinc-600 bg-zinc-900"
+                  checked={artifactBuildTimeframes.includes(tf)}
+                  onChange={() => toggleArtifactBuildTf(tf)}
+                  disabled={artifactBuilding || artifactStatusLoading}
+                />
+                {tf}
+              </label>
+            ))}
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {artifactBuilding ? (
         <div className="fixed inset-0 bg-black/55 backdrop-blur-[2px] flex items-center justify-center z-[60] p-4">
@@ -1998,6 +2139,16 @@ export function StrategyViewChart({
                   hasData: zones.some((z) => z.name === "Demand" || z.name === "Supply"),
                 },
                 {
+                  key: "zone_touches" as const,
+                  label: "Touch zóny (markery)",
+                  hasData: zones.some(
+                    (z) =>
+                      typeof z.touch_bar_index === "number" &&
+                      typeof z.touch_marker_price === "number" &&
+                      Number.isFinite(z.touch_marker_price),
+                  ),
+                },
+                {
                   key: "support_resistance_zones" as const,
                   label: "Support / Resistance zóny",
                   hasData: zones.some((z) => z.name === "Support" || z.name === "Resistance"),
@@ -2051,133 +2202,58 @@ export function StrategyViewChart({
         </>
       )}
 
-      {paramsDrawerOpen && selectedItemId && (
-        <>
-          <div
-            className="fixed inset-0 bg-black/50 z-40"
-            onClick={() => setParamsDrawerOpen(false)}
-            aria-hidden
-          />
-          <div className="fixed top-0 right-0 h-full w-80 max-w-[90vw] bg-zinc-900 border-l border-zinc-700 shadow-xl z-50 flex flex-col">
-            <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-700 shrink-0">
-              <h3 className="text-sm font-medium text-zinc-200">View params</h3>
+      <StrategyConfigModal
+        open={paramsDrawerOpen && !!selectedItemId}
+        onClose={() => setParamsDrawerOpen(false)}
+        title="Parametry zobrazení"
+        subtitle={
+          selectedItemLabel
+            ? `${selectedItemLabel} — hodnoty ovlivňují jen vizualizaci (View), dokud nepoužiješ Použít a načíst.`
+            : "Hodnoty ovlivňují vizualizaci ve View."
+        }
+        footer={
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setParamsDrawerOpen(false)}
+              className="flex-1 py-2.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-sm font-medium text-zinc-200"
+            >
+              Zavřít
+            </button>
+            {Object.keys(viewParamsSchema).length > 0 ? (
               <button
-                onClick={() => setParamsDrawerOpen(false)}
-                className="p-1.5 rounded hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200"
-                aria-label="Zavřít"
+                type="button"
+                onClick={() => {
+                  fetchData();
+                  setParamsDrawerOpen(false);
+                }}
+                disabled={loading}
+                className="flex-1 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-sm font-medium disabled:opacity-50 text-white"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="18" y1="6" x2="6" y2="18" />
-                  <line x1="6" y1="6" x2="18" y2="18" />
-                </svg>
+                {loading ? "Načítám..." : "Použít a načíst"}
               </button>
-            </div>
-            <div className="flex-1 overflow-auto p-4 space-y-4">
-              {Object.keys(viewParamsSchema).length === 0 ? (
-                <p className="text-sm text-zinc-500">
-                  Tento modul/indikátor nemá VIEW_PARAMS. Přidej do kódu např.:
-                  <code className="block mt-2 p-2 rounded bg-zinc-800 text-xs text-zinc-400">
-                    VIEW_PARAMS = &#123;&quot;period&quot;: 20, &quot;color&quot;: &quot;#3b82f6&quot;&#125;
-                  </code>
-                </p>
-              ) : (
-              Object.entries(viewParamsValues).map(([key, value]) => {
-                const meta = viewParamsMeta[key];
-                const label = meta?.title?.trim() || key;
-                return (
-                <div key={key} className="border-b border-zinc-800/80 pb-4 last:border-0 last:pb-0">
-                  <label className="text-sm font-medium text-zinc-200 block mb-0.5">{label}</label>
-                  {meta?.title?.trim() ? (
-                    <span className="text-[10px] text-zinc-600 font-mono block mb-1">{key}</span>
-                  ) : null}
-                  {meta?.whatItMeans && (
-                    <p className="text-xs text-zinc-500 mb-2 leading-relaxed">{meta.whatItMeans}</p>
-                  )}
-                  {meta?.howToUse && meta.howToUse.length > 0 && (
-                    <ul className="text-xs text-zinc-500 mb-2 list-disc pl-4 space-y-0.5">
-                      {meta.howToUse.map((line, i) => (
-                        <li key={i}>{line}</li>
-                      ))}
-                    </ul>
-                  )}
-                  {meta?.booleanWidget && typeof value === "number" && (value === 0 || value === 1) ? (
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={value === 1}
-                        onChange={(e) =>
-                          setViewParamsValues((prev) => ({
-                            ...prev,
-                            [key]: e.target.checked ? 1 : 0,
-                          }))
-                        }
-                        className="rounded"
-                      />
-                      <span className="text-sm text-zinc-300">{value === 1 ? "Zapnuto" : "Vypnuto"}</span>
-                    </label>
-                  ) : typeof value === "number" ? (
-                    <input
-                      type="number"
-                      value={value}
-                      onChange={(e) => {
-                        const v = parseFloat(e.target.value);
-                        if (!Number.isNaN(v)) {
-                          setViewParamsValues((prev) => ({ ...prev, [key]: v }));
-                        }
-                      }}
-                      step={Number.isInteger(value) ? 1 : 0.01}
-                      className={inputClass}
-                    />
-                  ) : typeof value === "boolean" ? (
-                    <label className="flex items-center gap-2 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={value}
-                        onChange={(e) =>
-                          setViewParamsValues((prev) => ({ ...prev, [key]: e.target.checked }))
-                        }
-                        className="rounded"
-                      />
-                      <span className="text-sm text-zinc-300">{value ? "Ano" : "Ne"}</span>
-                    </label>
-                  ) : (
-                    <input
-                      type="text"
-                      value={String(value)}
-                      onChange={(e) =>
-                        setViewParamsValues((prev) => ({ ...prev, [key]: e.target.value }))
-                      }
-                      className={inputClass}
-                    />
-                  )}
-                </div>
-              );
-              })
-              )}
-            </div>
-            {Object.keys(viewParamsSchema).length > 0 && (
-              <div className="p-4 border-t border-zinc-700 shrink-0">
-                <button
-                  onClick={() => {
-                    fetchData();
-                    setParamsDrawerOpen(false);
-                  }}
-                  disabled={loading}
-                  className="w-full px-4 py-2 rounded bg-emerald-600 hover:bg-emerald-500 text-sm font-medium disabled:opacity-50"
-                >
-                  {loading ? "Načítám..." : "Použít"}
-                </button>
-              </div>
-            )}
+            ) : null}
           </div>
-        </>
-      )}
-
-      {artifactBanner && (
-        <div className="mb-3 px-3 py-2 rounded border border-amber-500/35 bg-amber-950/50 text-amber-100/90 text-sm shrink-0">
-          {artifactBanner}
-        </div>
-      )}
+        }
+      >
+        {Object.keys(viewParamsSchema).length === 0 ? (
+          <div className="text-sm text-zinc-400 space-y-2">
+            <p>Tento modul/indikátor nemá VIEW_PARAMS. Přidej do kódu např.:</p>
+            <code className="block mt-2 p-3 rounded-lg bg-zinc-800 text-xs text-zinc-400 border border-zinc-700/80">
+              VIEW_PARAMS = {`{`}&quot;period&quot;: 20, &quot;color&quot;: &quot;#3b82f6&quot;{`}`}
+            </code>
+          </div>
+        ) : (
+          <StrategyParamsFieldList
+            entries={Object.entries(viewParamsValues)}
+            current={viewParamsValues}
+            onPatch={(next) => setViewParamsValues(next)}
+            metaMap={viewParamsMeta}
+            getHelp={getViewParamHelp}
+            inputClass={`${inputClass} w-full`}
+          />
+        )}
+      </StrategyConfigModal>
 
       {error && (
         <div className="mb-3 px-3 py-2 rounded bg-rose-500/20 text-rose-400 text-sm">

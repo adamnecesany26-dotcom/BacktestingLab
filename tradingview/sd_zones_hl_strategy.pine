@@ -1,0 +1,1490 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtesting_app — S/D Zones backtest v3.0 (structural rewrite)
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Cíl strategie (v3 — kompletní strukturální přepis):
+//  • Swing engine se state machine (PROVISIONAL → CONFIRMED → BROKEN).
+//      ATR-normalizovaný min leg filter místo bar-gap. Eliminuje šum i miss.
+//  • Strukturální trend (HH/HL vs LL/LH) jako TVRDÝ gate. RANGE = NO TRADE.
+//      HTF EMA filter zůstává jako sekundární (volitelný).
+//  • BOS validator s 5 podmínkami: close beyond + displacement (×ATR) + candle
+//      range + close-to-extreme + follow-through. Slabé driftové BOS jsou OUT.
+//  • Origin S/D zóna z impulse leg (poslední opačná svíčka, expand do base
+//      clusteru).
+//  • Entry: limit @ hraně zóny (institucionální retest).
+//  • SL: za druhou hranou + max(ATR buffer, % výšky zóny).
+//  • TP: multi-tier — (1) forward unswept swing, (2) measured move,
+//      (3) RRR floor. Pokud žádný TP nepřesahuje minRRR ⇒ NO TRADE
+//      (zóna je vykreslena, order není umístěn).
+//  • RRR PRE-trade gate (default 2.5). Trade se neprovede pokud RRR < threshold.
+//  • Lifecycle: clean state transitions, žádné nested if-not-handled.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("S/D Backtest Pro v3", shorttitle="S/D BT v3", overlay=true, format=format.price,
+     max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000,
+     pyramiding=100, process_orders_on_close=false,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     margin_long=100, margin_short=100,
+     commission_type=strategy.commission.percent, commission_value=0.0, slippage=0)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 1) USER INPUTS
+// ════════════════════════════════════════════════════════════════════════════
+gSw = "1) Swing Engine"
+gTr = "2) Trend Filter"
+gBo = "3) BOS Validator"
+gZn = "4) Zone Builder"
+gRk = "5) Risk & Entry"
+gLc = "6) Lifecycle"
+gVi = "7) Visuals"
+
+// === 1) Swing Engine ===
+int   uPivotWindow    = input.int(5, "Pivot window (L=R, bars)", minval=2, maxval=20, group=gSw,
+     tooltip="Šířka pivot okna nalevo i napravo. 3-5 = citlivé, 5-8 = vyvážené, 8+ = jen velké swingy.")
+float uMinLegAtr      = input.float(0.8, "Min. velikost legu (×ATR)", minval=0.0, maxval=5.0, step=0.1, group=gSw,
+     tooltip="Minimální vzdálenost mezi po sobě jdoucími swingy v násobcích ATR. 0.5 = citlivé, 1.0 = standard, 2.0 = jen velké pohyby. ATR-normalizace = stejné chování napříč TF.")
+float uMinLegPct      = input.float(0.0, "Min. velikost legu (% ceny, alt)", minval=0.0, maxval=10.0, step=0.05, group=gSw,
+     tooltip="Alternativní min. velikost jako % aktuální ceny. 0 = vypnuto. Použij pro symboly s nestabilním ATR (nový asset).")
+int   uConfirmTimeout = input.int(120, "Confirm timeout (bars)", minval=20, maxval=1000, group=gSw,
+     tooltip="Pokud provisional swing nedostane confirmation (= opačný swing) do N barů, expirován. Brání hromadění stale state.")
+bool  uLocalSweep     = input.bool(true, "Local extremum sweep", group=gSw,
+     tooltip="Po pivot detekci prohledá okno ±N barů a posune pivot na skutečný lokální extrém. Vylepšuje přesnost major swingů.")
+int   uLocalSweepRad  = input.int(15, "Local sweep radius (bars)", minval=3, maxval=50, group=gSw)
+
+// === 2) Trend Filter ===
+bool   uRequireStructTrend = input.bool(true, "Strukturální trend gate (HH/HL nebo LL/LH)", group=gTr,
+     tooltip="TVRDÝ filter: orders pouze pokud poslední 4 confirmed swingy tvoří uptrend (demand) nebo downtrend (supply). RANGE = NO TRADE. Zóny se stále kreslí pro analýzu.")
+bool   uHtfTrendCheck     = input.bool(true, "HTF EMA trend (sekundární gate)", group=gTr,
+     tooltip="Přidá HTF (např. 1D) EMA200 filter. Demand pouze v 1D-uptrendu, supply v downtrendu. Konzervativní.")
+string uHtfTimeframe      = input.timeframe("1D", "HTF timeframe", group=gTr)
+int    uHtfEmaPeriod      = input.int(200, "HTF EMA period", minval=20, maxval=500, group=gTr)
+
+// === 3) BOS Validator ===
+int   uBosFollowBars       = input.int(2, "Follow-through (close-bars)", minval=1, maxval=5, group=gBo,
+     tooltip="Počet po sobě jdoucích close za hranou potřebných k potvrzení BOS. 1 = okamžitý, 2-3 = standard, 4+ = velmi konzervativní.")
+float uMinDisplacementAtr  = input.float(0.5, "Min. displacement (×ATR)", minval=0.0, maxval=3.0, step=0.05, group=gBo,
+     tooltip="Vzdálenost close baru od broken levelu. Pod-displacement BOS = drift, ne impulse.")
+float uMinCandleAtr        = input.float(0.7, "Min. range svíčky (×ATR)", minval=0.0, maxval=3.0, step=0.05, group=gBo,
+     tooltip="Range BOS svíčky. Doji / inside-bar BOS jsou OUT.")
+float uCloseQualityMin     = input.float(0.6, "Close quality (0-1, blízko k extrému)", minval=0.0, maxval=1.0, step=0.05, group=gBo,
+     tooltip="Long BOS: (close-low)/range. Short BOS: (high-close)/range. 0.6 = close v top/bottom 40 % candle.")
+bool  uRequireImbalance    = input.bool(false, "Vyžadovat 3-bar imbalance (FVG)", group=gBo,
+     tooltip="Long: low[i] > high[i-2]. Short: high[i] < low[i-2]. Striktní podmínka. Pokud false, FVG je jen score boost.")
+int   uBosLookbackBars     = input.int(200, "BOS lookback (bary)", minval=20, maxval=2000, group=gBo,
+     tooltip="Maximální stáří swingu, který může být BOS kandidátem.")
+
+// === 4) Zone Builder ===
+string uZoneSide       = input.string("Obě", "Generovat zóny", options=["Obě", "Demand", "Supply"], group=gZn)
+float  uMinHeightAtr   = input.float(0.20, "Min. výška zóny (×ATR)", minval=0.0, maxval=2.0, step=0.05, group=gZn)
+float  uMaxHeightAtr   = input.float(1.50, "Max. výška zóny (×ATR, clamping)", minval=0.3, maxval=5.0, step=0.05, group=gZn,
+     tooltip="Větší zóny se ořežou. Demand zachovává LOW, supply zachovává HIGH.")
+float  uMinImpulseAtr  = input.float(1.50, "Min. BOS impuls (×ATR)", minval=0.3, maxval=10.0, step=0.1, group=gZn)
+int    uMinBaseLen     = input.int(1, "Min. délka base (bary)", minval=1, maxval=10, group=gZn)
+int    uMaxBaseLen     = input.int(8, "Max. délka base (bary)", minval=2, maxval=40, group=gZn)
+float  uQualityThr     = input.float(0.50, "Min. kvalita zóny (0-1)", minval=0.0, maxval=1.0, step=0.05, group=gZn,
+     tooltip="Score = vážený mix impulsu, base tightness, freshness, imbalance, HTF alignment. Pod prahem = zóna se nevytvoří.")
+
+// === 5) Risk & Entry ===
+bool  uTradeLong        = input.bool(true,  "Long (demand)", group=gRk)
+bool  uTradeShort       = input.bool(true,  "Short (supply)", group=gRk)
+float uMinRRR           = input.float(2.5, "Minimální RRR (HARD GATE)", minval=1.0, maxval=20.0, step=0.1, group=gRk,
+     tooltip="Pokud computed RRR < threshold ⇒ trade se NEPROVEDE. Zóna se vykreslí (informational). Default 2.5.")
+float uSlBufferAtr      = input.float(0.20, "SL buffer (×ATR)", minval=0.0, maxval=2.0, step=0.05, group=gRk,
+     tooltip="ATR buffer za vnější hranou zóny.")
+float uSlBufferZonePct  = input.float(0.15, "SL buffer (% výšky zóny)", minval=0.0, maxval=1.0, step=0.05, group=gRk,
+     tooltip="Alternativní % výšky zóny. Použije se MAX(ATR buffer, %-buffer) — vždy konzervativní.")
+bool  uTpUseStructure   = input.bool(true, "TP: forward unswept swing", group=gRk,
+     tooltip="Tier 1: hledej nejbližší swing high/low ve směru tradu, který nebyl proražen.")
+bool  uTpUseMeasured    = input.bool(true, "TP: measured move (impulse leg projekce)", group=gRk,
+     tooltip="Tier 2: TP = entry + (BOS_ref − origin_extreme). 1:1 projekce impulse legu.")
+bool  uTpRrrFloor       = input.bool(true, "TP: RRR floor (entry ± minRRR×risk)", group=gRk,
+     tooltip="Tier 3: hard floor TP = entry ± minRRR × risk. Pokud žádný tier nepřekročí floor ⇒ NO TRADE.")
+float uQty              = input.float(1.0, "Množství na obchod", minval=0.0, maxval=1e7, step=0.1, group=gRk)
+
+// === 6) Lifecycle ===
+int   uMaxAlive         = input.int(10, "Max. živých zón", minval=1, maxval=20, group=gLc)
+int   uMaxLifeBars      = input.int(300, "Max. životnost zóny (bary)", minval=20, maxval=2000, group=gLc)
+int   uMaxConcurrent    = input.int(50, "Max. souběžných obchodů", minval=1, maxval=50, group=gLc)
+bool  uReplaceOldest    = input.bool(false, "Rotace: zavřít nejstarší při full slot", group=gLc)
+bool  uExitOnZoneInv    = input.bool(true, "Exit on zone invalidation (close mimo)", group=gLc)
+bool  uExitOnStructBreak= input.bool(false, "Exit on opposite BOS (trend change)", group=gLc,
+     tooltip="Pokud po vstupu nastane BOS opačného směru ⇒ zavři pozici. Konzervativní.")
+float uNtPadAtr         = input.float(0.18, "Near-touch pad (×ATR)", minval=0.0, maxval=1.0, step=0.02, group=gLc)
+float uNtStrongAtr      = input.float(0.45, "Near-touch strong departure (×ATR)", minval=0.1, maxval=3.0, step=0.05, group=gLc)
+int   uMaxHoldBars      = input.int(300, "Max. držení (bary, 0=off)", minval=0, maxval=200000, group=gLc)
+
+// === 7) Visuals ===
+color uColDemand    = input.color(color.new(#22c55e, 78), "Demand fill (alive)", group=gVi)
+color uColSupply    = input.color(color.new(#ef4444, 78), "Supply fill (alive)", group=gVi)
+color uColPending   = input.color(color.new(#94a3b8, 86), "Pending fill", group=gVi)
+color uColInfoOnly  = input.color(color.new(#a855f7, 88), "Info-only fill (RRR fail)", group=gVi)
+color uColBorder    = input.color(color.new(#facc15, 35), "Hranice (border)", group=gVi)
+color uColBos       = input.color(color.new(#f59e0b, 0),  "BOS čára", group=gVi)
+bool  uShowPending  = input.bool(true,  "Pending zóny", group=gVi)
+bool  uShowDead     = input.bool(true,  "Historické (touched) zóny", group=gVi)
+bool  uShowInfo     = input.bool(true,  "Info-only zóny (RRR fail)", group=gVi)
+bool  uShowBos      = input.bool(true,  "BOS čáry", group=gVi)
+bool  uShowSwings   = input.bool(false, "Body swingů (PROV/CONF/BROKEN)", group=gVi)
+bool  uShowReady    = input.bool(false, "Značka READY (R)", group=gVi)
+bool  uShowTouch    = input.bool(true,  "Značka touch (T)", group=gVi)
+bool  uShowTfLabel  = input.bool(true,  "Diagnostická tabulka", group=gVi)
+bool  uShowEntries  = input.bool(true,  "Entry značky (Q/F)", group=gVi)
+bool  uShowSlTp     = input.bool(false, "SL/TP čáry pro pending", group=gVi)
+bool  uShowSkipDbg  = input.bool(false, "Diagnostika: značka X (skipped) + důvod", group=gVi)
+bool  uShowTrades   = input.bool(true,  "Vizualizace obchodů (PnL boxes)", group=gVi)
+float uTradeAlphaTp = input.float(80, "PnL box transparence — TP", minval=50, maxval=99, step=1, group=gVi)
+float uTradeAlphaSl = input.float(80, "PnL box transparence — SL", minval=50, maxval=99, step=1, group=gVi)
+color uTradeColTp   = input.color(#16a34a, "PnL box barva — TP", group=gVi)
+color uTradeColSl   = input.color(#dc2626, "PnL box barva — SL", group=gVi)
+color uTradeColEntry= input.color(#facc15, "Entry čára barva", group=gVi)
+bool  uShowPnLLabel = input.bool(true,  "Štítek na exitu (důvod + R)", group=gVi)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 2) CONSTANTS & TYPES
+// ════════════════════════════════════════════════════════════════════════════
+float ATR_FLOOR  = 0.0001
+int   ATR_PERIOD = 14
+
+// Swing state codes
+int SW_PROVISIONAL = 0
+int SW_CONFIRMED   = 1
+int SW_BROKEN      = 2
+
+// Trend codes
+int TR_RANGE      = 0
+int TR_UPTREND    = 1
+int TR_DOWNTREND  = -1
+
+// Zone end-reason codes (parita s indikátorem)
+int END_NONE      = 0
+int END_CLOSE_INV = 1
+int END_TOUCH     = 2
+int END_NEAR_KILL = 3
+int END_FAKE_BOS  = 4
+int END_MAX_LIFE  = 5
+int END_STRUCT    = 6
+
+// Zone status codes
+int STATUS_PENDING_READY = 0   // ještě nebyl departure → žádný order
+int STATUS_INFO_ONLY     = 1   // RRR fail → zóna bez orderu
+int STATUS_ORDER_PLACED  = 2   // limit umístěn, čeká na fill
+int STATUS_FILLED        = 3   // trade open
+int STATUS_CLOSED        = 4   // trade closed (TP/SL/zone-inv)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Swing UDT — state machine
+// ─────────────────────────────────────────────────────────────────────────────
+type Swing
+    int    bar       = -1
+    float  price     = na
+    int    typ       = 0       // +1 high, -1 low
+    int    state     = 0       // SW_PROVISIONAL/CONFIRMED/BROKEN
+    int    confAt    = -1      // bar where state → CONFIRMED
+    int    brokenAt  = -1      // bar where state → BROKEN
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zone UDT — vše v jedné struktuře (eliminuje parallel-array maintenance hell)
+// ─────────────────────────────────────────────────────────────────────────────
+type Zone
+    int    id         = 0
+    int    dir        = 0      // +1 demand, -1 supply
+    float  zL         = na
+    float  zH         = na
+    int    origBar    = -1
+    int    bosBar     = -1
+    float  bosRefPx   = na     // cena swingu, který BOS prorazil
+    int    born       = -1
+    int    endBar     = -1
+    bool   ready      = false
+    int    readyBar   = -1
+    bool   touched    = false
+    bool   alive      = true
+    int    endReason  = 0
+    bool   ntArm      = false
+    float  score      = na
+    int    baseLen    = 0
+    bool   hasImb     = false
+    int    status     = 0      // STATUS_*
+    // Trade plan (computed at zone creation, immutable):
+    float  entryPx    = na
+    float  slPx       = na
+    float  tpPx       = na
+    float  riskPx     = na
+    float  rrr        = na
+    string skipReason = ""
+    // Trade execution state:
+    int    tradeId    = -1     // -1 = no order; jinak unique id
+    bool   tradeFilled= false
+    bool   tradeClosed= false
+    int    entryBar   = -1
+    float  entryPxAct = na     // skutečný fill price (může != entryPx u gap fillu)
+    int    exitBar    = -1
+    float  exitPx     = na
+    string exitReas   = ""
+    // Render handles:
+    box    bx         = na
+    box    boxTp      = na
+    box    boxSl      = na
+    line   lineEntry  = na
+    label  labelExit  = na
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3) HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+f_safe_atr(float a) => na(a) or a <= ATR_FLOOR ? ATR_FLOOR : a
+f_clamp01(float x) => x < 0 ? 0.0 : x > 1 ? 1.0 : x
+
+f_time_at_bar(int absBar) =>
+    int rel = bar_index - absBar
+    (rel < 0 or rel > 10000) ? int(na) : time[rel]
+
+f_offset_at_bar(int absBar) =>
+    int rel = bar_index - absBar
+    (rel < 0 or rel > 5000) ? -1 : rel
+
+f_overlap_ratio(float bH, float bL, float zL, float zH) =>
+    float rng = bH - bL
+    rng <= 0 ? 0.0 : math.max(0.0, math.min(zH, bH) - math.max(zL, bL)) / rng
+
+f_v_overlap_ratio(float aLo, float aHi, float bLo, float bHi) =>
+    float oL = math.max(aLo, bLo)
+    float oH = math.min(aHi, bHi)
+    float o  = oH - oL
+    float h1 = aHi - aLo
+    float h2 = bHi - bLo
+    float sm = math.min(h1, h2)
+    o <= 0 or sm <= 0 ? 0.0 : o / sm
+
+atrVal = ta.atr(ATR_PERIOD)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 4) HTF DATA (sekundární trend filter)
+// ════════════════════════════════════════════════════════════════════════════
+[htfClose, htfEma] = request.security(syminfo.tickerid, uHtfTimeframe,
+     [close, ta.ema(close, uHtfEmaPeriod)], barmerge.gaps_off, barmerge.lookahead_off)
+bool htfReady     = not na(htfClose) and not na(htfEma)
+bool htfTrendUp   = htfReady and htfClose >  htfEma
+bool htfTrendDown = htfReady and htfClose <  htfEma
+
+// Y-scale anchors — drží auto-scale grafu (téměř neviditelné).
+plot(high, title="(Y hi)", color=color.new(color.silver, 99), linewidth=1, display=display.all, editable=false)
+plot(low,  title="(Y lo)", color=color.new(color.silver, 99), linewidth=1, display=display.all, editable=false)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 5) SWING ENGINE — state machine (PROVISIONAL → CONFIRMED → BROKEN)
+// ────────────────────────────────────────────────────────────────────────────
+//  Detekce probíhá ve 3 krocích na každém potvrzeném baru:
+//    A) Detekce raw pivot kandidáta přes ta.pivothigh/low(W,W).
+//    B) ATR/% min-leg filter vůči poslednímu opačnému swingu.
+//    C) Replace-on-stronger pro consecutive same-type pivoty (eliminuje
+//       artefakty typu "double top / double bottom" jako separátní swingy).
+//    D) Confirmation: nový opačný PROVISIONAL swing → předchozí opačný
+//       PROVISIONAL přechází na CONFIRMED.
+//    E) Timeout: stale provisional swingy se po N barech expirují.
+// ════════════════════════════════════════════════════════════════════════════
+var array<Swing> swings = array.new<Swing>()
+
+ph = ta.pivothigh(high, uPivotWindow, uPivotWindow)
+pl = ta.pivotlow(low,   uPivotWindow, uPivotWindow)
+
+// Local sweep: posun pivot na skutečný lokální extrém v okně ±radius.
+f_local_sweep_high(int candBar, int radius) =>
+    int loB = math.max(0, candBar - radius)
+    int hiB = math.min(bar_index - uPivotWindow, candBar + radius)
+    int   bestB = candBar
+    int candOff = bar_index - candBar
+    float bestP = candOff >= 0 and candOff <= 5000 ? high[candOff] : na
+    if hiB >= loB
+        for b = loB to hiB
+            int off = bar_index - b
+            if off < 0 or off > 5000
+                continue
+            float px = high[off]
+            if not na(px) and (na(bestP) or px > bestP or (px == bestP and b > bestB))
+                bestP := px
+                bestB := b
+    [bestB, bestP]
+
+f_local_sweep_low(int candBar, int radius) =>
+    int loB = math.max(0, candBar - radius)
+    int hiB = math.min(bar_index - uPivotWindow, candBar + radius)
+    int   bestB = candBar
+    int candOff = bar_index - candBar
+    float bestP = candOff >= 0 and candOff <= 5000 ? low[candOff] : na
+    if hiB >= loB
+        for b = loB to hiB
+            int off = bar_index - b
+            if off < 0 or off > 5000
+                continue
+            float px = low[off]
+            if not na(px) and (na(bestP) or px < bestP or (px == bestP and b > bestB))
+                bestP := px
+                bestB := b
+    [bestB, bestP]
+
+// Find last swing matching predicate (typ filter, state filter). Returns na if none.
+f_last_swing(int wantTyp, int wantState) =>
+    Swing out = na
+    int n = array.size(swings)
+    if n > 0
+        for i = n - 1 to 0
+            Swing s = array.get(swings, i)
+            bool typOk = wantTyp == 0 or s.typ == wantTyp
+            bool stOk  = wantState < 0 or s.state == wantState
+            if typOk and stOk
+                out := s
+                break
+    out
+
+// Min leg distance check: candidate vs last opposite-type swing (any state).
+f_passes_min_leg(int candTyp, float candPx, int candBar) =>
+    Swing prev = f_last_swing(-candTyp, -1)
+    if na(prev) or na(prev.price)
+        true
+    else
+        float legSize = math.abs(candPx - prev.price)
+        int candOff = bar_index - candBar
+        int candOffC = candOff < 0 ? 0 : (candOff > 5000 ? 5000 : candOff)
+        float atrAt  = na(atrVal[candOffC]) or atrVal[candOffC] <= ATR_FLOOR ? ATR_FLOOR : atrVal[candOffC]
+        bool atrOk = uMinLegAtr <= 0 or legSize >= uMinLegAtr * atrAt
+        bool pctOk = uMinLegPct <= 0 or legSize >= uMinLegPct * 0.01 * candPx
+        atrOk and pctOk
+
+// Register / replace / confirm — nová atomic operace.
+f_swing_register(int candBar, float candPx, int candTyp) =>
+    int n = array.size(swings)
+    bool replaced = false
+    // Replace-on-stronger pro CONSECUTIVE same-type pivoty:
+    if n > 0
+        Swing last = array.get(swings, n - 1)
+        if last.typ == candTyp and last.state == SW_PROVISIONAL
+            bool stronger = (candTyp == 1 and candPx > last.price) or (candTyp == -1 and candPx < last.price)
+            if stronger
+                last.bar   := candBar
+                last.price := candPx
+                array.set(swings, n - 1, last)
+            replaced := true
+    if not replaced
+        // Min-leg gate vs last opposite swing.
+        if f_passes_min_leg(candTyp, candPx, candBar)
+            // Confirm previous opposite PROVISIONAL — nový swing dokazuje, že předchozí byl strukturální.
+            int m = array.size(swings)
+            if m > 0
+                for i = m - 1 to 0
+                    Swing s = array.get(swings, i)
+                    if s.typ == -candTyp
+                        if s.state == SW_PROVISIONAL
+                            s.state  := SW_CONFIRMED
+                            s.confAt := candBar
+                            array.set(swings, i, s)
+                        break
+            // Push nový provisional.
+            Swing fresh = Swing.new(bar=candBar, price=candPx, typ=candTyp, state=SW_PROVISIONAL, confAt=-1, brokenAt=-1)
+            array.push(swings, fresh)
+
+// Mark all swings of given type with price at-or-beyond `levelPx` as BROKEN (BOS event).
+f_swing_mark_broken(int typ, float levelPx, int eventBar) =>
+    int n = array.size(swings)
+    if n > 0
+        for i = 0 to n - 1
+            Swing s = array.get(swings, i)
+            if s.typ == typ and s.state != SW_BROKEN
+                bool brk = (typ == 1 and s.price <= levelPx) or (typ == -1 and s.price >= levelPx)
+                if brk
+                    s.state    := SW_BROKEN
+                    s.brokenAt := eventBar
+                    array.set(swings, i, s)
+
+// Expire stale provisionals (no confirm in N bars).
+f_swing_expire_stale() =>
+    int n = array.size(swings)
+    int kept = 0
+    if n > 0
+        for i = 0 to n - 1
+            Swing s = array.get(swings, i)
+            bool stale = s.state == SW_PROVISIONAL and (bar_index - s.bar) > uConfirmTimeout
+            if not stale
+                if kept != i
+                    array.set(swings, kept, s)
+                kept += 1
+        // Trim tail.
+        while array.size(swings) > kept
+            array.pop(swings)
+
+// — Main per-bar swing detection —
+if barstate.isconfirmed and bar_index >= uPivotWindow * 2
+    int pivBar = bar_index - uPivotWindow
+    if not na(ph)
+        int   finalBar = pivBar
+        float finalPx  = ph
+        if uLocalSweep
+            [bb, bp] = f_local_sweep_high(pivBar, uLocalSweepRad)
+            finalBar := bb
+            finalPx  := bp
+        f_swing_register(finalBar, finalPx, 1)
+    else if not na(pl)
+        int   finalBar = pivBar
+        float finalPx  = pl
+        if uLocalSweep
+            [bb, bp] = f_local_sweep_low(pivBar, uLocalSweepRad)
+            finalBar := bb
+            finalPx  := bp
+        f_swing_register(finalBar, finalPx, -1)
+    f_swing_expire_stale()
+    // Cap memory.
+    while array.size(swings) > 200
+        array.shift(swings)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 6) STRUCTURAL TREND CLASSIFIER
+// ────────────────────────────────────────────────────────────────────────────
+//  Vyhodnocuje posledních 4 CONFIRMED swingů.
+//  UPTREND  = confirmed sequence Low_old, High_old, Low_new (>Low_old),
+//             High_new (>High_old) → HH + HL.
+//  DOWNTREND= zrcadlo: HH_old, LL_old, HH_new (<HH_old), LL_new (<LL_old).
+//  RANGE    = nic jiného (insufficient data, mixed pattern).
+// ════════════════════════════════════════════════════════════════════════════
+f_classify_trend() =>
+    array<Swing> conf = array.new<Swing>()
+    int n = array.size(swings)
+    if n > 0
+        for i = n - 1 to 0
+            Swing s = array.get(swings, i)
+            if s.state == SW_CONFIRMED or s.state == SW_BROKEN
+                array.unshift(conf, s)
+                if array.size(conf) >= 4
+                    break
+    int trend = TR_RANGE
+    if array.size(conf) >= 4
+        Swing s0 = array.get(conf, 0)
+        Swing s1 = array.get(conf, 1)
+        Swing s2 = array.get(conf, 2)
+        Swing s3 = array.get(conf, 3)
+        // Pattern A: Low, High, Low, High → uptrend if HH+HL
+        if s0.typ == -1 and s1.typ == 1 and s2.typ == -1 and s3.typ == 1
+            if s3.price > s1.price and s2.price > s0.price
+                trend := TR_UPTREND
+            else if s3.price < s1.price and s2.price < s0.price
+                trend := TR_DOWNTREND   // pattern degenerated
+        // Pattern B: High, Low, High, Low → downtrend if LL+LH
+        else if s0.typ == 1 and s1.typ == -1 and s2.typ == 1 and s3.typ == -1
+            if s3.price < s1.price and s2.price < s0.price
+                trend := TR_DOWNTREND
+            else if s3.price > s1.price and s2.price > s0.price
+                trend := TR_UPTREND
+    trend
+
+// ════════════════════════════════════════════════════════════════════════════
+// 7) BOS DETECTOR + VALIDATOR
+// ────────────────────────────────────────────────────────────────────────────
+//  5-condition BOS:
+//    1) close[K-1..0] all beyond reference level (K = uBosFollowBars)
+//    2) displacement: |close - level| >= minDisplacementAtr × ATR
+//    3) candle range: high - low >= minCandleAtr × ATR (BOS bar)
+//    4) close quality: close near extreme (>= closeQualityMin of range)
+//    5) optional: 3-bar imbalance (FVG) — hard gate or score-only
+//  Reference levely jsou výhradně CONFIRMED swingy (eliminuje BOS na šum).
+//  BOS bar = bar_index - K + 1 (první close streaku) — deterministic, no repaint.
+// ════════════════════════════════════════════════════════════════════════════
+var array<line> bosLines = array.new_line()
+int BOS_LINES_CAP = 30
+
+// 3-bar imbalance check: long FVG = low[off] > high[off+2], short FVG = high[off] < low[off+2].
+f_has_imbalance(int impulseBar, int dir) =>
+    int off = bar_index - impulseBar
+    if off < 0 or off > 5000 - 2
+        false
+    else
+        bool found = false
+        // check across BOS bar and ±1 bars (impulse may span)
+        for k = 0 to 2
+            int o = off + k
+            int o2 = o + 2
+            if o2 > 5000
+                continue
+            float hi0 = high[o]
+            float lo0 = low[o]
+            float hi2 = high[o2]
+            float lo2 = low[o2]
+            if not na(hi0) and not na(lo0) and not na(hi2) and not na(lo2)
+                if (dir == 1 and lo0 > hi2) or (dir == -1 and hi0 < lo2)
+                    found := true
+                    break
+        found
+
+// Validate BOS quality on the BOS bar itself.
+f_bos_quality_ok(int dir, float refPx, float atrAt) =>
+    int A = uBosFollowBars
+    int bosBar = bar_index - A + 1
+    int bosOff = bar_index - bosBar
+    if bosOff < 0 or bosOff > 5000
+        [false, false]
+    else
+        float bcH = high[bosOff]
+        float bcL = low[bosOff]
+        float bcC = close[bosOff]
+        if na(bcH) or na(bcL) or na(bcC)
+            [false, false]
+        else
+            float candRange = bcH - bcL
+            // 1) close beyond (already checked outside, redundant safety)
+            bool beyondOk = (dir == 1 and bcC > refPx) or (dir == -1 and bcC < refPx)
+            // 2) displacement
+            float displ = math.abs(bcC - refPx)
+            bool displOk = displ >= uMinDisplacementAtr * atrAt
+            // 3) candle range
+            bool rangeOk = candRange >= uMinCandleAtr * atrAt
+            // 4) close quality
+            float closeQ = candRange > 0 ? (dir == 1 ? (bcC - bcL) / candRange : (bcH - bcC) / candRange) : 0.0
+            bool qualOk = closeQ >= uCloseQualityMin
+            // 5) follow-through: K consecutive closes beyond level
+            bool ftOk = true
+            for k = 0 to A - 1
+                float c = close[k]
+                if na(c) or (dir == 1 and c <= refPx) or (dir == -1 and c >= refPx)
+                    ftOk := false
+                    break
+            // 6) imbalance
+            bool imbOk = f_has_imbalance(bosBar, dir)
+            bool allOk = beyondOk and displOk and rangeOk and qualOk and ftOk and (not uRequireImbalance or imbOk)
+            [allOk, imbOk]
+
+// Find best BOS candidate among CONFIRMED swings of type `typ` that haven't been broken.
+f_best_bos_candidate(int typ, int bosBar, int minRelevantBar) =>
+    Swing best = na
+    int n = array.size(swings)
+    if n > 0
+        for i = 0 to n - 1
+            Swing s = array.get(swings, i)
+            if s.typ == typ and s.state == SW_CONFIRMED
+                if s.bar < minRelevantBar or s.bar > bosBar - 1
+                    continue
+                int off = bar_index - s.bar
+                if off < 0 or off > 5000
+                    continue
+                if na(best) or (typ == 1 and s.price > best.price) or (typ == -1 and s.price < best.price)
+                    best := s
+    best
+
+// ════════════════════════════════════════════════════════════════════════════
+// 8) ZONE BUILDER (origin walk + bounds + score + quality gate)
+// ════════════════════════════════════════════════════════════════════════════
+var array<Zone> zones = array.new<Zone>()
+
+// ─── Counters (shared int array — Pine v6 dovoluje mutace arrays z funkcí, ne plain int) ───
+int CTR_ZONE_ID    = 0
+int CTR_TRADE_ID   = 1
+int CTR_SKIP_RRR   = 2
+int CTR_SKIP_QUAL  = 3
+int CTR_SKIP_SLOT  = 4
+var array<int> counters = array.new_int(5, 0)
+
+f_ctr_inc(int idx) =>
+    int v = array.get(counters, idx) + 1
+    array.set(counters, idx, v)
+    v
+
+f_ctr_get(int idx) => array.get(counters, idx)
+
+// Find origin bar of impulse leg: walk legEnd → legStart, find LAST opposite candle.
+f_find_origin(int legStart, int legEnd, int dir) =>
+    int outBar = -1
+    int b = legEnd
+    while b >= legStart and b >= 0
+        int off = bar_index - b
+        if off >= 0 and off <= 5000
+            float c = close[off]
+            float o = open[off]
+            if not na(c) and not na(o)
+                bool isOpposite = (dir == 1 and c < o) or (dir == -1 and c > o)
+                if isOpposite
+                    outBar := b
+                    break
+        b -= 1
+    if outBar < 0
+        // Fallback: extreme bar of the leg
+        int   xB = legStart
+        float xP = na
+        if legEnd >= legStart
+            for k = legStart to legEnd
+                int off = bar_index - k
+                if off < 0 or off > 5000
+                    continue
+                float p = dir == 1 ? low[off] : high[off]
+                if na(p)
+                    continue
+                if na(xP) or (dir == 1 and p < xP) or (dir == -1 and p > xP)
+                    xP := p
+                    xB := k
+        outBar := xB
+    outBar
+
+// Compute zone bounds from origin bar (body high for demand, body low for supply).
+f_zone_bounds(int origBar, int dir) =>
+    int off = bar_index - origBar
+    float lo = low[off]
+    float hi = high[off]
+    float op = open[off]
+    float cl = close[off]
+    float outLo = lo
+    float outHi = hi
+    if dir == 1
+        outHi := math.max(op, cl)   // demand: top = body high
+    else
+        outLo := math.min(op, cl)   // supply: bottom = body low
+    [outLo, outHi]
+
+// Clamp height to maxHeightAtr × ATR.
+f_clamp_height(float zL, float zH, int dir, float atr) =>
+    float outL = zL
+    float outH = zH
+    if uMaxHeightAtr > 0 and atr > ATR_FLOOR
+        float capW = uMaxHeightAtr * atr
+        float h = zH - zL
+        if h > capW
+            if dir == 1
+                outH := zL + capW
+            else
+                outL := zH - capW
+    [outL, outH]
+
+// Expand base to include adjacent same-direction candles (cluster).
+f_base_len(int origBar, float zL, float zH) =>
+    int left  = origBar
+    int right = origBar
+    for j = 1 to 30
+        int b = origBar - j
+        if b < 0
+            break
+        int off = bar_index - b
+        if off < 0 or off > 5000
+            break
+        if f_overlap_ratio(high[off], low[off], zL, zH) >= 0.40
+            left := b
+        else
+            break
+    for j = 1 to 30
+        int b = origBar + j
+        if b > bar_index
+            break
+        int off = bar_index - b
+        if off < 0 or off > 5000
+            break
+        if f_overlap_ratio(high[off], low[off], zL, zH) >= 0.40
+            right := b
+        else
+            break
+    right - left + 1
+
+f_chop_density(int leftStart, int rightEnd, float zL, float zH) =>
+    float dens = 0.0
+    int span = rightEnd - leftStart + 1
+    if span > 0
+        int cnt = 0
+        for k = leftStart to rightEnd
+            int off = bar_index - k
+            if off < 0 or off > 5000
+                continue
+            if f_overlap_ratio(high[off], low[off], zL, zH) >= 0.30
+                cnt += 1
+        dens := float(cnt) / float(span)
+    dens
+
+// Quality score — vážený mix.
+f_zone_score(float impulseAtr, int baseLen, float chopDens, bool hasImb, bool htfAligned) =>
+    float sImp   = f_clamp01(impulseAtr / 4.0)
+    float sBase  = f_clamp01(1.0 - math.abs(float(baseLen) - 2.0) / 5.0)
+    float sChop  = f_clamp01(1.0 - chopDens)
+    float sImb   = hasImb ? 1.0 : 0.5
+    float sHtf   = htfAligned ? 1.0 : 0.7
+    f_clamp01(0.30 * sImp + 0.20 * sBase + 0.20 * sChop + 0.15 * sImb + 0.15 * sHtf)
+
+// Check overlap with existing alive zones (same direction).
+f_overlaps_existing(float zL, float zH, int dir) =>
+    bool hit = false
+    int n = array.size(zones)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(zones, i)
+            if z.alive and z.dir == dir and not na(z.zL) and not na(z.zH)
+                float iL = math.min(z.zL, z.zH)
+                float iH = math.max(z.zL, z.zH)
+                float ol = f_v_overlap_ratio(zL, zH, iL, iH)
+                if ol >= 0.50
+                    hit := true
+                    break
+    hit
+
+// Count alive zones.
+f_count_alive_zones() =>
+    int c = 0
+    int n = array.size(zones)
+    if n > 0
+        for i = 0 to n - 1
+            Zone z = array.get(zones, i)
+            if z.alive
+                c += 1
+    c
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9) ENTRY/RISK PLANNER (multi-tier TP + RRR gate)
+// ────────────────────────────────────────────────────────────────────────────
+//  TP tiers (best target = nejkonzervativnější, který přesahuje RRR floor):
+//    Tier 1 (forward swing): nejbližší unswept CONFIRMED swing high/low ve směru
+//            tradu, který je za entry (ne BOS reference, ale strukturální dále).
+//    Tier 2 (measured move): entry + (BOS_ref_px - origin_extreme_px) — 1:1 leg.
+//    Tier 3 (RRR floor): entry ± minRRR × risk — minimum acceptable.
+//  Pokud žádný tier nepřekročí floor ⇒ tp = na ⇒ NO TRADE (zone INFO_ONLY).
+// ════════════════════════════════════════════════════════════════════════════
+f_sl_price(float zL, float zH, int dir, float atrAt) =>
+    float bufferAtr  = uSlBufferAtr * atrAt
+    float bufferPct  = uSlBufferZonePct * (zH - zL)
+    float bufFinal   = math.max(bufferAtr, bufferPct)
+    dir == 1 ? zL - bufFinal : zH + bufFinal
+
+// Forward unswept swing TP — nearest swing of correct type beyond entry.
+f_forward_swing_tp(int dir, float entryPx, int afterBar) =>
+    float out = na
+    int n = array.size(swings)
+    if n > 0
+        for i = 0 to n - 1
+            Swing s = array.get(swings, i)
+            // Must be opposite type to trade dir (long → swing high, short → swing low)?
+            // No — for demand (long), TP = next swing HIGH (resistance). type +1.
+            // For supply (short), TP = next swing LOW. type -1.
+            int wantTyp = dir == 1 ? 1 : -1
+            if s.typ == wantTyp and s.state != SW_BROKEN
+                bool beyond = (dir == 1 and s.price > entryPx) or (dir == -1 and s.price < entryPx)
+                bool fresh  = s.bar > afterBar
+                if beyond and fresh
+                    if na(out) or (dir == 1 and s.price < out) or (dir == -1 and s.price > out)
+                        out := s.price
+    out
+
+f_compute_tp(int dir, float entryPx, float slPx, int origBar, float bosRefPx) =>
+    float risk = math.abs(entryPx - slPx)
+    if risk <= 0
+        [float(na), float(na)]
+    else
+        float rrFloor = dir == 1 ? entryPx + uMinRRR * risk : entryPx - uMinRRR * risk
+
+        // Tier 1: forward unswept swing (musí být za bosRefPx, tedy "vpřed za již-broken HH")
+        float tpStruct = na
+        if uTpUseStructure
+            tpStruct := f_forward_swing_tp(dir, dir == 1 ? math.max(entryPx, bosRefPx) : math.min(entryPx, bosRefPx), origBar)
+
+        // Tier 2: measured move
+        float tpMeasured = na
+        if uTpUseMeasured
+            int origOff = bar_index - origBar
+            if origOff >= 0 and origOff <= 5000
+                float origExtreme = dir == 1 ? low[origOff] : high[origOff]
+                float legSize = math.abs(bosRefPx - origExtreme)
+                tpMeasured := dir == 1 ? entryPx + legSize : entryPx - legSize
+
+        // Pick best valid candidate ≥ rrFloor (long) / ≤ rrFloor (short)
+        float pick = na
+        if uTpRrrFloor
+            // Hard floor mode: pick smallest target ≥ rrFloor (long) or largest ≤ rrFloor (short)
+            if dir == 1
+                if not na(tpStruct) and tpStruct >= rrFloor
+                    pick := tpStruct
+                if not na(tpMeasured) and tpMeasured >= rrFloor
+                    if na(pick) or tpMeasured < pick
+                        pick := tpMeasured
+                // pick := na if neither candidate met floor → NO TRADE
+            else
+                if not na(tpStruct) and tpStruct <= rrFloor
+                    pick := tpStruct
+                if not na(tpMeasured) and tpMeasured <= rrFloor
+                    if na(pick) or tpMeasured > pick
+                        pick := tpMeasured
+        else
+            // Soft mode: pick most conservative valid candidate
+            if not na(tpStruct)
+                pick := tpStruct
+            if not na(tpMeasured)
+                if na(pick) or (dir == 1 and tpMeasured < pick) or (dir == -1 and tpMeasured > pick)
+                    pick := tpMeasured
+
+        float rrrOut = na(pick) ? na : math.abs(pick - entryPx) / risk
+        [pick, rrrOut]
+
+// ════════════════════════════════════════════════════════════════════════════
+// 10) ZONE CREATION (orchestrator: bounds → quality → entry/SL/TP → RRR gate)
+// ════════════════════════════════════════════════════════════════════════════
+f_try_create_zone(int origBar, int dir, float bosRefPx, int bosBar, bool hasImb) =>
+    bool created = false
+    int off = bar_index - origBar
+    if off >= 0 and off <= 5000 and f_count_alive_zones() < uMaxAlive
+        int relP = bar_index - origBar
+        int relPC = relP < 0 ? 0 : (relP > 5000 ? 5000 : relP)
+        float atrP = na(atrVal[relPC]) or atrVal[relPC] <= ATR_FLOOR ? ATR_FLOOR : atrVal[relPC]
+
+        [zL0, zH0] = f_zone_bounds(origBar, dir)
+        if zH0 > zL0
+            [zL, zH] = f_clamp_height(zL0, zH0, dir, atrP)
+            float h = zH - zL
+            bool minHOk = uMinHeightAtr <= 0 or h >= uMinHeightAtr * atrP
+            float origPxImp = dir == 1 ? low[off] : high[off]
+            float impulse   = dir == 1 ? (bosRefPx - origPxImp) : (origPxImp - bosRefPx)
+            float impAtr    = atrP > ATR_FLOOR ? impulse / atrP : 0.0
+            bool impOk      = impAtr >= uMinImpulseAtr
+            int  baseLen    = f_base_len(origBar, zL, zH)
+            bool baseOk     = baseLen >= uMinBaseLen and baseLen <= uMaxBaseLen
+            float chopD     = f_chop_density(math.max(0, origBar - 30), bar_index, zL, zH)
+            bool htfAligned = (dir == 1 and htfTrendUp) or (dir == -1 and htfTrendDown) or not htfReady
+            float score     = f_zone_score(impAtr, baseLen, chopD, hasImb, htfAligned)
+            bool scoreOk    = score >= uQualityThr
+            bool noOverlap  = not f_overlaps_existing(zL, zH, dir)
+
+            if minHOk and impOk and baseOk and scoreOk and noOverlap
+                // Pre-compute trade plan (entry @ edge, SL @ far + buffer, TP multi-tier)
+                float entryPx = dir == 1 ? zH : zL
+                float slPx    = f_sl_price(zL, zH, dir, atrP)
+                [tpPx, rrrCalc] = f_compute_tp(dir, entryPx, slPx, origBar, bosRefPx)
+                float riskPx = math.abs(entryPx - slPx)
+
+                int status = STATUS_PENDING_READY
+                string skipReason = ""
+                if na(tpPx) or na(rrrCalc) or rrrCalc < uMinRRR or riskPx <= 0
+                    status := STATUS_INFO_ONLY
+                    skipReason := na(tpPx) ? "no valid TP candidate ≥ RRR floor" : "RRR " + str.tostring(rrrCalc, "#.##") + " < " + str.tostring(uMinRRR, "#.##")
+                    f_ctr_inc(CTR_SKIP_RRR)
+
+                int tL = f_time_at_bar(origBar)
+                int tR = time
+                if not na(tL) and not na(tR)
+                    color fillC = status == STATUS_INFO_ONLY ? uColInfoOnly : uColPending
+                    box bx = box.new(left=tL, top=zH, right=tR, bottom=zL,
+                         xloc=xloc.bar_time, bgcolor=fillC,
+                         border_color=uColBorder, border_width=1, border_style=line.style_dashed)
+                    int newZoneId = f_ctr_inc(CTR_ZONE_ID)
+                    Zone z = Zone.new()
+                    z.id         := newZoneId
+                    z.dir        := dir
+                    z.zL         := zL
+                    z.zH         := zH
+                    z.origBar    := origBar
+                    z.bosBar     := bosBar
+                    z.bosRefPx   := bosRefPx
+                    z.born       := bar_index
+                    z.endBar     := bar_index
+                    z.ready      := false
+                    z.readyBar   := -1
+                    z.touched    := false
+                    z.alive      := true
+                    z.endReason  := END_NONE
+                    z.ntArm      := false
+                    z.score      := score
+                    z.baseLen    := baseLen
+                    z.hasImb     := hasImb
+                    z.status     := status
+                    z.entryPx    := entryPx
+                    z.slPx       := slPx
+                    z.tpPx       := tpPx
+                    z.riskPx     := riskPx
+                    z.rrr        := rrrCalc
+                    z.skipReason := skipReason
+                    z.bx         := bx
+                    array.push(zones, z)
+                    created := true
+            else
+                if not scoreOk
+                    f_ctr_inc(CTR_SKIP_QUAL)
+    created
+
+// ════════════════════════════════════════════════════════════════════════════
+// 11) BOS DETECTION + TRIGGER (uses CONFIRMED swings only)
+// ════════════════════════════════════════════════════════════════════════════
+var int lastBosUpSwingBar = -1
+var int lastBosDnSwingBar = -1
+var int lastBosUpBar      = -1
+var int lastBosDnBar      = -1
+
+if barstate.isconfirmed and bar_index >= uBosFollowBars
+    int A = uBosFollowBars
+    int bosBar = bar_index - A + 1
+    int minRelevantBar = bar_index - uBosLookbackBars
+    int currOff = 0
+    float atrAt = na(atrVal[currOff]) or atrVal[currOff] <= ATR_FLOOR ? ATR_FLOOR : atrVal[currOff]
+
+    // ── BOS UP — break of CONFIRMED swing high ──
+    Swing bestUp = f_best_bos_candidate(1, bosBar, minRelevantBar)
+    if not na(bestUp) and bestUp.bar > lastBosUpSwingBar
+        // Must close beyond level on all K bars
+        bool basicOk = true
+        for k = 0 to A - 1
+            float c = close[k]
+            if na(c) or c <= bestUp.price
+                basicOk := false
+                break
+        if basicOk
+            [qualOk, hasImb] = f_bos_quality_ok(1, bestUp.price, atrAt)
+            if qualOk
+                f_swing_mark_broken(1, bestUp.price, bosBar)
+                lastBosUpSwingBar := bestUp.bar
+                lastBosUpBar      := bosBar
+                if uShowBos
+                    int tBosH = f_time_at_bar(bestUp.bar)
+                    if not na(tBosH)
+                        line ln = line.new(tBosH, bestUp.price, time, bestUp.price,
+                             xloc=xloc.bar_time, color=uColBos, width=1, style=line.style_dashed)
+                        array.push(bosLines, ln)
+                        while array.size(bosLines) > BOS_LINES_CAP
+                            line.delete(array.shift(bosLines))
+                bool sideOkDem = uZoneSide == "Obě" or uZoneSide == "Demand"
+                if sideOkDem
+                    // Find leg start = last CONFIRMED low before bosBar
+                    Swing legStartSwing = f_last_swing(-1, SW_CONFIRMED)
+                    int legStart = na(legStartSwing) ? math.max(0, bosBar - 50) : legStartSwing.bar
+                    int legEnd   = math.max(legStart, bosBar)
+                    int origin   = f_find_origin(legStart, legEnd, 1)
+                    if origin >= 0
+                        f_try_create_zone(origin, 1, bestUp.price, bosBar, hasImb)
+
+    // ── BOS DOWN — break of CONFIRMED swing low ──
+    Swing bestDn = f_best_bos_candidate(-1, bosBar, minRelevantBar)
+    if not na(bestDn) and bestDn.bar > lastBosDnSwingBar
+        bool basicOk = true
+        for k = 0 to A - 1
+            float c = close[k]
+            if na(c) or c >= bestDn.price
+                basicOk := false
+                break
+        if basicOk
+            [qualOk, hasImb] = f_bos_quality_ok(-1, bestDn.price, atrAt)
+            if qualOk
+                f_swing_mark_broken(-1, bestDn.price, bosBar)
+                lastBosDnSwingBar := bestDn.bar
+                lastBosDnBar      := bosBar
+                if uShowBos
+                    int tBosL = f_time_at_bar(bestDn.bar)
+                    if not na(tBosL)
+                        line ln = line.new(tBosL, bestDn.price, time, bestDn.price,
+                             xloc=xloc.bar_time, color=uColBos, width=1, style=line.style_dashed)
+                        array.push(bosLines, ln)
+                        while array.size(bosLines) > BOS_LINES_CAP
+                            line.delete(array.shift(bosLines))
+                bool sideOkSup = uZoneSide == "Obě" or uZoneSide == "Supply"
+                if sideOkSup
+                    Swing legStartSwing = f_last_swing(1, SW_CONFIRMED)
+                    int legStart = na(legStartSwing) ? math.max(0, bosBar - 50) : legStartSwing.bar
+                    int legEnd   = math.max(legStart, bosBar)
+                    int origin   = f_find_origin(legStart, legEnd, -1)
+                    if origin >= 0
+                        f_try_create_zone(origin, -1, bestDn.price, bosBar, hasImb)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 12) STRATEGY HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+f_can_enter() => strategy.opentrades < uMaxConcurrent
+f_trade_id(int dir, int idCounter) => (dir == 1 ? "L_" : "S_") + str.tostring(idCounter)
+f_exit_id(int dir, int idCounter)  => (dir == 1 ? "XL_" : "XS_") + str.tostring(idCounter)
+
+f_is_trade_open(string idTrade) =>
+    bool found = false
+    int n = strategy.opentrades
+    if n > 0
+        for ti = 0 to n - 1
+            if strategy.opentrades.entry_id(ti) == idTrade
+                found := true
+                break
+    found
+
+f_find_open(string idTrade) =>
+    int found = -1
+    int n = strategy.opentrades
+    if n > 0
+        for ti = 0 to n - 1
+            if strategy.opentrades.entry_id(ti) == idTrade
+                found := ti
+                break
+    found
+
+f_find_closed(string idTrade) =>
+    int found = -1
+    int n = strategy.closedtrades
+    if n > 0
+        int lo = math.max(0, n - 200)
+        for k = n - 1 to lo
+            if strategy.closedtrades.entry_id(k) == idTrade
+                found := k
+                break
+    found
+
+// ════════════════════════════════════════════════════════════════════════════
+// 13) ZONE LIFECYCLE — clean state machine (no nested if-not-handled)
+// ────────────────────────────────────────────────────────────────────────────
+//  Per-bar pass přes všechny živé zóny:
+//    1) Compute current state metrics (overlap, departure, near-touch, etc.)
+//    2) Apply state transitions in priority order:
+//         CLOSE_INV  > TOUCH_AFTER_READY > NEAR_KILL > MAX_LIFE > FAKE_BOS
+//    3) Side effects (place order on READY, cancel on death, etc.)
+//    4) Default: update right edge
+// ════════════════════════════════════════════════════════════════════════════
+f_place_limit_order(Zone z) =>
+    bool placed = false
+    bool sideOk = (z.dir == 1 and uTradeLong) or (z.dir == -1 and uTradeShort)
+    bool slotOk = f_can_enter() or uReplaceOldest
+
+    // Strict structural trend gate
+    if uRequireStructTrend
+        int tr = f_classify_trend()
+        bool trendOk = (z.dir == 1 and tr == TR_UPTREND) or (z.dir == -1 and tr == TR_DOWNTREND)
+        if not trendOk
+            sideOk := false
+            z.skipReason := "structural trend = " + (tr == TR_RANGE ? "RANGE" : tr == TR_UPTREND ? "UP" : "DOWN")
+
+    // Secondary HTF gate
+    if uHtfTrendCheck and htfReady
+        bool htfOk = (z.dir == 1 and htfTrendUp) or (z.dir == -1 and htfTrendDown)
+        if not htfOk
+            sideOk := false
+            z.skipReason := "HTF trend mismatch"
+
+    if sideOk and slotOk and not na(z.entryPx) and not na(z.slPx) and not na(z.tpPx)
+        if uReplaceOldest and not f_can_enter() and strategy.opentrades > 0
+            string oldId = strategy.opentrades.entry_id(0)
+            strategy.close(oldId, comment="rotate")
+        int newTradeId = f_ctr_inc(CTR_TRADE_ID)
+        z.tradeId := newTradeId
+        string idTrade = f_trade_id(z.dir, z.tradeId)
+        string idExit  = f_exit_id(z.dir,  z.tradeId)
+        float qty = uQty <= 0 ? 1.0 : uQty
+        if z.dir == 1
+            strategy.entry(idTrade, strategy.long,  qty=qty, limit=z.entryPx, comment="ready-L")
+        else
+            strategy.entry(idTrade, strategy.short, qty=qty, limit=z.entryPx, comment="ready-S")
+        // Limit fill = limit price = edge → absolutní SL/TP je deterministické.
+        strategy.exit(idExit, from_entry=idTrade, stop=z.slPx, limit=z.tpPx, comment_loss="SL", comment_profit="TP")
+        z.status := STATUS_ORDER_PLACED
+        placed := true
+        if uShowEntries
+            label.new(bar_index, z.entryPx, xloc=xloc.bar_index, yloc=yloc.price,
+                 text="Q", style=z.dir == 1 ? label.style_label_up : label.style_label_down,
+                 color=color.new(z.dir == 1 ? #16a34a : #dc2626, 60),
+                 textcolor=color.white, size=size.tiny,
+                 tooltip="Pending limit @ " + str.tostring(z.entryPx, "#.####") +
+                       "\nSL=" + str.tostring(z.slPx, "#.####") +
+                       "\nTP=" + str.tostring(z.tpPx, "#.####") +
+                       "\nRRR=" + str.tostring(z.rrr, "#.##"))
+        if uShowSlTp
+            int tNow0 = time
+            int tPivT0 = f_time_at_bar(z.origBar)
+            if not na(tPivT0)
+                line.new(tPivT0, z.slPx, tNow0, z.slPx, xloc=xloc.bar_time, color=color.new(#dc2626, 50), width=1, style=line.style_dotted)
+                line.new(tPivT0, z.tpPx, tNow0, z.tpPx, xloc=xloc.bar_time, color=color.new(#16a34a, 50), width=1, style=line.style_dotted)
+    else
+        if not slotOk
+            f_ctr_inc(CTR_SKIP_SLOT)
+        if uShowSkipDbg
+            string reason = not sideOk ? z.skipReason : not slotOk ? "max trades" : "?"
+            label.new(bar_index, z.dir == 1 ? z.zH : z.zL, xloc=xloc.bar_index, yloc=yloc.price,
+                 text="X", style=label.style_xcross,
+                 color=color.new(#a855f7, 30), textcolor=color.white, size=size.tiny,
+                 tooltip="Entry skipped: " + reason)
+    placed
+
+if barstate.isconfirmed
+    int nz = array.size(zones)
+    if nz > 0
+        for zi = 0 to nz - 1
+            Zone z = array.get(zones, zi)
+            if z.alive
+                float bH = high
+                float bL = low
+                float bC = close
+                bool overlap = bL <= z.zH and bH >= z.zL
+                int currOff = 0
+                float atrZ = na(atrVal[currOff]) or atrVal[currOff] <= ATR_FLOOR ? ATR_FLOOR : atrVal[currOff]
+                int handled = 0   // 0 = not handled, 1 = handled
+
+                // ── PRIORITY 1: Close-invalidation ─────────────────────────
+                bool isCloseInv = (z.dir == 1 and bC < z.zL) or (z.dir == -1 and bC > z.zH)
+                if isCloseInv
+                    z.alive     := false
+                    z.touched   := true
+                    z.endBar    := bar_index
+                    z.endReason := END_CLOSE_INV
+                    if uShowTouch
+                        float yLab = z.dir == 1 ? z.zL : z.zH
+                        label.new(bar_index, yLab, xloc=xloc.bar_index, yloc=yloc.price,
+                             text="T", style=z.dir == 1 ? label.style_label_up : label.style_label_down,
+                             color=color.new(uColBorder, 25), textcolor=color.white, size=size.tiny,
+                             tooltip="Close invalidation")
+                    if z.tradeId >= 0
+                        string idTradeC = f_trade_id(z.dir, z.tradeId)
+                        if not f_is_trade_open(idTradeC)
+                            strategy.cancel(idTradeC)
+                        else if uExitOnZoneInv
+                            strategy.close(idTradeC, comment="zone_inv")
+                    handled := 1
+
+                // ── PRIORITY 2: READY transition + place limit order ───────
+                if handled == 0 and not z.ready and z.status != STATUS_INFO_ONLY
+                    float depNeed = atrZ * 0.30
+                    bool departClose = z.dir == 1 ? (bC > z.zH + depNeed) : (bC < z.zL - depNeed)
+                    if departClose
+                        z.ready    := true
+                        z.readyBar := bar_index
+                        if uShowReady
+                            float yLab = z.dir == 1 ? z.zH : z.zL
+                            label.new(bar_index, yLab, xloc=xloc.bar_index, yloc=yloc.price,
+                                 text="R", style=z.dir == 1 ? label.style_label_down : label.style_label_up,
+                                 color=color.new(uColBorder, 55), textcolor=color.white, size=size.tiny,
+                                 tooltip="READY (departure close)")
+                        // Place limit order (with all gates: side, slot, trend, HTF)
+                        f_place_limit_order(z)
+
+                // ── PRIORITY 3: Touch after READY ──────────────────────────
+                //   Limit @ edge: overlap = true ⇔ bar range protnul edge price ⇔
+                //   Pine broker fillnul limit (nebo gap-open dal lepší cenu).
+                //   OCO bracket (SL/TP) přebírá řízení exitu. Zóna umírá.
+                if handled == 0 and z.ready and bar_index > z.readyBar and overlap
+                    z.alive     := false
+                    z.touched   := true
+                    z.endBar    := bar_index
+                    z.endReason := END_TOUCH
+                    if uShowTouch
+                        float yLab = z.dir == 1 ? z.zH : z.zL
+                        label.new(bar_index, yLab, xloc=xloc.bar_index, yloc=yloc.price,
+                             text="T", style=z.dir == 1 ? label.style_label_down : label.style_label_up,
+                             color=color.new(uColBorder, 25), textcolor=color.white, size=size.tiny,
+                             tooltip="Touch (post-READY) — limit @ edge filled by broker")
+                    handled := 1
+
+                // ── PRIORITY 4: Near-touch FSM ─────────────────────────────
+                if handled == 0 and uNtPadAtr > 0 and not overlap
+                    float ntPad = uNtPadAtr * atrZ
+                    float ntStr = uNtStrongAtr * atrZ
+                    bool isProbe = z.dir == 1 ? (bL <= z.zH + ntPad and bL > z.zH) : (bH >= z.zL - ntPad and bH < z.zL)
+                    bool isStrongDepart = z.dir == 1 ? (bC > z.zH + ntStr) : (bC < z.zL - ntStr)
+                    bool nearKill = (isProbe and isStrongDepart) or (z.ntArm and isStrongDepart)
+                    if nearKill
+                        z.alive     := false
+                        z.touched   := true
+                        z.endBar    := bar_index
+                        z.endReason := END_NEAR_KILL
+                        if uShowTouch
+                            float yLab = z.dir == 1 ? z.zH : z.zL
+                            label.new(bar_index, yLab, xloc=xloc.bar_index, yloc=yloc.price,
+                                 text="T*", style=z.dir == 1 ? label.style_label_down : label.style_label_up,
+                                 color=color.new(#a855f7, 35), textcolor=color.white, size=size.tiny,
+                                 tooltip="Near-touch missed")
+                        if z.tradeId >= 0
+                            strategy.cancel(f_trade_id(z.dir, z.tradeId))
+                        handled := 1
+                    else if isProbe and not isStrongDepart
+                        z.ntArm := true
+
+                // ── PRIORITY 5: Max life ───────────────────────────────────
+                if handled == 0 and uMaxLifeBars > 0 and (bar_index - z.origBar) >= uMaxLifeBars
+                    z.alive     := false
+                    z.endBar    := bar_index
+                    z.endReason := END_MAX_LIFE
+                    if z.tradeId >= 0 and not f_is_trade_open(f_trade_id(z.dir, z.tradeId))
+                        strategy.cancel(f_trade_id(z.dir, z.tradeId))
+                    handled := 1
+
+                // ── PRIORITY 6: Opposite-BOS structural break (optional) ───
+                if handled == 0 and uExitOnStructBreak
+                    bool oppositeBos = z.dir == 1 ? (lastBosDnBar > z.born) : (lastBosUpBar > z.born)
+                    if oppositeBos
+                        z.alive     := false
+                        z.endBar    := bar_index
+                        z.endReason := END_STRUCT
+                        if z.tradeId >= 0
+                            string idT = f_trade_id(z.dir, z.tradeId)
+                            if f_is_trade_open(idT)
+                                strategy.close(idT, comment="struct_break")
+                            else
+                                strategy.cancel(idT)
+                        handled := 1
+
+                // ── DEFAULT: Update right edge ─────────────────────────────
+                if handled == 0 and z.alive
+                    if not na(z.bx)
+                        box.set_right(z.bx, time)
+                    z.endBar := bar_index
+
+                // Persist mutations.
+                array.set(zones, zi, z)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 14) MAX-HOLD safety net (volitelný global time-stop pro stuck trades)
+// ════════════════════════════════════════════════════════════════════════════
+if uMaxHoldBars > 0 and strategy.opentrades > 0
+    for ti = 0 to strategy.opentrades - 1
+        int barsHeld = bar_index - strategy.opentrades.entry_bar_index(ti)
+        if barsHeld >= uMaxHoldBars
+            string clId = strategy.opentrades.entry_id(ti)
+            strategy.close(clId, comment="max_hold")
+
+// ════════════════════════════════════════════════════════════════════════════
+// 15) TRADE VISUALIZATION (TradingView-styl Long/Short Position tool)
+// ════════════════════════════════════════════════════════════════════════════
+if uShowTrades and barstate.isconfirmed
+    int nzt = array.size(zones)
+    if nzt > 0
+        for zi = 0 to nzt - 1
+            Zone z = array.get(zones, zi)
+            if z.tradeId >= 0
+                string idTrade = f_trade_id(z.dir, z.tradeId)
+
+                // Phase 1: detect fill
+                if not z.tradeFilled
+                    int openIdx   = f_find_open(idTrade)
+                    int closedIdx = openIdx >= 0 ? -1 : f_find_closed(idTrade)
+                    if openIdx >= 0 or closedIdx >= 0
+                        int   eBar = 0
+                        float ePx  = 0.0
+                        if openIdx >= 0
+                            eBar := strategy.opentrades.entry_bar_index(openIdx)
+                            ePx  := strategy.opentrades.entry_price(openIdx)
+                        else
+                            eBar := strategy.closedtrades.entry_bar_index(closedIdx)
+                            ePx  := strategy.closedtrades.entry_price(closedIdx)
+                        z.tradeFilled := true
+                        z.entryBar    := eBar
+                        z.entryPxAct  := ePx
+                        z.status      := STATUS_FILLED
+
+                        int tEntry = f_time_at_bar(eBar)
+                        int tNow   = time
+                        if not na(tEntry) and not na(z.slPx) and not na(z.tpPx)
+                            color tpC = color.new(uTradeColTp, uTradeAlphaTp)
+                            color slC = color.new(uTradeColSl, uTradeAlphaSl)
+                            float tpTop = z.dir == 1 ? z.tpPx : ePx
+                            float tpBot = z.dir == 1 ? ePx    : z.tpPx
+                            float slTop = z.dir == 1 ? ePx    : z.slPx
+                            float slBot = z.dir == 1 ? z.slPx : ePx
+                            z.boxTp := box.new(left=tEntry, top=tpTop, right=tNow, bottom=tpBot,
+                                 xloc=xloc.bar_time, bgcolor=tpC,
+                                 border_color=color.new(uTradeColTp, 50), border_width=1, border_style=line.style_solid)
+                            z.boxSl := box.new(left=tEntry, top=slTop, right=tNow, bottom=slBot,
+                                 xloc=xloc.bar_time, bgcolor=slC,
+                                 border_color=color.new(uTradeColSl, 50), border_width=1, border_style=line.style_solid)
+                            z.lineEntry := line.new(tEntry, ePx, tNow, ePx,
+                                 xloc=xloc.bar_time, color=uTradeColEntry, width=2, style=line.style_solid)
+
+                        // Fill+close ve stejném baru
+                        if closedIdx >= 0
+                            int   xBar = strategy.closedtrades.exit_bar_index(closedIdx)
+                            float xPx  = strategy.closedtrades.exit_price(closedIdx)
+                            string raw = strategy.closedtrades.exit_comment(closedIdx)
+                            string xReas = na(raw) or raw == "" ? "exit" : raw
+                            float pnl  = strategy.closedtrades.profit(closedIdx)
+                            z.tradeClosed := true
+                            z.exitBar     := xBar
+                            z.exitPx      := xPx
+                            z.exitReas    := xReas
+                            z.status      := STATUS_CLOSED
+                            int tExit = f_time_at_bar(xBar)
+                            if not na(tExit)
+                                if not na(z.boxTp)
+                                    box.set_right(z.boxTp, tExit)
+                                if not na(z.boxSl)
+                                    box.set_right(z.boxSl, tExit)
+                                if not na(z.lineEntry)
+                                    line.set_x2(z.lineEntry, tExit)
+                            if uShowPnLLabel
+                                float riskInt = z.riskPx
+                                if na(riskInt) or riskInt <= 0
+                                    riskInt := math.abs(ePx - z.slPx)
+                                float rMul = riskInt > 0 ? (z.dir == 1 ? (xPx - ePx) / riskInt : (ePx - xPx) / riskInt) : 0.0
+                                color lblC = rMul >= 0 ? color.new(uTradeColTp, 20) : color.new(uTradeColSl, 20)
+                                string txt = xReas + "  " + (rMul >= 0 ? "+" : "") + str.tostring(rMul, "#.##") + "R"
+                                z.labelExit := label.new(xBar, xPx, xloc=xloc.bar_index, yloc=yloc.price,
+                                     text=txt, style=label.style_label_left,
+                                     color=lblC, textcolor=color.white, size=size.tiny,
+                                     tooltip="Trade " + idTrade + "\nDir: " + (z.dir == 1 ? "LONG" : "SHORT") +
+                                           "\nEntry: " + str.tostring(ePx, "#.####") +
+                                           "\nExit:  " + str.tostring(xPx, "#.####") +
+                                           "\nReason: " + xReas +
+                                           "\nPnL: " + str.tostring(pnl, "#.##") +
+                                           "\nR: " + (rMul >= 0 ? "+" : "") + str.tostring(rMul, "#.##"))
+
+                // Phase 2: alive update / Phase 3: close detection
+                if z.tradeFilled and not z.tradeClosed
+                    int openIdx = f_find_open(idTrade)
+                    if openIdx >= 0
+                        int tNow = time
+                        if not na(z.boxTp)
+                            box.set_right(z.boxTp, tNow)
+                        if not na(z.boxSl)
+                            box.set_right(z.boxSl, tNow)
+                        if not na(z.lineEntry)
+                            line.set_x2(z.lineEntry, tNow)
+                    else
+                        int closedIdx = f_find_closed(idTrade)
+                        int xBar = bar_index
+                        float xPx = close
+                        string xReas = "exit"
+                        float pnl = 0.0
+                        if closedIdx >= 0
+                            xBar := strategy.closedtrades.exit_bar_index(closedIdx)
+                            xPx  := strategy.closedtrades.exit_price(closedIdx)
+                            string raw = strategy.closedtrades.exit_comment(closedIdx)
+                            xReas := na(raw) or raw == "" ? "exit" : raw
+                            pnl  := strategy.closedtrades.profit(closedIdx)
+                        z.tradeClosed := true
+                        z.exitBar     := xBar
+                        z.exitPx      := xPx
+                        z.exitReas    := xReas
+                        z.status      := STATUS_CLOSED
+
+                        int tExit = f_time_at_bar(xBar)
+                        if not na(tExit)
+                            if not na(z.boxTp)
+                                box.set_right(z.boxTp, tExit)
+                            if not na(z.boxSl)
+                                box.set_right(z.boxSl, tExit)
+                            if not na(z.lineEntry)
+                                line.set_x2(z.lineEntry, tExit)
+
+                        if uShowPnLLabel
+                            float ePx2 = z.entryPxAct
+                            float riskInt = z.riskPx
+                            if na(riskInt) or riskInt <= 0
+                                riskInt := math.abs(ePx2 - z.slPx)
+                            float rMul = riskInt > 0 ? (z.dir == 1 ? (xPx - ePx2) / riskInt : (ePx2 - xPx) / riskInt) : 0.0
+                            color lblC = rMul >= 0 ? color.new(uTradeColTp, 20) : color.new(uTradeColSl, 20)
+                            string txt = xReas + "  " + (rMul >= 0 ? "+" : "") + str.tostring(rMul, "#.##") + "R"
+                            z.labelExit := label.new(xBar, xPx, xloc=xloc.bar_index, yloc=yloc.price,
+                                 text=txt, style=label.style_label_left,
+                                 color=lblC, textcolor=color.white, size=size.tiny,
+                                 tooltip="Trade " + idTrade + "\nDir: " + (z.dir == 1 ? "LONG" : "SHORT") +
+                                       "\nEntry: " + str.tostring(ePx2, "#.####") +
+                                       "\nExit:  " + str.tostring(xPx, "#.####") +
+                                       "\nReason: " + xReas +
+                                       "\nPnL: " + str.tostring(pnl, "#.##") +
+                                       "\nR: " + (rMul >= 0 ? "+" : "") + str.tostring(rMul, "#.##"))
+                array.set(zones, zi, z)
+
+// ════════════════════════════════════════════════════════════════════════════
+// 16) ZONE RENDERING (sync barev podle stavu)
+// ════════════════════════════════════════════════════════════════════════════
+int nzVis = array.size(zones)
+if nzVis > 0
+    for zi = 0 to nzVis - 1
+        Zone z = array.get(zones, zi)
+        if not na(z.bx)
+            bool isDem = z.dir == 1
+            bool sideOk = (uZoneSide == "Obě") or (uZoneSide == "Demand" and isDem) or (uZoneSide == "Supply" and not isDem)
+            bool show = sideOk
+            if z.status == STATUS_INFO_ONLY
+                show := show and uShowInfo
+            else if not z.alive
+                show := show and uShowDead
+            else if not z.ready
+                show := show and uShowPending
+            if show
+                color liveColor  = isDem ? uColDemand : uColSupply
+                float aliveTrans = isDem ? color.t(uColDemand) : color.t(uColSupply)
+                float deadTrans  = math.min(100.0, aliveTrans + 12.0)
+                color deadColor  = isDem ? color.new(uColDemand, deadTrans) : color.new(uColSupply, deadTrans)
+                color borderLive = uColBorder
+                color borderDead = color.new(uColBorder, math.min(100.0, color.t(uColBorder) + 25.0))
+                color fillC = na
+                color borderC = na
+                if z.status == STATUS_INFO_ONLY
+                    fillC := uColInfoOnly
+                    borderC := color.new(uColBorder, math.min(100.0, color.t(uColBorder) + 30.0))
+                else if z.alive
+                    fillC := z.ready ? liveColor : uColPending
+                    borderC := borderLive
+                else
+                    fillC := deadColor
+                    borderC := borderDead
+                box.set_bgcolor(z.bx, fillC)
+                box.set_border_color(z.bx, borderC)
+            else
+                box.set_bgcolor(z.bx, color.new(color.gray, 100))
+                box.set_border_color(z.bx, color.new(uColBorder, 100))
+
+// ════════════════════════════════════════════════════════════════════════════
+// 17) SWING DOTS (vykreslení swingů s odlišnými barvami podle stavu)
+// ════════════════════════════════════════════════════════════════════════════
+var array<label> swingLbls = array.new_label()
+var int prevTipBar = na
+
+if barstate.isconfirmed and uShowSwings
+    int nSL = array.size(swings)
+    if nSL > 0
+        Swing tip = array.get(swings, nSL - 1)
+        if na(prevTipBar) or tip.bar != prevTipBar
+            color baseC = tip.typ == 1 ? #22c55e : #3b82f6
+            int trans = tip.state == SW_PROVISIONAL ? 70 : tip.state == SW_CONFIRMED ? 30 : 60
+            color cc = color.new(baseC, trans)
+            int tx = f_time_at_bar(tip.bar)
+            if not na(tx)
+                label lb = label.new(tx, tip.price, xloc=xloc.bar_time, yloc=yloc.price,
+                     style=label.style_circle, color=cc, size=size.tiny, text="")
+                array.push(swingLbls, lb)
+            prevTipBar := tip.bar
+        while array.size(swingLbls) > 200
+            label.delete(array.shift(swingLbls))
+
+// ════════════════════════════════════════════════════════════════════════════
+// 18) DIAGNOSTIC TABLE
+// ════════════════════════════════════════════════════════════════════════════
+var table diagTable = table.new(position=position.top_right, columns=2, rows=10,
+     bgcolor=color.new(color.black, 75),
+     border_color=color.new(color.gray, 50), border_width=1,
+     frame_color=color.new(color.gray, 30), frame_width=1)
+
+if barstate.islast and uShowTfLabel
+    int currTrend = f_classify_trend()
+    string trendTxt = currTrend == TR_UPTREND ? "UP" : currTrend == TR_DOWNTREND ? "DOWN" : "RANGE"
+    color  trendC   = currTrend == TR_UPTREND ? #16a34a : currTrend == TR_DOWNTREND ? #dc2626 : color.silver
+
+    string htfTxt = not htfReady ? "?" : htfTrendUp ? "UP" : htfTrendDown ? "DOWN" : "FLAT"
+    color  htfC   = not htfReady ? color.gray : htfTrendUp ? #16a34a : htfTrendDown ? #dc2626 : color.silver
+
+    int pendingCnt = 0
+    int aliveCnt   = 0
+    int readyCnt   = 0
+    int infoCnt    = 0
+    int nLab = array.size(zones)
+    if nLab > 0
+        for li = 0 to nLab - 1
+            Zone zL = array.get(zones, li)
+            if zL.tradeId >= 0 and not zL.tradeFilled and zL.status == STATUS_ORDER_PLACED
+                pendingCnt += 1
+            if zL.alive
+                aliveCnt += 1
+                if zL.ready
+                    readyCnt += 1
+            if zL.status == STATUS_INFO_ONLY
+                infoCnt += 1
+
+    color hdrBg = color.new(#1f2937, 60)
+    color valBg = color.new(#0f172a, 60)
+    color hdrTx = color.new(color.silver, 0)
+    color valTx = color.new(color.white,  0)
+
+    table.cell(diagTable, 0, 0, "TF",            text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 0, timeframe.period,text_color=valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 1, "Struct trend",  text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 1, trendTxt,        text_color=trendC, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 2, "HTF trend",     text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 2, htfTxt,          text_color=htfC,  text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 3, "Open / Max",    text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 3, str.tostring(strategy.opentrades) + " / " + str.tostring(uMaxConcurrent),
+         text_color=strategy.opentrades >= uMaxConcurrent ? #dc2626 : valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 4, "Closed",        text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 4, str.tostring(strategy.closedtrades), text_color=valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 5, "Pending",       text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 5, str.tostring(pendingCnt), text_color=valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 6, "Zones A/R",     text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 6, str.tostring(aliveCnt) + " / " + str.tostring(readyCnt), text_color=valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 7, "Info-only",     text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 7, str.tostring(infoCnt), text_color=infoCnt > 0 ? #a855f7 : valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    int skipRrr  = f_ctr_get(CTR_SKIP_RRR)
+    int skipSlot = f_ctr_get(CTR_SKIP_SLOT)
+    int skipQual = f_ctr_get(CTR_SKIP_QUAL)
+    table.cell(diagTable, 0, 8, "Skip RRR/Slot", text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 8, str.tostring(skipRrr) + " / " + str.tostring(skipSlot),
+         text_color=(skipRrr + skipSlot) > 0 ? #f59e0b : valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)
+    table.cell(diagTable, 0, 9, "Skip quality",  text_color=hdrTx, text_size=size.small, bgcolor=hdrBg, text_halign=text.align_left)
+    table.cell(diagTable, 1, 9, str.tostring(skipQual), text_color=skipQual > 0 ? #f59e0b : valTx, text_size=size.small, bgcolor=valBg, text_halign=text.align_right)

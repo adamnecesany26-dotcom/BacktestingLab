@@ -3,6 +3,16 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ComponentType } from "react";
 
+function minMaxSafe(values: number[]): { lo: number; hi: number } {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const v of values) {
+    if (v < lo) lo = v;
+    if (v > hi) hi = v;
+  }
+  return { lo, hi };
+}
+
 /**
  * Osa Y bez nuly: vizuálně „zoom“ kolem dat.
  * Spodní mez = nejbližší hrubší dělení pod minimum (krok ≈ ¼ řádu hodnoty, typ. u ~100k USD je krok 25k),
@@ -13,8 +23,7 @@ function computeEquityYRange(values: number[]): [number, number] {
   const finite = values.filter((v) => Number.isFinite(v));
   if (finite.length === 0) return [0, 1];
 
-  const lo = Math.min(...finite);
-  const hi = Math.max(...finite);
+  const { lo, hi } = minMaxSafe(finite);
   if (lo === hi) {
     const pad = Math.max(Math.abs(lo) * 0.02, 1);
     return [lo - pad, hi + pad];

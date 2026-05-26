@@ -1,0 +1,2499 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtesting_app — S/D zones + Swing HL + BOS (Option B spec). v1.6.0 (parity ind v1.4.11: ext pre-READY MFE obě hrany; pivot extrem v noze)
+//@version=6
+// Zóny/swingy/BOS z OHLC grafu; trend filtr může použít HTF EMA přes request.security() (jako indikátor).
+// title/shorttitle must be const strings — use optional label below for the active chart TF.
+// Backtest fill model: `process_orders_on_close=false` allows limit orders to fill on the same bar
+// when the bar's range touches the limit price (needed for long-history FX symbols).
+// NOTE: pyramiding is set >0 so users can opt into multiple concurrent trades via `Max. otevřené obchody`.
+strategy("S/D backtest (retest, 1R)", shorttitle="S/D backtest", overlay=true, format=format.price, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000, pyramiding=20, process_orders_on_close=false, initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1, margin_long=100, margin_short=100, commission_type=strategy.commission.percent, commission_value=0.0, slippage=0)
+
+float ATR_FLOOR = 0.0001
+float MIN_THRESHOLD_ATR_RATIO = 0.24
+
+// ——— Vstupy (parity indikátor v1.4.11 + Backtest) ———
+string gB = "Základ"
+string gV = "Vzhled"
+string gF = "Filtry"
+string gQ = "Kvalita zóny"
+string gQM = "Meta zóny (induce, base, MFE)"
+string gS = "Backtest"
+
+string uSwingMode = input.string("Klasické", "Swingy", options=["Klasické", "Major"], group=gB, tooltip="Stejná logika jako indikátor.")
+float uCitStrukt = input.float(0.93, "Citlivost struktury", minval=0.65, maxval=1.35, step=0.01, group=gB)
+int uBosAcceptanceBars = input.int(1, "BOS acceptance (0–5)", minval=0, maxval=5, group=gB)
+string uReadyMode = input.string("Close", "READY (odchod)", options=["Close", "Close_nebo_knot"], group=gB)
+
+color uCdem = input.color(color.new(#22c55e, 86), "Demand – výplň", group=gV)
+color uCsup = input.color(color.new(#ef4444, 86), "Supply – výplň", group=gV)
+
+bool uZPasma = input.bool(true, "Pásma D/S", group=gV)
+bool uZTecky = input.bool(true, "Tečky doteku (T)", group=gV)
+bool uZbos = input.bool(true, "Čáry BOS", group=gV)
+bool uZswing = input.bool(false, "Body swingů", group=gV)
+bool uZtf = input.bool(true, "TF label vpravo", group=gV)
+bool uDebugOverlay = input.bool(false, "Debug overlay", group=gV)
+bool uDebugMarkOrders = input.bool(false, "Debug: značka E u příkazu", group=gV)
+int inpTouchLabelMaxBars = input.int(0, "Štítky zón: max. od pravého kraje (bary, 0=vše)", minval=0, maxval=20000, group=gV, tooltip="P, debug, chop/far/end, kontaminace; 0 = celá viditelná historie.")
+
+string uZoneSide = input.string("Obě", "Generovat zóny", options=["Obě", "Demand", "Supply"], group=gF)
+bool uAlignWithTrend = input.bool(false, "Jen ve směru trendu", group=gF)
+string uTrendSource = input.string("Proxy (aktuální TF)", "Trend", options=["Proxy (aktuální TF)", "HTF EMA (request.security)"], group=gF)
+string uHtfTf = input.timeframe("240", "HTF (jen HTF trend)", group=gF)
+int uTrendEmaLen = input.int(200, "EMA délka", minval=20, maxval=600, group=gF)
+
+string uTouchPreset = input.string("Vyvážený", "Dotek po READY", options=["Citlivý (overlap)", "Vyvážený", "Přísný"], group=gF)
+bool uTouchRequirePriorOutside = uTouchPreset != "Citlivý (overlap)"
+bool uTouchStrictOutsidePrevBar = uTouchPreset == "Přísný"
+bool uTouchRequireEdgeCross = uTouchPreset != "Citlivý (overlap)"
+
+float uNearTouchPadAtr = input.float(0.15, "Near-touch pásmo (×ATR)", minval=0.0, maxval=2.0, step=0.05, group=gF, tooltip="0=vyp. Po READY: málem-dotek u hrany → silný odchod (viz další vstup).")
+float uNearTouchStrongDepartAtr = input.float(0.35, "Near-touch: silný odchod (×ATR)", minval=0.0, maxval=3.0, step=0.05, group=gF, tooltip="Po málem-doteku close/knot musí zajet za hranou o ×ATR. 0 = jen přes hranou.")
+
+bool inpContaminationEnabled = input.bool(true, "Kontaminace: odchod+návrat před READY → konec", group=gF, tooltip="Departure viz prahy níže → návrat (pomalý překryv / near-touch pásmo) před READY: zóna ihned končí (end 12).")
+float uContamOverlapMaxFrac = input.float(0.30, "Kont.: A1 max. překryv range se zónou", minval=0.0, maxval=1.0, step=0.05, group=gF, tooltip="Momentum svíčka: jen pokud poměr překryvu range se zónou ≤ (větší část mimo).")
+float uContamMomentumMinMult = input.float(0.60, "Kont.: A1 min. range / ATR", minval=0.0, maxval=5.0, step=0.05, group=gF)
+float uContamBodyMinFrac = input.float(0.45, "Kont.: A1 min. |body| / range", minval=0.0, maxval=1.0, step=0.05, group=gF)
+int uContamBarsOutsideMin = input.int(2, "Kont.: A2 bary řadě nad/pod zónou", minval=1, maxval=20, group=gF)
+float uContamFullBarAvgMult = input.float(1.0, "Kont.: A3 range / sma(range)", minval=0.2, maxval=5.0, step=0.05, group=gF)
+int uContamAvgRl = input.int(14, "Kont.: A3 sma délka (range)", minval=1, maxval=100, group=gF)
+int uContamReturnBarsMin = input.int(2, "Kont.: B1 min. překryvů za sebou", minval=1, maxval=20, group=gF)
+bool inpDebugContamination = input.bool(false, "Debug štítek kontaminace", group=gV)
+
+float uMinZoneHeightAtr = input.float(0.28, "Min. výška zóny (×ATR)", minval=0.0, maxval=3.0, step=0.02, group=gQ)
+int uMinBaseLen = input.int(3, "Min. délka base (bary)", minval=1, maxval=20, group=gQ)
+float uMajorImpulseAtr = input.float(2.0, "Major impuls zóny (×ATR)", minval=0.5, maxval=10.0, step=0.1, group=gQ)
+
+bool uInstEnabled = input.bool(true, "Institucionální režim (+ skóre)", group=gQ, tooltip="Skóre, únik/BOS při vzniku zóny, READY/arrival — jako indikátor.")
+float uMinZoneScoreCreate = input.float(0.55, "Min. score při vzniku zóny", minval=0.0, maxval=1.0, step=0.01, group=gQ)
+float uDepMinMoveAtr = input.float(1.25, "Min. únik od pivotu k BOS (×ATR)", minval=0.0, maxval=20.0, step=0.05, group=gQ, tooltip="Jen pokud je zapnutý institucionální režim. 0 = nevynucovat.")
+float uDepMinBodyRatio = input.float(0.62, "Min. podíl těla u BOS", minval=0.0, maxval=1.0, step=0.02, group=gQ)
+
+bool uUsePremiumDiscount = input.bool(false, "Premium/discount (filtr podle swingů)", group=gQ, tooltip="Demand jen níže od „midu“ struktury; supply jen výše.")
+float uPDPadAtr = input.float(0.0, "P/D odsazení od midu (×ATR)", minval=0.0, maxval=10.0, step=0.05, group=gQ)
+
+int uMetaMinBaseLen = input.int(0, "Min. délka base (0=vyp.)", minval=0, maxval=80, group=gQM)
+int uMetaMaxBaseLen = input.int(0, "Max. délka base (0=vyp.)", minval=0, maxval=80, group=gQM)
+float uMetaMinBosImpulseAtr = input.float(0.0, "Min. impuls od pivotu meta (×ATR)", minval=0.0, maxval=20.0, step=0.05, group=gQM, tooltip="0 = vyp.")
+float uMetaMinMfeReadyAtr = input.float(0.0, "Min. MFE po READY pro obchod (×ATR)", minval=0.0, maxval=20.0, step=0.05, group=gQM, tooltip="0 = vyp.")
+
+string uMetaInduceFilter = input.string("Vypnuto", "Inducement", options=["Vypnuto", "Jen se inducementem", "Jen inducement nahoře", "Jen inducement dole", "Bez inducement nahoře", "Bez inducement dole"], group=gQM)
+int uInduceSwingLookback = input.int(10, "Swingů zpět", minval=1, maxval=80, group=gQM)
+float uInducePadAtr = input.float(0.55, "Pásmo u hrany (×ATR)", minval=0.0, maxval=5.0, step=0.05, group=gQM)
+
+string uEntryConfirm = input.string("Pinbar", "Potvrzení vstupu", options=["Off", "Pinbar", "Engulf"], group=gS, tooltip="Vstup jen při doteku hrany zóny (viz kód); volitelně Pinbar/Engulf na bar[1].")
+int uEntryTimeoutBars = input.int(24, "Timeout limitu po READY (bary)", minval=0, maxval=2000, group=gS)
+float inpStratSlMult = input.float(1.20, "Zarážka: násobitel výšky pásma (od hrany, 1.0 = u hrany, 1.2 = 20 % buffer mimo pásme)", minval=1.0, maxval=3.0, step=0.01, group=gS, tooltip="Stop: u poptávky pod dno, u nabídky nad vrchol pásma, plus (násobitel−1) × výška pásma.")
+float inpStratR = input.float(1.0, "Cíl v R (zisk = násobek vzdálenosti entry–stop)", minval=0.1, maxval=20.0, step=0.1, group=gS, tooltip="Objednávka take-profit: R× riziko od vstupu (close).")
+float inpStratQty = input.float(1.0, "Množství u vstupu (0 = 1; zvyš, pokud broker vyžaduje větší lot)", minval=0.0, maxval=1e7, step=0.1, group=gS, tooltip="Pevné množství na příkaz. 0 vnitřně nahradíme 1,0 jednotkou.")
+int inpStratMaxHoldBars = input.int(0, "Max. držení (bary, 0 = vypnuto)", minval=0, maxval=200000, group=gS, tooltip="Bez tohoto může jeden trade zůstat otevřený roky a zablokovat nové vstupy (pyramiding=0). Pokud >0, po N barech se pozice ukončí na market.")
+string inpStratFillMode = input.string("Limit (resting)", "Fill model", options=["Limit (resting)", "Assume fill on touch"], group=gS, tooltip="Limit (resting) = pokládáme limit na edge po READY a čekáme na fill. Assume fill on touch = pokud svíčka protne edge, vezmeme obchod jako vyplněný na edge (spolehlivé na dlouhé historii, méně realistické).")
+int inpStratMaxOpenTrades = input.int(1, "Max. otevřené obchody (1 = bez souběhu)", minval=1, maxval=20, group=gS, tooltip="Pokud je 1 a zároveň je jeden obchod otevřený dlouho (TP/SL netrefí), backtest udělá jen pár obchodů za desítky let. Zvyš pro testování více retestů; vyžaduje pyramiding>0 (nastaveno).")
+
+bool allowWickReady = uReadyMode == "Close_nebo_knot"
+
+// --- Interní konstanty (parity indikátor v1.4.x) ---
+float uTrendNeutralBandAtr = 0.0
+float uMaxChopDensity = 0.70
+int uMajorSwingLookback = 12
+float uDepMinCloseAtr = 0.35
+int uArrivalLookback = 6
+float uArrivalMaxAtr = 1.35
+float uArrivalMaxLastBarRangeAtr = 1.30
+
+// --- Ostatní skryté „knoflíky“: pevné defaulty „Vyvážené“ (dříve Volné/Přísné menu) ---
+float inpSensitivity = uCitStrukt
+float inpAtrMult = 1.44
+float inpSwingSpacing = 1.0
+color inpColSwingHigh = color.new(#22c55e, 65)
+color inpColSwingLow = color.new(#3b82f6, 65)
+int inpBosWidth = 1
+string inpBosStyle = "Dashed"
+int inpBosMaxLookbackSwings = 20
+string inpBosPivotPick = "extreme"
+int inpAcceptanceBars = uBosAcceptanceBars
+int inpBosPivotClusterMaxBars = 6
+float inpBosPivotClusterAtrMult = 0.25
+color inpDemandFill = uCdem
+color inpSupplyFill = uCsup
+color inpZoneBorder = color.new(#facc15, 35)
+color inpColBos = color.new(#f59e0b, 0)
+color inpTouchCol = color.new(#f59e0b, 0)
+color inpPendingFill = color.new(#94a3b8, 86)
+color inpPendingBorder = color.new(#94a3b8, 58)
+float inpZoneBorderW = 2.5
+string inpZoneXLoc = "bar_time"
+bool inpDebugRelaxZoneFilters = false
+string inpDemandZoneMode = "wick_to_body"
+string inpSupplyZoneMode = "wick_to_body"
+float inpBaseBarRangeInZoneMin = 0.38
+float inpBaseBodyInZoneMin = 0.60
+int inpSdZoneMaxBaseBars = 15
+int inpSdZoneMaxChopOverlapBars = 18
+float inpSdZoneChopOverlapMin = 0.30
+bool inpDropYoungNearDominant = true
+int inpDominantMinBase = 4
+float inpYoungNearDominantMaxAtr = 1.25
+int inpYoungDominantMaxPivotGap = 400
+int inpMaxAliveZones = 6
+int inpMaxZoneLifeBars = 240
+int inpMajorZoneExemptBase = 6
+int inpMinPivotBarsGap = 48
+int inpMinBarsBetweenSame = 7
+float inpZonePriceOverlap = 0.25
+int inpZoneNearDupMaxPivotGap = 20
+float inpZoneNearDupMinOl = 0.18
+float inpZoneNearDupGapAtr = 0.45
+bool inpZoneFarInvalidateEnabled = true
+// Daleko od zóny: větší ×ATR + více barů v řadě ⇒ tolerantnější než dřív (5 / 15 barů).
+int inpZoneFarInvBars = 28
+float inpZoneFarInvAtr = 10.0
+float inpZoneMajorProtectAtr = 2.5
+bool inpRequirePivotSweep = false
+float inpPivotSweepMinAtr = 0.25
+int inpPivotSweepLookback = 220
+int inpSdDepartureMinBarsAfterPivot = 1
+bool inpRetestStraddleEdgeOnly = false
+bool inpFarProtectNearMajor = false
+
+bool inpShowZones = uZPasma
+bool inpShowTouch = uZTecky
+bool inpShowBos = uZbos
+bool inpShowSwings = uZswing
+bool inpShowChartTfLabel = uZtf
+bool inpYScalePlots = true
+int inpMaxConsEntries = 320
+bool inpDebug = uDebugOverlay
+bool inpDebugPivot = uDebugOverlay
+bool inpDebugEnd = uDebugOverlay
+
+// Debug counters (help isolate: READY missing vs order not placed vs fill issues)
+var int dbgReadyCnt = 0
+var int dbgOrderCnt = 0
+var int dbgFillCnt = 0
+var int dbgLastPos = 0
+var int dbgOrderAttemptCnt = 0
+
+// Debug series (readable anywhere via Data Window / hover)
+plot(inpDebug ? float(dbgReadyCnt) : na, title="dbg_ready_count", display=display.data_window, editable=false)
+plot(inpDebug ? float(dbgOrderAttemptCnt) : na, title="dbg_order_attempts", display=display.data_window, editable=false)
+plot(inpDebug ? float(dbgOrderCnt) : na, title="dbg_order_count", display=display.data_window, editable=false)
+plot(inpDebug ? float(dbgFillCnt) : na, title="dbg_fill_count", display=display.data_window, editable=false)
+
+// MAX_VISIBLE (~504): jen BOS čar; zónové štítky přes dbgZoneScope (= touchLabelScope).
+int MAX_VISIBLE_BARS = 504
+bool drawScope = last_bar_index - bar_index < MAX_VISIBLE_BARS
+bool touchLabelScope = inpTouchLabelMaxBars == 0 ? true : (last_bar_index - bar_index < inpTouchLabelMaxBars)
+bool dbgZoneScope = touchLabelScope
+
+// Společné Y: nikdy `na` (TV pak nemá ancoru) — vypnutá kotva = 99% alfa, data stejná.
+float yScaleAlpha = inpYScalePlots ? 92.0 : 99.0
+color yHi = color.new(color.silver, yScaleAlpha)
+color yLo = color.new(color.silver, yScaleAlpha)
+color yC = color.new(color.silver, yScaleAlpha)
+plot(high,  title="(Y hi, scale)", color=yHi, linewidth=1, style=plot.style_line, display=display.all, editable=false)
+plot(low,   title="(Y lo, scale)", color=yLo, linewidth=1, style=plot.style_line, display=display.all, editable=false)
+plot(close, title="(Y c,  scale)", color=yC, linewidth=1, style=plot.style_line, display=display.all, editable=false)
+
+f_vis_fill(bool show, bool isDemand) =>
+    show ? (isDemand ? inpDemandFill : inpSupplyFill) : color.new(#787b86, 100)
+
+f_vis_border(bool show) =>
+    show ? inpZoneBorder : color.new(inpZoneBorder, 100)
+
+f_safe_atr(float a) =>
+    na(a) or a <= ATR_FLOOR ? ATR_FLOOR : a
+
+f_ext_pre_ready_atr(int zd, float hi, float lo, float zlBox, float zhBox, float depAtr) =>
+    float d = depAtr <= ATR_FLOOR ? ATR_FLOOR : depAtr
+    float out = 0.0
+    if zd == 1
+        float a = hi > zhBox ? (hi - zhBox) / d : 0.0
+        float b = hi > zlBox ? (hi - zlBox) / d : 0.0
+        out := math.max(a, b)
+    else
+        float c = lo < zlBox ? (zlBox - lo) / d : 0.0
+        float e = lo < zhBox ? (zhBox - lo) / d : 0.0
+        out := math.max(c, e)
+    out
+
+f_clamp01(float x) =>
+    x < 0 ? 0.0 : x > 1 ? 1.0 : x
+
+f_meta_show_ok(bool isReady, int baseLen, float mfeAtr, float bosImpAtr, int induceFlags) =>
+    bool okB0 = uMetaMinBaseLen <= 0 or baseLen >= uMetaMinBaseLen
+    bool okB1 = uMetaMaxBaseLen <= 0 or baseLen <= uMetaMaxBaseLen
+    bool okBi = uMetaMinBosImpulseAtr <= 0 or bosImpAtr >= uMetaMinBosImpulseAtr
+    bool okMfe = uMetaMinMfeReadyAtr <= 0 or (not isReady) or (mfeAtr >= uMetaMinMfeReadyAtr)
+    bool hasAbove = (induceFlags % 2) != 0
+    bool hasBelow = (math.floor(induceFlags / 2) % 2) != 0
+    bool indOk = true
+    if uMetaInduceFilter == "Jen se inducementem"
+        indOk := induceFlags != 0
+    else if uMetaInduceFilter == "Jen inducement nahoře"
+        indOk := hasAbove
+    else if uMetaInduceFilter == "Jen inducement dole"
+        indOk := hasBelow
+    else if uMetaInduceFilter == "Bez inducement nahoře"
+        indOk := not hasAbove
+    else if uMetaInduceFilter == "Bez inducement dole"
+        indOk := not hasBelow
+    okB0 and okB1 and okBi and okMfe and indOk
+
+f_zone_score(float depMoveAtr, int baseLen, float chopDensity, bool isMajor) =>
+    float sDep = f_clamp01(depMoveAtr / 3.0)
+    float sBase = f_clamp01((float(baseLen) - 2.0) / 6.0)
+    float sChop = f_clamp01(1.0 - chopDensity)
+    float sMaj = isMajor ? 0.10 : 0.0
+    f_clamp01(0.55 * sDep + 0.25 * sBase + 0.20 * sChop + sMaj)
+
+f_body_ratio_at_off(int off) =>
+    float rng = high[off] - low[off]
+    rng <= 0 ? 0.0 : math.abs(close[off] - open[off]) / rng
+
+f_round_tick(float p) =>
+    float t = syminfo.mintick
+    t <= 0 ? p : (math.round(p / t) * t)
+
+f_touch_tip(string kind, float px) =>
+    str.format_time(time, "yyyy-MM-dd", syminfo.timezone) + " · " + kind + " · " + str.tostring(px, format.mintick)
+
+f_dbg_tip(string kind, int piv, float zl, float zh) =>
+    str.format_time(time, "yyyy-MM-dd", syminfo.timezone) + " · " + kind + " · piv=" + str.tostring(piv) + " · [" + str.tostring(zl, format.mintick) + ", " + str.tostring(zh, format.mintick) + "]"
+
+tfKey() =>
+    // v6: timeframe.period always includes a multiplier (e.g. "1D" not "D"); keep legacy aliases.
+    string p = timeframe.period
+    p == "1" or p == "3" or p == "5" or p == "15" or p == "45" ? "30m" :
+     p == "30" ? "30m" :
+     p == "60" ? "1h" :
+     p == "120" ? "2h" :
+     p == "240" ? "4h" :
+     p == "D" or p == "1D" ? "1d" :
+     p == "W" or p == "1W" ? "1w" :
+     p == "M" or p == "1M" ? "1M" : "1h"
+
+presetAtrPeriod() =>
+    string k = tfKey()
+    k == "30m" ? 24 :
+     k == "1h" ? 17 :
+     k == "2h" ? 15 :
+     k == "4h" ? 13 :
+     k == "1d" ? 10 :
+     k == "1w" ? 8 :
+     k == "1M" ? 6 : 17
+
+presetMinBars() =>
+    string k = tfKey()
+    k == "30m" ? 6 :
+     k == "1h" ? 5 :
+     k == "2h" ? 5 :
+     k == "4h" ? 6 :
+     k == "1d" ? 4 :
+     k == "1w" ? 4 :
+     k == "1M" ? 3 : 5
+
+presetTimeConfirm() =>
+    string k = tfKey()
+    k == "1h" ? 6 :
+     k == "2h" ? 5 :
+     k == "4h" ? 5 :
+     k == "1d" ? 4 :
+     k == "1w" ? 3 :
+     k == "1M" ? 2 : 0
+
+presetAltAfter() =>
+    string k = tfKey()
+    k == "1h" ? 10 : k == "4h" ? 6 : 0
+
+presetAltFrac() =>
+    string k = tfKey()
+    k == "1h" ? 0.80 : k == "4h" ? 0.75 : 0.0
+
+lineStyleFrom(string s) =>
+    s == "Solid" ? line.style_solid : s == "Dotted" ? line.style_dotted : line.style_dashed
+
+float sp = math.max(0.35, math.min(inpSwingSpacing, 5.0))
+int mb0 = math.max(presetMinBars(), 2)
+int effMinBars = math.max(2, int(math.round(mb0 * sp)))
+float atrBump = 1.0 + 0.06 * math.max(0.0, sp - 1.0)
+float effAtrMult = math.min(3.5, inpAtrMult * atrBump)
+int effAtrPeriod = presetAtrPeriod()
+float effMinPull = 0.58
+int effTimeConfirm = presetTimeConfirm()
+int effAltAfter = presetAltAfter()
+float effAltFrac = presetAltFrac()
+float sensitivity = math.max(0.5, inpSensitivity)
+bool swingModeMajor = uSwingMode == "Major"
+
+atrVal = ta.atr(effAtrPeriod)
+
+// --- Trend filtr (volitelný; stejně jako indikátor) ---
+float _emaProxy = ta.ema(close, uTrendEmaLen)
+bool useHtfTrend = uTrendSource == "HTF EMA (request.security)"
+float trPx = close
+float trEma = _emaProxy
+float trAtrBand = atrVal
+if useHtfTrend
+    trPx := request.security(syminfo.tickerid, uHtfTf, close, barmerge.gaps_off, barmerge.lookahead_off)
+    trEma := request.security(syminfo.tickerid, uHtfTf, ta.ema(close, uTrendEmaLen), barmerge.gaps_off, barmerge.lookahead_off)
+    float htfA = request.security(syminfo.tickerid, uHtfTf, ta.atr(14), barmerge.gaps_off, barmerge.lookahead_off)
+    trAtrBand := na(htfA) or htfA <= ATR_FLOOR ? ATR_FLOOR : htfA
+
+float nbTr = uTrendNeutralBandAtr
+float trendBandPx = nbTr > 0 ? nbTr * trAtrBand : 0.0
+bool trendNeutralChop = nbTr > 0 and math.abs(trPx - trEma) <= trendBandPx
+bool trendSideDemand = nbTr > 0 ? (trendNeutralChop or trPx > trEma + trendBandPx) : (trPx >= trEma)
+bool trendSideSupply = nbTr > 0 ? (trendNeutralChop or trPx < trEma - trendBandPx) : (trPx <= trEma)
+
+bool allowDemand = (uZoneSide == "Obě" or uZoneSide == "Demand") and (not uAlignWithTrend or trendSideDemand)
+bool allowSupply = (uZoneSide == "Obě" or uZoneSide == "Supply") and (not uAlignWithTrend or trendSideSupply)
+
+// --- S/D zóny: zarovnání s examples/sd_zones.py (VIEW / _VIEW_PARAMS_INTERNAL) ---
+float SD_MAX_PIVOT_RANGE_ATR = 7.5
+float SD_CAP_ATR_GENERIC = 3.0
+float SD_CAP_ATR_SUPPLY = 1.75
+float SD_CAP_ATR_DEMAND = 0.0
+float SD_OVERLAP_TRIM = 0.68
+// get_zones: _compute_zone_width left-extend (chop count span), not base_width range/body
+float SD_ZONE_LEFT_CHOP_EXT_RANGE = 0.33
+float SD_ZONE_LEFT_CHOP_EXT_BODY  = 0.10
+
+f_atr_at_pivot(int pivBar) =>
+    int rel = bar_index - pivBar
+    float a = rel >= 0 ? atrVal[rel] : atrVal[0]
+    na(a) or a <= ATR_FLOOR ? ATR_FLOOR : a
+
+f_atr_at_index(int ix) =>
+    // Safe ATR at absolute bar index `ix` (0..bar_index). Avoids calling f_atr_at_pivot in nested scopes.
+    int rel = bar_index - ix
+    float a = rel >= 0 ? atrVal[rel] : atrVal[0]
+    na(a) or a <= ATR_FLOOR ? ATR_FLOOR : a
+
+f_atr_for_pivot_reg_filters(int pivBar) =>
+    // Match examples/sd_zones.py: max_pivot_candle_range_atr uses ATR at pivot's *previous* bar.
+    // For pivBar==0, fall back to ATR on bar 0.
+    f_atr_at_index(math.max(0, pivBar - 1))
+
+f_zone_x_time() =>
+    inpZoneXLoc == "bar_time"
+
+f_zone_x_at_bar(int bix) =>
+    // bix = absolutní index baru (0..bar_index). Nikdy mimo: záporný time[] nebo bix>bar_index dá
+    // na bar_time chybné/NA souřadnice a boxy můžou „jít do nekonečna“ doprava v široké historii.
+    int c = int(math.max(0, math.min(bix, bar_index)))
+    f_zone_x_time() ? time[bar_index - c] : c
+
+f_box_set_xright(box b, int bix) =>
+    box.set_right(b, f_zone_x_at_bar(bix))
+
+f_vertical_overlap_ratio(float aLo, float aHi, float bLo, float bHi) =>
+    float o = math.min(aHi, bHi) - math.max(aLo, bLo)
+    if o <= 0
+        0.0
+    else
+        float h1 = aHi - aLo
+        float h2 = bHi - bLo
+        float sm = math.min(h1, h2)
+        sm <= 0 ? 0.0 : o / sm
+
+f_vertical_price_gap(float aLo, float aHi, float bLo, float bHi) =>
+    // Positive gap between disjoint intervals; 0 if they overlap
+    if math.min(aHi, bHi) >= math.max(aLo, bLo)
+        0.0
+    else
+        aHi < bLo ? (bLo - aHi) : (aLo - bHi)
+
+f_ranges_overlap(float aLo, float aHi, float bLo, float bHi) =>
+    math.min(aHi, bHi) >= math.max(aLo, bLo)
+
+// Klastr zón (kill / touch sync): stejný typ + cena „patří k sobě“ — tvrdý překryv může selhat u přilehlých
+// pásem (dno horní = vršek dolní) nebo o 1–2 ticky kvůli float. Dilatace kolem pásma, pak průsečík.
+f_ranges_overlap_cluster(float aLo, float aHi, float bLo, float bHi) =>
+    float dil = syminfo.mintick * 6.0
+    float al = math.min(aLo, aHi) - dil
+    float ah = math.max(aLo, aHi) + dil
+    float bl = math.min(bLo, bHi) - dil
+    float bh = math.max(bLo, bHi) + dil
+    math.min(ah, bh) >= math.max(al, bl)
+
+// Striktní překryv ceny (kladná plocha), ne jen dotyk hran
+f_price_overlap_strict(float aLo, float aHi, float bLo, float bHi) =>
+    math.min(aHi, bHi) > math.max(aLo, bLo)
+
+f_edge_gap(float aLo, float aHi, float bLo, float bHi) =>
+    // Like sd_zones.py _vertical_price_gap_between_boxes: positive gap if disjoint, else 0.
+    math.min(aHi, bHi) >= math.max(aLo, bLo) ? 0.0 : (aHi < bLo ? (bLo - aHi) : (aLo - bHi))
+
+f_zone_is_dominant(int baseLen) =>
+    inpDominantMinBase > 0 and baseLen >= inpDominantMinBase
+
+f_should_drop_young_near_dominant(int youngPivot, float youngLo, float youngHi, int youngBaseLen, int oldPivot, float oldLo, float oldHi, int oldBaseLen, float atrYoung) =>
+    // Approx port of sd_zones.py drop_young_near_dominant_enabled (without true is_major).
+    // Drop young if older is dominant and young is not, pivots close enough, and price gap <= max_atr*ATR.
+    if not inpDropYoungNearDominant
+        false
+    else if atrYoung <= ATR_FLOOR
+        false
+    else
+        bool oldDom = f_zone_is_dominant(oldBaseLen)
+        bool youngDom = f_zone_is_dominant(youngBaseLen)
+        bool pivOk = math.abs(youngPivot - oldPivot) <= inpYoungDominantMaxPivotGap
+        float gap = f_edge_gap(youngLo, youngHi, oldLo, oldHi)
+        oldDom and not youngDom and pivOk and gap <= inpYoungNearDominantMaxAtr * atrYoung
+
+f_zone_bounds_from_pivot(int pivotOff, int zoneDir, string mode) =>
+    float lo = low[pivotOff]
+    float hi = high[pivotOff]
+    float op = open[pivotOff]
+    float cl = close[pivotOff]
+    float bodyLow = math.min(op, cl)
+    float bodyHigh = math.max(op, cl)
+    string m = str.lower(str.trim(mode))
+    if m != "wick_to_body" and m != "full" and m != "body_only" and m != "refined"
+        m := "wick_to_body"
+    if m == "full"
+        [lo, hi]
+    else if m == "body_only"
+        [bodyLow, bodyHigh]
+    else if m == "wick_to_body"
+        if zoneDir == 1
+            [lo, bodyHigh]
+        else
+            [bodyLow, hi]
+    else
+        // refined: match examples/sd_zones.py _zone_bounds_from_pivot (approx)
+        if zoneDir == 1
+            if cl >= op
+                [lo, cl]
+            else
+                [lo, bodyHigh]
+        else
+            if cl <= op
+                [cl, hi]
+            else
+                [bodyLow, hi]
+
+f_bar_overlap_ratio(float barHi, float barLo, float zLoV, float zHiV) =>
+    float rng = barHi - barLo
+    if rng <= 0
+        0.0
+    else
+        float ol = math.max(zLoV, barLo)
+        float oh = math.min(zHiV, barHi)
+        float olen = math.max(0.0, oh - ol)
+        olen / rng
+
+f_depart_outside_ratio(int zoneDir, float barLo, float barHi, float zLoV, float zHiV) =>
+    float rng = barHi - barLo
+    if rng <= 0
+        0.0
+    else
+        // Correct direction: Demand -> above zone_high; Supply -> below zone_low
+        float outLen = zoneDir == 1 ? math.max(0.0, barHi - math.max(barLo, zHiV)) : math.max(0.0, math.min(barHi, zLoV) - barLo)
+        outLen / rng
+
+f_bar_body_overlap_ratio(float op, float cl, float zLoV, float zHiV) =>
+    float bLo = math.min(op, cl)
+    float bHi = math.max(op, cl)
+    float blen = bHi - bLo
+    if blen <= 0
+        f_bar_overlap_ratio(math.max(op, cl), math.min(op, cl), zLoV, zHiV)
+    else
+        float ol = math.max(zLoV, bLo)
+        float oh = math.min(zHiV, bHi)
+        float olen = math.max(0.0, oh - ol)
+        olen / blen
+
+f_base_width(int pivotBar, float zLoV, float zHiV) =>
+    float thrR = inpBaseBarRangeInZoneMin
+    float thrB = inpBaseBodyInZoneMin
+    int left = pivotBar
+    int right = pivotBar
+    // expand left
+    for j = 1 to 120
+        int b = pivotBar - j
+        if b < 0
+            break
+        int off = bar_index - b
+        float r = f_bar_overlap_ratio(high[off], low[off], zLoV, zHiV)
+        float br = f_bar_body_overlap_ratio(open[off], close[off], zLoV, zHiV)
+        bool ok = (r >= thrR) and (br >= thrB or math.abs(close[off] - open[off]) <= syminfo.mintick)
+        if ok
+            left := b
+        else
+            break
+    // expand right up to current bar
+    for j = 1 to 120
+        int b = pivotBar + j
+        if b > bar_index
+            break
+        int off = bar_index - b
+        float r = f_bar_overlap_ratio(high[off], low[off], zLoV, zHiV)
+        float br = f_bar_body_overlap_ratio(open[off], close[off], zLoV, zHiV)
+        bool ok = (r >= thrR) and (br >= thrB or math.abs(close[off] - open[off]) <= syminfo.mintick)
+        if ok
+            right := b
+        else
+            break
+    [left, right, right - left + 1]
+
+// Jako _compute_zone_width: levý okraj pásma pro spočtení „heavy chop“ (sd_zones.get_zones chop count)
+f_compute_zone_leftmost_chop(int pivotBar, float zLoV, float zHiV) =>
+    int left = pivotBar
+    for j = 1 to 500
+        int b = pivotBar - j
+        if b < 0
+            break
+        int off = bar_index - b
+        if off < 0
+            break
+        float bHi = high[off]
+        float bLo = low[off]
+        float rng = bHi - bLo
+        if rng <= 0.0
+            continue
+        float ol = math.max(zLoV, bLo)
+        float oh = math.min(zHiV, bHi)
+        float olen = math.max(0.0, oh - ol)
+        float ratio = olen / rng
+        if ratio < SD_ZONE_LEFT_CHOP_EXT_RANGE
+            break
+        float op_ = open[off]
+        float cl_ = close[off]
+        float bdyLo = math.min(op_, cl_)
+        float bdyHi = math.max(op_, cl_)
+        float blen = bdyHi - bdyLo
+        if blen > 0.0
+            float bol = math.max(zLoV, bdyLo)
+            float boh = math.min(zHiV, bdyHi)
+            float bov = math.max(0.0, boh - bol)
+            float brat = bov / blen
+            if brat < SD_ZONE_LEFT_CHOP_EXT_BODY
+                break
+        left := b
+    left
+
+// Jako _count_bars_heavy_zone_overlap(ohlc, i_start, i_end, ...)
+f_count_bars_heavy_chop(int iStart, int iEnd, float zl, float zh) =>
+    if zh - zl <= 0.0
+        0
+    else
+        int a = int(math.min(iStart, iEnd))
+        int b_ = int(math.max(iStart, iEnd))
+        if a < 0
+            a := 0
+        if b_ > bar_index
+            b_ := int(bar_index)
+        int span = b_ - a + 1
+        int cnt = 0
+        if span > 0
+            for t = 0 to span - 1
+                int barIx = a + t
+                if barIx < 0 or barIx > bar_index
+                    continue
+                int o = bar_index - barIx
+                if f_bar_overlap_ratio(high[o], low[o], zl, zh) >= inpSdZoneChopOverlapMin
+                    cnt += 1
+        cnt
+
+// Jako _zones_overlap: podobný čas (|pivoty|) + překryv délky ≥ práh vůči menší z výšek
+f_zones_overlap_px(float z1l, float z1h, int p1, float z2l, float z2h, int p2) =>
+    if math.abs(p1 - p2) > inpMinBarsBetweenSame
+        false
+    else
+        float ol = math.max(z1l, z2l)
+        float oh = math.min(z1h, z2h)
+        float olen = math.max(0.0, oh - ol)
+        float r1 = z1h - z1l
+        float r2 = z2h - z2l
+        r1 <= 0 or r2 <= 0 ? olen > 0 : olen / r1 >= inpZonePriceOverlap or olen / r2 >= inpZonePriceOverlap
+
+// Jako _clamp_pivot_zone_height
+f_clamp_pivot_h(float zl, float zh, bool isDemand, float atrp) =>
+    float capAtr = isDemand ? (SD_CAP_ATR_DEMAND > 0 ? SD_CAP_ATR_DEMAND : SD_CAP_ATR_GENERIC) : (SD_CAP_ATR_SUPPLY > 0 ? SD_CAP_ATR_SUPPLY : SD_CAP_ATR_GENERIC)
+    if capAtr <= 0 or atrp <= ATR_FLOOR
+        [zl, zh]
+    else
+        float capW = capAtr * atrp
+        float h = zh - zl
+        if h <= capW
+            [zl, zh]
+        else
+            if isDemand
+                [zl, zl + capW]
+            else
+                [zh - capW, zh]
+
+var float candHigh = na
+var int candHighIdx = na
+var float candLow = na
+var int candLowIdx = na
+var int lastSwingIdx = -1000000000
+var string lastSwingType = na
+
+var array<float> swingPx = array.new_float()
+var array<int> swingBar = array.new_int()
+var array<int> swingTyp = array.new_int()
+
+// Definice až po swing* polích (get_zones pivot_sweep_*)
+f_pivot_swept_demand(int pivBar, float pivotLow, float atrP) =>
+    if not inpRequirePivotSweep
+        true
+    else
+        int lb0 = int(math.max(0, pivBar - inpPivotSweepLookback))
+        float need = inpPivotSweepMinAtr * atrP
+        int bestB = na
+        int nSw = array.size(swingBar)
+        if nSw == 0
+            false
+        else
+            for s = 0 to nSw - 1
+                if array.get(swingTyp, s) == -1
+                    int sb = int(array.get(swingBar, s))
+                    if sb >= lb0 and sb < pivBar
+                        if na(bestB) or sb > bestB
+                            bestB := sb
+            if na(bestB)
+                false
+            else
+                int o0 = int(bar_index - int(bestB))
+                float refP = o0 >= 0 ? low[o0] : low[0]
+                refP - pivotLow > need
+
+f_pivot_swept_supply(int pivBar, float pivotHigh, float atrP) =>
+    if not inpRequirePivotSweep
+        true
+    else
+        int lb0 = int(math.max(0, pivBar - inpPivotSweepLookback))
+        float need = inpPivotSweepMinAtr * atrP
+        int bestB = na
+        int nSw = array.size(swingBar)
+        if nSw == 0
+            false
+        else
+            for s = 0 to nSw - 1
+                if array.get(swingTyp, s) == 1
+                    int sb = int(array.get(swingBar, s))
+                    if sb >= lb0 and sb < pivBar
+                        if na(bestB) or sb > bestB
+                            bestB := sb
+            if na(bestB)
+                false
+            else
+                int o0 = int(bar_index - int(bestB))
+                float refP = o0 >= 0 ? high[o0] : high[0]
+                pivotHigh - refP > need
+
+f_zone_near_major(float zLoV, float zHiV, float atrRef, float protectMult) =>
+    // Approx of examples/sd_zones.py _zone_near_major_structure using swing points as structure proxy.
+    bool hit = false
+    if protectMult <= 0 or atrRef <= ATR_FLOOR
+        hit := false
+    else
+        float maxD = protectMult * atrRef
+        int n = array.size(swingPx)
+        int lim = math.min(n, 80)
+        if lim > 0
+            for t = 0 to lim - 1
+                float p = array.get(swingPx, n - 1 - t)
+                if zLoV <= p and p <= zHiV
+                    hit := true
+                    break
+                float d = math.min(math.abs(p - zLoV), math.abs(p - zHiV))
+                if d <= maxD
+                    hit := true
+                    break
+    hit
+
+f_init_zone_state_until_now(int piv, int zd, float zlv, float zhv) =>
+    // Backfill seen_outside + possible early end from pivot+1..current bar.
+    // Returns [alive(bool), seenOut(bool), touchDone(bool), endRight(int), endReason(int), farStreak(int)].
+    bool alive = true
+    bool seenOut = false
+    bool touchDone = false
+    int endRight = bar_index
+    int endReason = 0
+    int farStreak = 0
+    int depMin = inpSdDepartureMinBarsAfterPivot
+    int start = piv + 1
+    if start < 0
+        start := 0
+    if start > bar_index
+        start := bar_index
+    for j = start to bar_index
+        int off = bar_index - j
+        float bh = high[off]
+        float bl = low[off]
+        float bc = close[off]
+        // Inline ATR at index j (avoid CW10003)
+        int rel = bar_index - j
+        float atrJ = rel >= 0 ? atrVal[rel] : atrVal[0]
+        atrJ := na(atrJ) or atrJ <= ATR_FLOOR ? ATR_FLOOR : atrJ
+        // Far-invalidate streak
+        if inpZoneFarInvalidateEnabled
+            bool farCand = zd == 1 ? bl > zhv + inpZoneFarInvAtr * atrJ : bh < zlv - inpZoneFarInvAtr * atrJ
+            bool farBarI = farCand and (not inpFarProtectNearMajor or not f_zone_near_major(zlv, zhv, atrJ, inpZoneMajorProtectAtr))
+            farStreak := farBarI ? (farStreak + 1) : 0
+            if farStreak >= inpZoneFarInvBars
+                int cut = math.max(piv, j - inpZoneFarInvBars)
+                endRight := cut
+                alive := false
+                endReason := 3
+                break
+        else
+            farStreak := 0
+        bool overlap = bl <= zhv and bh >= zlv
+        bool dep_ok = (j - piv) >= depMin
+        bool wasOut = seenOut
+        if zd == 1
+            if bc < zlv
+                endRight := math.max(piv, j - 1)
+                alive := false
+                touchDone := true
+                endReason := 1
+                break
+            if wasOut and overlap and dep_ok and (bh >= zhv and bl <= zhv)
+                endRight := math.min(j + 3, bar_index)
+                alive := false
+                touchDone := true
+                endReason := 2
+                break
+            if bl > zhv
+                seenOut := true
+        else
+            if bc > zhv
+                endRight := math.max(piv, j - 1)
+                alive := false
+                touchDone := true
+                endReason := 1
+                break
+            if wasOut and overlap and dep_ok and (bl <= zlv and bh >= zlv)
+                endRight := math.min(j + 3, bar_index)
+                alive := false
+                touchDone := true
+                endReason := 2
+                break
+            if bh < zlv
+                seenOut := true
+    [alive, seenOut, touchDone, endRight, endReason, farStreak]
+
+f_collapse_bos_pivot_cluster_side(array<float> sPx, array<int> sBar, bool isHigh, int maxGapBars, float atrMult) =>
+    // Helper for f_collapse_bos_pivot_clusters; Pine does not allow nested function defs.
+    array<float> kPx = array.new_float()
+    array<int> kBar = array.new_int()
+    int n = array.size(sBar)
+    if n == 0
+        [kPx, kBar]
+    else if n == 1
+        array.push(kPx, array.get(sPx, 0))
+        array.push(kBar, array.get(sBar, 0))
+        [kPx, kBar]
+    else
+        int i = 0
+        int spanCap = maxGapBars
+        if spanCap <= 0 and atrMult > 0
+            spanCap := 8
+        while i < n
+            int firstBar = array.get(sBar, i)
+            float bestP = array.get(sPx, i)
+            int bestB = firstBar
+            int j = i + 1
+            int lastBar = firstBar
+            float lastPx = bestP
+            while j < n
+                int curBar = array.get(sBar, j)
+                int span = curBar - firstBar
+                if spanCap > 0 and span > spanCap
+                    break
+                int di = curBar - lastBar
+                // Inline ATR at absolute index curBar (avoid CW10003)
+                int relAtr = bar_index - curBar
+                float atrI = relAtr >= 0 ? atrVal[relAtr] : atrVal[0]
+                atrI := na(atrI) or atrI <= ATR_FLOOR ? ATR_FLOOR : atrI
+                float curPx = array.get(sPx, j)
+                float dprice = math.abs(curPx - lastPx)
+                bool gapOk = maxGapBars > 0 and di <= maxGapBars
+                bool priceOk = atrMult > 0 and dprice <= atrMult * atrI
+                if gapOk or priceOk
+                    if isHigh
+                        if curPx > bestP or (curPx == bestP and curBar > bestB)
+                            bestP := curPx
+                            bestB := curBar
+                    else
+                        if curPx < bestP or (curPx == bestP and curBar > bestB)
+                            bestP := curPx
+                            bestB := curBar
+                    lastBar := curBar
+                    lastPx := curPx
+                    j += 1
+                else
+                    break
+            array.push(kPx, bestP)
+            array.push(kBar, bestB)
+            i := j
+        [kPx, kBar]
+
+f_collapse_bos_pivot_clusters(array<float> px, array<int> bar, array<int> typ, int maxGapBars, float atrMult) =>
+    // Port of Swing_HL._collapse_bos_pivot_clusters (high/low only, no majors/internals here).
+    // Returns [outPx, outBar, outTyp] as new arrays.
+    array<float> outPx = array.new_float()
+    array<int> outBar = array.new_int()
+    array<int> outTyp = array.new_int()
+    int n0 = array.size(bar)
+    // Split highs/lows preserving chronological order (swingBar already chronological).
+    // IMPORTANT: call cluster-side helper on every calculation path (avoid CW10003), even when n0==0.
+    array<float> hPx = array.new_float()
+    array<int> hBar = array.new_int()
+    array<float> lPx = array.new_float()
+    array<int> lBar = array.new_int()
+    if n0 > 0
+        for i = 0 to n0 - 1
+            int t = array.get(typ, i)
+            if t == 1
+                array.push(hPx, array.get(px, i))
+                array.push(hBar, array.get(bar, i))
+            else if t == -1
+                array.push(lPx, array.get(px, i))
+                array.push(lBar, array.get(bar, i))
+
+    [khPx, khBar] = f_collapse_bos_pivot_cluster_side(hPx, hBar, true, maxGapBars, atrMult)
+    [klPx, klBar] = f_collapse_bos_pivot_cluster_side(lPx, lBar, false, maxGapBars, atrMult)
+
+    // Merge back sorted by bar (tie: highs first like Python sort key)
+    int ih = 0
+    int il = 0
+    int nh = array.size(khBar)
+    int nl = array.size(klBar)
+    while ih < nh or il < nl
+        bool takeH = false
+        if ih < nh and il < nl
+            int bh = array.get(khBar, ih)
+            int bl = array.get(klBar, il)
+            takeH := bh < bl or bh == bl
+        else
+            takeH := ih < nh
+        if takeH
+            array.push(outPx, array.get(khPx, ih))
+            array.push(outBar, array.get(khBar, ih))
+            array.push(outTyp, 1)
+            ih += 1
+        else
+            array.push(outPx, array.get(klPx, il))
+            array.push(outBar, array.get(klBar, il))
+            array.push(outTyp, -1)
+            il += 1
+    [outPx, outBar, outTyp]
+
+var array<int> consHigh = array.new_int()
+var array<int> consLow = array.new_int()
+
+var array<int> barsList = array.new_int()
+// One-pass BOS: collect matching swing bar indices before pushing to cons*
+var array<int> bosCandSix = array.new_int()
+
+// After swingBar is capped, push+shift keeps array size constant; compare last pivot bar instead of size.
+var int prevTipSwingBar = na
+var label gChartTfLabel = na
+// Swing labels cap (avoid overflowing max_labels_count)
+var array<label> swingLbls = array.new_label()
+
+var array<box> zBox = array.new_box()
+var array<float> zLo = array.new_float()
+var array<float> zHi = array.new_float()
+var array<int> zDir = array.new_int()
+var array<int> zPivot = array.new_int()
+var array<bool> zSeenOut = array.new_bool()
+var array<bool> zReady = array.new_bool()
+var array<int> zReadyBar = array.new_int()
+var array<bool> zTouchDone = array.new_bool()
+var array<bool> zNtArm = array.new_bool()
+var array<bool> zAlive = array.new_bool()
+// Bar index kdy zóna vstoupila do pole (vznik) — departure se nehodnotí na tom samém baru
+var array<int> zBorn = array.new_int()
+// Po sobě jdoucí bary „daleko“ od zóny (_compute_zone_width_right far-invalidate)
+var array<int> zFarStreak = array.new_int()
+// End reason (debug): 0=none,1=invalidate_close,2=retest_after_departure,3=far_invalidate,4=chop_filter,10=stale_purged (pre-READY),11=near_touch,12=contamination_pre_ready
+var array<int> zEndReason = array.new_int()
+// Quality metrics (align closer to examples/sd_zones.py)
+var array<int> zStart = array.new_int()
+var array<int> zBaseLen = array.new_int()
+var array<int> zChopCnt = array.new_int()
+var array<int> zLastChopBar = array.new_int()
+// Major = delší base (proxy za major swing); přednost při konfliktu + výjimka z max. životnosti
+var array<bool> zMajor = array.new_bool()
+// -1 = ještě žádný touch; jinak poslední bar index (včetně), do kterého smí box sahat po touch + 1 buffer svíčka
+var array<int> zTouchEnd = array.new_int()
+// Strategie: na zónu max. jeden obchod (vstup při prvním platném retestu)
+var array<bool> zEntryPlaced = array.new_bool()
+var array<bool> zEntryFilled = array.new_bool()
+var array<int> zEntryReadyAt = array.new_int()
+var array<float> zScore = array.new_float()
+var array<float> zDepMoveAtr = array.new_float()
+var array<int> zBosBar = array.new_int()
+var array<float> zMfePostReadyAtr = array.new_float()
+var array<float> zMfePreReadyAtr = array.new_float()
+var array<int> zInduceFlags = array.new_int()
+// Kontaminace pre-READY: streak nad/pod boxem / překryvy po sealingu / sealing bar odchodu
+var array<int> zCfOutSt = array.new_int()
+var array<int> zCfOvSt = array.new_int()
+var array<int> zCfDepartSealBar = array.new_int()
+
+// Musí být až po var swing* / zPivot — Pine CE10272 jinak hlásí „Undeclared identifier“.
+f_last_swing_of_type(int wantTyp) =>
+    int n = array.size(swingBar)
+    int out = na
+    if n > 0
+        for i = n - 1 to 0
+            if array.get(swingTyp, i) == wantTyp
+                out := array.get(swingBar, i)
+                break
+    out
+
+f_market_mid_from_swings() =>
+    int bh = f_last_swing_of_type(1)
+    int bl = f_last_swing_of_type(-1)
+    if na(bh) or na(bl)
+        na
+    else
+        int oh = bar_index - bh
+        int ol = bar_index - bl
+        float ph = oh >= 0 ? high[oh] : na
+        float pl = ol >= 0 ? low[ol] : na
+        na(ph) or na(pl) ? na : (ph + pl) * 0.5
+
+f_inducement_flags_now(float atrRef, int maxSwings, float padAtr, float zl, float zh) =>
+    int flags = 0
+    float a = f_safe_atr(atrRef)
+    float pad = padAtr * a
+    float zL = math.min(zl, zh)
+    float zH = math.max(zl, zh)
+    int n = array.size(swingBar)
+    int used = 0
+    if n > 0
+        for ii = n - 1 to 0
+            if used >= maxSwings
+                break
+            int tt = array.get(swingTyp, ii)
+            int sb = array.get(swingBar, ii)
+            float spx = array.get(swingPx, ii)
+            int span = bar_index - sb + 1
+            if span < 1 or span > 5000
+                continue
+            used += 1
+            if tt == 1
+                bool nearH = spx >= zH - syminfo.mintick * 2.0 and spx <= zH + pad
+                if nearH
+                    float mxH = ta.highest(high, span)
+                    if not na(mxH) and mxH < spx - syminfo.mintick * 2.0
+                        if flags % 2 == 0
+                            flags += 1
+            else
+                bool nearL = spx <= zL + syminfo.mintick * 2.0 and spx >= zL - pad
+                if nearL
+                    float mnL = ta.lowest(low, span)
+                    if not na(mnL) and mnL > spx + syminfo.mintick * 2.0
+                        if flags < 2
+                            flags += 2
+    flags
+
+f_existing_same_pivot_dir(int piv, int dir) =>
+    bool hit = false
+    int nz = array.size(zPivot)
+    if nz > 0
+        for i = 0 to nz - 1
+            if not (i < array.size(zPivot) and i < array.size(zDir))
+                break
+            if array.get(zPivot, i) == piv and array.get(zDir, i) == dir
+                hit := true
+                break
+    hit
+
+f_count_zones_alive() =>
+    int c = 0
+    int n = array.size(zAlive)
+    if n > 0
+        for i = 0 to n - 1
+            if i < array.size(zAlive) and array.get(zAlive, i)
+                c += 1
+    c
+
+f_too_close_to_alive_same_dir(int newPiv, int wantDir) =>
+    // Throttle cluster of zones on same side (Pine: no full dedupe like pandas merge).
+    bool hit = false
+    if inpMinPivotBarsGap > 0
+        int n = array.size(zPivot)
+        if n > 0
+            for i = 0 to n - 1
+                if i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zPivot) and array.get(zAlive, i) and array.get(zDir, i) == wantDir
+                    if math.abs(array.get(zPivot, i) - newPiv) < inpMinPivotBarsGap
+                        hit := true
+                        break
+    hit
+
+f_has_near_duplicate_alive(int candPiv, int candDir, float candLo0, float candHi0, float atrRef) =>
+    // Mirror indicator: prevent stacked near-duplicates at creation time.
+    bool hit = false
+    int maxGap = inpZoneNearDupMaxPivotGap
+    float minOl = inpZoneNearDupMinOl
+    float gapAtr = inpZoneNearDupGapAtr
+    if maxGap <= 0
+        hit := false
+    else
+        float cLo = math.min(candLo0, candHi0)
+        float cHi = math.max(candLo0, candHi0)
+        float a = (na(atrRef) or atrRef <= ATR_FLOOR) ? ATR_FLOOR : atrRef
+        int n = array.size(zPivot)
+        if n > 0
+            for i = 0 to n - 1
+                if not (i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zPivot) and i < array.size(zLo) and i < array.size(zHi))
+                    continue
+                if not array.get(zAlive, i)
+                    continue
+                if array.get(zDir, i) != candDir
+                    continue
+                if math.abs(array.get(zPivot, i) - candPiv) > maxGap
+                    continue
+                float zLo0 = array.get(zLo, i)
+                float zHi0 = array.get(zHi, i)
+                float zL = math.min(zLo0, zHi0)
+                float zH = math.max(zLo0, zHi0)
+                float ol = f_vertical_overlap_ratio(cLo, cHi, zL, zH)
+                float gap = f_vertical_price_gap(cLo, cHi, zL, zH)
+                bool nearPx = (minOl > 0 and ol >= minOl) or (gapAtr > 0 and gap <= gapAtr * a)
+                if nearPx
+                    hit := true
+                    break
+    hit
+
+f_new_inside_existing_same_type(float newLo0, float newHi0, int dir) =>
+    float nL = math.min(newLo0, newHi0)
+    float nH = math.max(newLo0, newHi0)
+    bool hit = false
+    int nz = array.size(zBox)
+    if nz > 0
+        for i = 0 to nz - 1
+            if not (i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zLo) and i < array.size(zHi))
+                continue
+            if not array.get(zAlive, i) or array.get(zDir, i) != dir
+                continue
+            float iLo0 = array.get(zLo, i)
+            float iHi0 = array.get(zHi, i)
+            float iL = math.min(iLo0, iHi0)
+            float iH = math.max(iLo0, iHi0)
+            if nL >= iL and nH <= iH
+                hit := true
+                break
+    hit
+
+f_sync_zone_arrays() =>
+    // Ensure all parallel arrays match zBox length (defensive against any drift).
+    int n = array.size(zBox)
+    int nMin = n
+    nMin := math.min(nMin, array.size(zLo))
+    nMin := math.min(nMin, array.size(zHi))
+    nMin := math.min(nMin, array.size(zDir))
+    nMin := math.min(nMin, array.size(zPivot))
+    nMin := math.min(nMin, array.size(zSeenOut))
+    nMin := math.min(nMin, array.size(zReady))
+    nMin := math.min(nMin, array.size(zReadyBar))
+    nMin := math.min(nMin, array.size(zTouchDone))
+    nMin := math.min(nMin, array.size(zNtArm))
+    nMin := math.min(nMin, array.size(zAlive))
+    nMin := math.min(nMin, array.size(zBorn))
+    nMin := math.min(nMin, array.size(zFarStreak))
+    nMin := math.min(nMin, array.size(zEndReason))
+    nMin := math.min(nMin, array.size(zStart))
+    nMin := math.min(nMin, array.size(zBaseLen))
+    nMin := math.min(nMin, array.size(zChopCnt))
+    nMin := math.min(nMin, array.size(zLastChopBar))
+    nMin := math.min(nMin, array.size(zMajor))
+    nMin := math.min(nMin, array.size(zTouchEnd))
+    nMin := math.min(nMin, array.size(zEntryPlaced))
+    nMin := math.min(nMin, array.size(zEntryFilled))
+    nMin := math.min(nMin, array.size(zEntryReadyAt))
+    nMin := math.min(nMin, array.size(zScore))
+    nMin := math.min(nMin, array.size(zDepMoveAtr))
+    nMin := math.min(nMin, array.size(zBosBar))
+    nMin := math.min(nMin, array.size(zMfePostReadyAtr))
+    nMin := math.min(nMin, array.size(zMfePreReadyAtr))
+    nMin := math.min(nMin, array.size(zInduceFlags))
+    nMin := math.min(nMin, array.size(zCfOutSt))
+    nMin := math.min(nMin, array.size(zCfOvSt))
+    nMin := math.min(nMin, array.size(zCfDepartSealBar))
+    // Delete extra boxes if zBox is longer
+    while array.size(zBox) > nMin
+        box.delete(array.pop(zBox))
+    // Trim other arrays down to nMin
+    while array.size(zLo) > nMin
+        array.pop(zLo)
+    while array.size(zHi) > nMin
+        array.pop(zHi)
+    while array.size(zDir) > nMin
+        array.pop(zDir)
+    while array.size(zPivot) > nMin
+        array.pop(zPivot)
+    while array.size(zSeenOut) > nMin
+        array.pop(zSeenOut)
+    while array.size(zReady) > nMin
+        array.pop(zReady)
+    while array.size(zReadyBar) > nMin
+        array.pop(zReadyBar)
+    while array.size(zTouchDone) > nMin
+        array.pop(zTouchDone)
+    while array.size(zNtArm) > nMin
+        array.pop(zNtArm)
+    while array.size(zAlive) > nMin
+        array.pop(zAlive)
+    while array.size(zBorn) > nMin
+        array.pop(zBorn)
+    while array.size(zFarStreak) > nMin
+        array.pop(zFarStreak)
+    while array.size(zEndReason) > nMin
+        array.pop(zEndReason)
+    while array.size(zStart) > nMin
+        array.pop(zStart)
+    while array.size(zBaseLen) > nMin
+        array.pop(zBaseLen)
+    while array.size(zChopCnt) > nMin
+        array.pop(zChopCnt)
+    while array.size(zLastChopBar) > nMin
+        array.pop(zLastChopBar)
+    while array.size(zMajor) > nMin
+        array.pop(zMajor)
+    while array.size(zTouchEnd) > nMin
+        array.pop(zTouchEnd)
+    while array.size(zEntryPlaced) > nMin
+        array.pop(zEntryPlaced)
+    while array.size(zEntryFilled) > nMin
+        array.pop(zEntryFilled)
+    while array.size(zEntryReadyAt) > nMin
+        array.pop(zEntryReadyAt)
+    while array.size(zScore) > nMin
+        array.pop(zScore)
+    while array.size(zDepMoveAtr) > nMin
+        array.pop(zDepMoveAtr)
+    while array.size(zBosBar) > nMin
+        array.pop(zBosBar)
+    while array.size(zMfePostReadyAtr) > nMin
+        array.pop(zMfePostReadyAtr)
+    while array.size(zMfePreReadyAtr) > nMin
+        array.pop(zMfePreReadyAtr)
+    while array.size(zInduceFlags) > nMin
+        array.pop(zInduceFlags)
+    while array.size(zCfOutSt) > nMin
+        array.pop(zCfOutSt)
+    while array.size(zCfOvSt) > nMin
+        array.pop(zCfOvSt)
+    while array.size(zCfDepartSealBar) > nMin
+        array.pop(zCfDepartSealBar)
+
+f_arrival_aggression_atr(int zd, float zlN, float zhN, int lb, float atrNow) =>
+    float a = f_safe_atr(atrNow)
+    float edge = zd == 1 ? zhN : zlN
+    float worst = 0.0
+    int N = math.max(1, lb)
+    for k = 1 to N
+        if na(high[k]) or na(low[k])
+            continue
+        float adv = zd == 1 ? (edge - low[k]) : (high[k] - edge)
+        adv := math.max(0.0, adv)
+        worst := math.max(worst, adv / a)
+    worst
+
+f_pinbar_reject(bool isDemand, float edge) =>
+    // Simple rejection proxy on previous closed bar (bar[1]).
+    // Demand: long lower wick, close above edge, and touches edge.
+    // Supply: long upper wick, close below edge, and touches edge.
+    if bar_index < 2
+        false
+    else
+        float o = open[1], c = close[1], h = high[1], l = low[1]
+        float rng = h - l
+        if rng <= 0
+            false
+        else
+            float body = math.abs(c - o)
+            float upperW = h - math.max(o, c)
+            float lowerW = math.min(o, c) - l
+            bool touched = isDemand ? (h >= edge and l <= edge) : (l <= edge and h >= edge)
+            if isDemand
+                touched and c >= edge and lowerW / rng >= 0.35 and body / rng <= 0.60
+            else
+                touched and c <= edge and upperW / rng >= 0.35 and body / rng <= 0.60
+
+f_engulf_reject(bool isDemand, float edge) =>
+    if bar_index < 3
+        false
+    else
+        // Bullish engulf for demand: bar[1] bullish and engulfs bar[2] body; closes above edge.
+        // Bearish engulf for supply: bar[1] bearish and engulfs bar[2] body; closes below edge.
+        float o1 = open[1], c1 = close[1]
+        float o2 = open[2], c2 = close[2]
+        float b1Lo = math.min(o1, c1), b1Hi = math.max(o1, c1)
+        float b2Lo = math.min(o2, c2), b2Hi = math.max(o2, c2)
+        bool engulf = b1Lo <= b2Lo and b1Hi >= b2Hi
+        if isDemand
+            engulf and c1 > o1 and c1 >= edge
+        else
+            engulf and c1 < o1 and c1 <= edge
+
+f_strat_cancel_pending(int zi) =>
+    if strategy.position_size != 0
+        0
+    // Když už jsme pro tuhle zónu odpálili entry na tomto/předchozím baru,
+    // nesmíme volat strategy.cancel() se stejným order_id (process_orders_on_close),
+    // jinak se entry zruší ještě před vyplněním a backtest skončí s 0 obchody.
+    else if zi >= 0 and zi < array.size(zEntryPlaced) and array.get(zEntryPlaced, zi)
+        0
+    else if zi < 0 or zi >= array.size(zPivot) or zi >= array.size(zDir)
+        0
+    else
+        int pd = array.get(zDir, zi)
+        int pbar = array.get(zPivot, zi)
+        string oid = (pd == 1 ? "D_" : "S_") + str.tostring(pbar)
+        strategy.cancel(oid)
+        0
+
+f_zone_set_dead(int zi, int endBarIdx, int endReas) =>
+    if zi < 0 or zi >= array.size(zBox) or zi >= array.size(zAlive) or zi >= array.size(zEndReason)
+        0
+    else if not array.get(zAlive, zi)
+        0
+    else
+        box zb = array.get(zBox, zi)
+        f_box_set_xright(zb, endBarIdx)
+        array.set(zAlive, zi, false)
+        array.set(zEndReason, zi, endReas)
+        f_strat_cancel_pending(zi)
+        1
+
+f_is_major_swing_past_only(int pivotBar, int dir) =>
+    int n = array.size(swingBar)
+    int N = uMajorSwingLookback
+    if n == 0 or N <= 0
+        true
+    else
+        int cnt = 0
+        bool ok = true
+        float pivPx = na
+        int pivOff = bar_index - pivotBar
+        if pivOff >= 0
+            pivPx := dir == 1 ? low[pivOff] : high[pivOff]
+        if na(pivPx)
+            true
+        else
+            for k = n - 1 to 0
+                if cnt >= N
+                    break
+                int t = array.get(swingTyp, k)
+                if (dir == 1 and t == -1) or (dir == -1 and t == 1)
+                    int sb = array.get(swingBar, k)
+                    if sb == pivotBar
+                        continue
+                    if sb < pivotBar
+                        float spx = array.get(swingPx, k)
+                        if dir == 1 and spx < pivPx
+                            ok := false
+                            break
+                        if dir == -1 and spx > pivPx
+                            ok := false
+                            break
+                        cnt += 1
+            ok
+
+f_major_protection_ok(int zi, int dir, float zlN, float zhN) =>
+    bool ok = true
+    int nz = array.size(zBox)
+    if nz > 0
+        for j = 0 to nz - 1
+            if j == zi
+                continue
+            if not (j < array.size(zAlive) and j < array.size(zDir) and j < array.size(zLo) and j < array.size(zHi))
+                continue
+            if not array.get(zAlive, j)
+                continue
+            if array.get(zDir, j) != dir
+                continue
+            float jLo0 = array.get(zLo, j)
+            float jHi0 = array.get(zHi, j)
+            float jL = math.min(jLo0, jHi0)
+            float jH = math.max(jLo0, jHi0)
+            if dir == 1
+                if jH < zlN
+                    ok := false
+                    break
+            else
+                if jL > zhN
+                    ok := false
+                    break
+    ok
+
+f_dedupe_near_duplicate_newer_wins() =>
+    int nz = array.size(zBox)
+    int killed = 0
+    int maxGap = inpZoneNearDupMaxPivotGap
+    float minOl = inpZoneNearDupMinOl
+    float gapAtr = inpZoneNearDupGapAtr
+    if nz >= 2 and maxGap > 0 and (minOl > 0 or gapAtr > 0)
+        for i = 0 to nz - 2
+            if not (i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zPivot) and i < array.size(zLo) and i < array.size(zHi) and i < array.size(zBorn))
+                continue
+            if not array.get(zAlive, i)
+                continue
+            int di = array.get(zDir, i)
+            int pi = array.get(zPivot, i)
+            int bi = array.get(zBorn, i)
+            float iLo0 = array.get(zLo, i)
+            float iHi0 = array.get(zHi, i)
+            float iL = math.min(iLo0, iHi0)
+            float iH = math.max(iLo0, iHi0)
+            int relAi = bar_index - pi
+            // Guard against RE10008: cap historical reference to max 5000 bars back.
+            int relAiC = relAi < 0 ? 0 : math.min(relAi, 5000)
+            float atrI = atrVal[relAiC]
+            atrI := na(atrI) or atrI <= ATR_FLOOR ? ATR_FLOOR : atrI
+            for j = i + 1 to nz - 1
+                if not (j < array.size(zAlive) and j < array.size(zDir) and j < array.size(zPivot) and j < array.size(zLo) and j < array.size(zHi) and j < array.size(zBorn))
+                    continue
+                if not array.get(zAlive, j)
+                    continue
+                if array.get(zDir, j) != di
+                    continue
+                int pj = array.get(zPivot, j)
+                if math.abs(pj - pi) > maxGap
+                    continue
+                int bj = array.get(zBorn, j)
+                float jLo0 = array.get(zLo, j)
+                float jHi0 = array.get(zHi, j)
+                float jL = math.min(jLo0, jHi0)
+                float jH = math.max(jLo0, jHi0)
+                int relAj = bar_index - pj
+                int relAjC = relAj < 0 ? 0 : math.min(relAj, 5000)
+                float atrJ = atrVal[relAjC]
+                atrJ := na(atrJ) or atrJ <= ATR_FLOOR ? ATR_FLOOR : atrJ
+                float atrRef = math.max(atrI, atrJ)
+                float ol = f_vertical_overlap_ratio(iL, iH, jL, jH)
+                float gap = f_vertical_price_gap(iL, iH, jL, jH)
+                bool nearPx = (minOl > 0 and ol >= minOl) or (gapAtr > 0 and gap > 0 and gap <= gapAtr * atrRef)
+                if nearPx
+                    bool jNewer = pj > pi or (pj == pi and bj >= bi)
+                    int die = jNewer ? i : j
+                    int eB = math.max(0, bar_index - 1)
+                    killed += f_zone_set_dead(die, eB, 9)
+    killed
+
+// Opposite types must not overlap: keep younger, kill older.
+f_resolve_ds_overlap_younger_wins() =>
+    int nz = array.size(zBox)
+    if nz < 2
+        0
+    else
+        int did = 0
+        for i = 0 to nz - 2
+            if not (i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zLo) and i < array.size(zHi))
+                continue
+            if not array.get(zAlive, i)
+                continue
+            int di = array.get(zDir, i)
+            float iLo = array.get(zLo, i)
+            float iHi = array.get(zHi, i)
+            for j = i + 1 to nz - 1
+                if not (j < array.size(zAlive) and j < array.size(zDir) and j < array.size(zLo) and j < array.size(zHi))
+                    continue
+                if not array.get(zAlive, j)
+                    continue
+                int dj = array.get(zDir, j)
+                if di == dj
+                    continue
+                float jLo = array.get(zLo, j)
+                float jHi = array.get(zHi, j)
+                if f_price_overlap_strict(iLo, iHi, jLo, jHi)
+                    int eB = math.max(0, bar_index - 1)
+                    int bi = i < array.size(zBorn) ? array.get(zBorn, i) : 0
+                    int bj = j < array.size(zBorn) ? array.get(zBorn, j) : 0
+                    int die = bi >= bj ? j : i
+                    did += f_zone_set_dead(die, eB, 6)
+        did
+
+// Same-type overlap rule:
+// Demand: lower wins; Supply: higher wins; tie -> younger wins.
+f_i_beats_j_sametype(int i, int j) =>
+    int dir = array.get(zDir, i)
+    float iLo0 = array.get(zLo, i), iHi0 = array.get(zHi, i)
+    float jLo0 = array.get(zLo, j), jHi0 = array.get(zHi, j)
+    float iMid = (math.min(iLo0, iHi0) + math.max(iLo0, iHi0)) * 0.5
+    float jMid = (math.min(jLo0, jHi0) + math.max(jLo0, jHi0)) * 0.5
+    float eps = syminfo.mintick * 2.0
+    if dir == 1
+        if iMid < jMid - eps
+            true
+        else if iMid > jMid + eps
+            false
+        else
+            array.get(zBorn, i) >= array.get(zBorn, j)
+    else
+        if iMid > jMid + eps
+            true
+        else if iMid < jMid - eps
+            false
+        else
+            array.get(zBorn, i) >= array.get(zBorn, j)
+
+f_resolve_one_same_type_overlap() =>
+    int nz = array.size(zBox)
+    bool found = false
+    if nz >= 2
+        for i = 0 to nz - 2
+            if found
+                break
+            if not (i < array.size(zAlive) and i < array.size(zDir) and i < array.size(zLo) and i < array.size(zHi) and i < array.size(zBorn) and i < array.size(zMajor) and i < array.size(zPivot))
+                continue
+            if not array.get(zAlive, i)
+                continue
+            int di = array.get(zDir, i)
+            float iLo = array.get(zLo, i)
+            float iHi = array.get(zHi, i)
+            for j = i + 1 to nz - 1
+                if not (j < array.size(zAlive) and j < array.size(zDir) and j < array.size(zLo) and j < array.size(zHi) and j < array.size(zBorn) and j < array.size(zMajor) and j < array.size(zPivot))
+                    continue
+                if not array.get(zAlive, j)
+                    continue
+                if array.get(zDir, j) != di
+                    continue
+                float jLo = array.get(zLo, j)
+                float jHi = array.get(zHi, j)
+                if not f_price_overlap_strict(iLo, iHi, jLo, jHi)
+                    continue
+                int die = f_i_beats_j_sametype(i, j) ? j : i
+                int eB = math.max(0, bar_index - 1)
+                if f_zone_set_dead(die, eB, 7) > 0
+                    found := true
+                    break
+    found
+
+f_enforce_spatial_zones(int maxRounds) =>
+    f_resolve_ds_overlap_younger_wins()
+    int guard = 0
+    while guard < maxRounds
+        if not f_resolve_one_same_type_overlap()
+            break
+        guard += 1
+
+// Duplicity: při zániku jedné (close / touch) ukončit všechny se stejným typem, které s ní sdílejí pásmo
+// (f_ranges_overlap_cluster = překryv nebo těsně přilehlé stackované S/S nebo D/D).
+// endBar < 0 → použij bar_index - 1 (např. close); jinak pevné pravé okraje (např. te1 po touch bufferu)
+f_kill_sametype_overlap_cluster(int triggerZi, int endReas, int endBar) =>
+    if triggerZi < 0 or triggerZi >= array.size(zBox) or triggerZi >= array.size(zAlive) or not array.get(zAlive, triggerZi)
+        0
+    else
+        int zd0 = array.get(zDir, triggerZi)
+        float tLo0 = array.get(zLo, triggerZi)
+        float tHi0 = array.get(zHi, triggerZi)
+        float tLo = math.min(tLo0, tHi0)
+        float tHi = math.max(tLo0, tHi0)
+        int nz = array.size(zBox)
+        int eB = endBar < 0 ? math.max(0, bar_index - 1) : math.max(0, endBar)
+        int nK = 0
+        // vždy ukončit trigger (při přehozeném zLo/zHi f_ranges_overlap se sebou neshodne → dřív se nezabil)
+        nK += f_zone_set_dead(triggerZi, eB, endReas)
+        for zj = 0 to nz - 1
+            if zj == triggerZi
+                continue
+            if not (zj < array.size(zAlive) and zj < array.size(zDir) and zj < array.size(zLo) and zj < array.size(zHi))
+                continue
+            if not array.get(zAlive, zj) or array.get(zDir, zj) != zd0
+                continue
+            float jLo0 = array.get(zLo, zj)
+            float jHi0 = array.get(zHi, zj)
+            float jLo = math.min(jLo0, jHi0)
+            float jHi = math.max(jLo0, jHi0)
+            if f_ranges_overlap_cluster(tLo, tHi, jLo, jHi)
+                nK += f_zone_set_dead(zj, eB, endReas)
+        nK
+
+f_sync_touch_sametype_cluster(int triggerZi, int teTo) =>
+    if triggerZi < 0 or triggerZi >= array.size(zBox) or triggerZi >= array.size(zTouchEnd) or not array.get(zAlive, triggerZi)
+        0
+    else
+        int zd0 = array.get(zDir, triggerZi)
+        float tLo0 = array.get(zLo, triggerZi)
+        float tHi0 = array.get(zHi, triggerZi)
+        float tLo = math.min(tLo0, tHi0)
+        float tHi = math.max(tLo0, tHi0)
+        int nz = array.size(zBox)
+        int n = 0
+        for zj = 0 to nz - 1
+            if not (zj < array.size(zAlive) and zj < array.size(zDir) and zj < array.size(zLo) and zj < array.size(zHi) and zj < array.size(zTouchEnd) and zj < array.size(zTouchDone))
+                continue
+            if not array.get(zAlive, zj) or array.get(zDir, zj) != zd0
+                continue
+            if zj == triggerZi
+                continue
+            float jLo0 = array.get(zLo, zj)
+            float jHi0 = array.get(zHi, zj)
+            float jLo = math.min(jLo0, jHi0)
+            float jHi = math.max(jLo0, jHi0)
+            if f_ranges_overlap_cluster(tLo, tHi, jLo, jHi)
+                if array.get(zTouchEnd, zj) < 0
+                    array.set(zTouchEnd, zj, teTo)
+                if not array.get(zTouchDone, zj)
+                    array.set(zTouchDone, zj, true)
+                n += 1
+        n
+
+f_sync_nt_arm_sametype_cluster(int triggerZi) =>
+    if triggerZi < 0 or triggerZi >= array.size(zBox) or not array.get(zAlive, triggerZi)
+        0
+    else
+        int zd0 = array.get(zDir, triggerZi)
+        float tLo0 = array.get(zLo, triggerZi)
+        float tHi0 = array.get(zHi, triggerZi)
+        float tLo = math.min(tLo0, tHi0)
+        float tHi = math.max(tLo0, tHi0)
+        int nz = array.size(zBox)
+        int n = 0
+        for zj = 0 to nz - 1
+            if not (zj < array.size(zAlive) and zj < array.size(zDir) and zj < array.size(zLo) and zj < array.size(zHi) and zj < array.size(zNtArm))
+                continue
+            if not array.get(zAlive, zj) or array.get(zDir, zj) != zd0
+                continue
+            float jLo0 = array.get(zLo, zj)
+            float jHi0 = array.get(zHi, zj)
+            float jLo = math.min(jLo0, jHi0)
+            float jHi = math.max(jLo0, jHi0)
+            if f_ranges_overlap_cluster(tLo, tHi, jLo, jHi)
+                array.set(zNtArm, zj, true)
+                n += 1
+        n
+
+f_cons_has(array<int> a, int ix) =>
+    bool hit = false
+    n = array.size(a)
+    if n > 0
+        for i = 0 to n - 1
+            if array.get(a, i) == ix
+                hit := true
+                break
+    hit
+
+f_trim_cons_tail(array<int> a, int cap) =>
+    while array.size(a) > cap
+        array.shift(a)
+
+f_zone_wtb(int pivotOff, int zoneDir) =>
+    // Backward-compat wrapper: default wick_to_body
+    f_zone_bounds_from_pivot(pivotOff, zoneDir, "wick_to_body")
+
+f_pivot_in_window(int six, array<int> sortedBars, int winLo) =>
+    bool ok = false
+    if inpBosMaxLookbackSwings <= 0
+        ok := true
+    else
+        n = array.size(sortedBars)
+        if n > 0
+            for t = winLo to n - 1
+                if array.get(sortedBars, t) == six
+                    ok := true
+                    break
+    ok
+
+// Match Swing_HL._find_bos_from_swings: acceptance is on bars *after* BOS bar i (i+1..i+A), not past closes.
+accept_bull_ok(float lvl) =>
+    int A = inpAcceptanceBars
+    if A <= 0
+        true
+    else
+        bool ok = not na(close[A]) and close[A] > lvl
+        if ok
+            for k = 0 to A - 1
+                float cj = close[k]
+                if na(cj) or cj < lvl
+                    ok := false
+                    break
+        ok
+
+accept_bear_ok(float lvl) =>
+    int A = inpAcceptanceBars
+    if A <= 0
+        true
+    else
+        bool ok = not na(close[A]) and close[A] < lvl
+        if ok
+            for k = 0 to A - 1
+                float cj = close[k]
+                if na(cj) or cj > lvl
+                    ok := false
+                    break
+        ok
+
+pine_i = bar_index - 1
+// Swings only on confirmed bars: less work on the live, forming bar and matches BOS/zone timing
+if barstate.isconfirmed and bar_index >= 2 and pine_i >= 1
+    if swingModeMajor
+        int lr = math.min(14, math.max(6, int(math.ceil(effMinBars * 1.4))))
+        int gapMaj = math.max(effMinBars + 3, int(math.ceil(effMinBars * 1.35)))
+        float ph = ta.pivothigh(high, lr, lr)
+        float pl = ta.pivotlow(low, lr, lr)
+        int pivBar = bar_index - lr
+        bool canSp = lastSwingIdx < 0 or (pivBar - lastSwingIdx >= gapMaj)
+        bool wantH = not na(ph) and canSp and (na(lastSwingType) or lastSwingType == "low")
+        bool wantL = not na(pl) and canSp and (na(lastSwingType) or lastSwingType == "high")
+        if wantH or wantL
+            bool preferLow = wantL and (not wantH or (wantH and wantL))
+            if preferLow
+                array.push(swingPx, pl)
+                array.push(swingBar, pivBar)
+                array.push(swingTyp, -1)
+                lastSwingIdx := pivBar
+                lastSwingType := "low"
+            else
+                array.push(swingPx, ph)
+                array.push(swingBar, pivBar)
+                array.push(swingTyp, 1)
+                lastSwingIdx := pivBar
+                lastSwingType := "high"
+        while array.size(swingBar) > 400
+            array.shift(swingPx)
+            array.shift(swingBar)
+            array.shift(swingTyp)
+    else
+        int atrOff = bar_index - pine_i
+        float av = atrVal[atrOff]
+        av := na(av) or av <= 0 ? ATR_FLOOR : av
+        float thr = math.max(av * effAtrMult, av * MIN_THRESHOLD_ATR_RATIO) / sensitivity
+        float minPb = av * effMinPull / sensitivity
+
+        int midOff = bar_index - pine_i
+        float hMid = high[midOff]
+        float hL = high[midOff + 1]
+        float hR = high[midOff - 1]
+        float lMid = low[midOff]
+        float lL = low[midOff + 1]
+        float lR = low[midOff - 1]
+
+        bool lookHigh = na(lastSwingType) or lastSwingType == "low"
+        bool lookLow = na(lastSwingType) or lastSwingType == "high"
+
+        if lookHigh and hMid > hL and hMid > hR
+            if na(candHigh) or hMid >= candHigh
+                candHigh := hMid
+                candHighIdx := pine_i
+
+        if lookLow and lMid < lL and lMid < lR
+            if na(candLow) or lMid <= candLow
+                candLow := lMid
+                candLowIdx := pine_i
+
+        float cLow = low[midOff]
+        float cHigh = high[midOff]
+
+        bool lfHi = na(lastSwingType) or lastSwingType == "low"
+        bool lfLo = na(lastSwingType) or lastSwingType == "high"
+        bool canConf = pine_i - lastSwingIdx >= effMinBars
+
+        if canConf
+            bool hiOk = false
+            if not na(candHigh) and not na(candHighIdx) and lfHi and pine_i > candHighIdx
+                bool cpull = cLow <= candHigh - thr
+                if not cpull and effAltAfter > 0 and effAltFrac > 0 and (pine_i - candHighIdx) >= effAltAfter
+                    cpull := cLow <= candHigh - thr * effAltFrac
+                bool tconf = effTimeConfirm > 0 and (pine_i - candHighIdx) >= math.max(effMinBars, effTimeConfirm) and cLow <= candHigh - minPb
+                hiOk := cpull or tconf
+
+            bool loOk = false
+            if not na(candLow) and not na(candLowIdx) and lfLo and pine_i > candLowIdx
+                bool cpull = cHigh >= candLow + thr
+                if not cpull and effAltAfter > 0 and effAltFrac > 0 and (pine_i - candLowIdx) >= effAltAfter
+                    cpull := cHigh >= candLow + thr * effAltFrac
+                bool tconf = effTimeConfirm > 0 and (pine_i - candLowIdx) >= math.max(effMinBars, effTimeConfirm) and cHigh >= candLow + minPb
+                loOk := cpull or tconf
+
+            if hiOk or loOk
+                bool preferLow = loOk and (not hiOk or (not na(candLowIdx) and not na(candHighIdx) and candLowIdx <= candHighIdx))
+                if preferLow
+                    array.push(swingPx, candLow)
+                    array.push(swingBar, candLowIdx)
+                    array.push(swingTyp, -1)
+                    lastSwingIdx := candLowIdx
+                    lastSwingType := "low"
+                else
+                    array.push(swingPx, candHigh)
+                    array.push(swingBar, candHighIdx)
+                    array.push(swingTyp, 1)
+                    lastSwingIdx := candHighIdx
+                    lastSwingType := "high"
+                candHigh := na
+                candHighIdx := na
+                candLow := na
+                candLowIdx := na
+
+        while array.size(swingBar) > 400
+            array.shift(swingPx)
+            array.shift(swingBar)
+            array.shift(swingTyp)
+
+// Keep UDF calls consistent (avoid CW10003): precompute BOS collapsed arrays on every confirmed bar.
+// These arrays are used later when bosReady/biBos gates allow BOS scan.
+var array<float> bosPx = array.new_float()
+var array<int> bosBar = array.new_int()
+var array<int> bosTyp = array.new_int()
+// Call collapse on each calculation (avoid CW10003); arrays only change on confirmed swing updates.
+[bosPxCalc, bosBarCalc, bosTypCalc] = f_collapse_bos_pivot_clusters(swingPx, swingBar, swingTyp, inpBosPivotClusterMaxBars, inpBosPivotClusterAtrMult)
+bosPx := bosPxCalc
+bosBar := bosBarCalc
+bosTyp := bosTypCalc
+
+if barstate.isconfirmed and bar_index >= 2
+    float cls = close
+    int bi = bar_index
+    int A = inpAcceptanceBars
+    bool bosReady = A == 0 or bar_index >= A
+    // When not bosReady, disable BOS scan (biBos < 0 => six < biBos never true for valid bars)
+    int biBos = bosReady ? (A == 0 ? bi : bi - A) : -1
+    float clsBos = bosReady ? (A == 0 ? cls : close[A]) : na
+    int ns = array.size(swingBar)
+
+    int nsBos = array.size(bosBar)
+
+    array.clear(barsList)
+    if bosReady and nsBos > 0
+        for s = 0 to nsBos - 1
+            int sb = array.get(bosBar, s)
+            if sb < biBos
+                array.push(barsList, sb)
+    int nList = array.size(barsList)
+    if nList > 1
+        array.sort(barsList, order.ascending)
+    int winLo = 0
+    if inpBosMaxLookbackSwings > 0 and nList > inpBosMaxLookbackSwings
+        winLo := nList - inpBosMaxLookbackSwings
+
+    int bestHBar = na
+    float bestHPx = na
+    bool foundH = false
+    array.clear(bosCandSix)
+    if nsBos > 0
+        for s = 0 to nsBos - 1
+            if array.get(bosTyp, s) == 1
+                int six = array.get(bosBar, s)
+                float px = array.get(bosPx, s)
+                if six < biBos and px < clsBos and not f_cons_has(consHigh, six) and f_pivot_in_window(six, barsList, winLo)
+                    array.push(bosCandSix, six)
+                    if not foundH
+                        foundH := true
+                        bestHBar := six
+                        bestHPx := px
+                    else
+                        if inpBosPivotPick == "newest"
+                            if six > bestHBar
+                                bestHBar := six
+                                bestHPx := px
+                        else
+                            if px > bestHPx or (px == bestHPx and six > bestHBar)
+                                bestHBar := six
+                                bestHPx := px
+
+    if bosReady and foundH and not na(bestHBar) and accept_bull_ok(bestHPx)
+        int nCand = array.size(bosCandSix)
+        if nCand > 0
+            for ci = 0 to nCand - 1
+                array.push(consHigh, array.get(bosCandSix, ci))
+            f_trim_cons_tail(consHigh, inpMaxConsEntries)
+
+        // Keep BOS lines scoped (avoid hitting max_lines_count on long history)
+        if inpShowBos and drawScope
+            int offSwing = bar_index - bestHBar
+            // BOS level is horizontal at the broken swing price (not close→swing diagonal)
+            line.new(time[offSwing], bestHPx, time, bestHPx, xloc=xloc.bar_time, extend=extend.none, color=inpColBos, width=inpBosWidth, style=lineStyleFrom(inpBosStyle))
+
+        // Zone construction must NOT be scoped to right-edge window; otherwise scrolling looks "static"
+        int legStart = na
+        if ns > 0
+            for s = 0 to ns - 1
+                if array.get(swingTyp, s) == -1
+                    int six = array.get(swingBar, s)
+                    if six < bestHBar
+                        legStart := na(legStart) ? six : math.max(legStart, six)
+        int piv = na
+        if not na(legStart)
+            int ss = math.min(legStart, biBos - 1)
+            int ee = biBos
+            if ee >= ss
+                int minAt = ss
+                float minLv = low[bar_index - ss]
+                for j = ss to ee
+                    int o = bar_index - j
+                    float lj = low[o]
+                    if lj < minLv
+                        minLv := lj
+                        minAt := j
+                piv := minAt
+
+            // Inline ATR for pivot reg filters (pivot-1 bar) to avoid CW10003 (UDF in conditional scope).
+            int pivIdxForAtr = na(piv) ? 0 : piv
+            int pivAtrBar = math.max(0, pivIdxForAtr - 1)
+            int relP = bar_index - pivAtrBar
+            float atrPiv = relP >= 0 ? atrVal[relP] : atrVal[0]
+            atrPiv := na(atrPiv) or atrPiv <= ATR_FLOOR ? ATR_FLOOR : atrPiv
+            if not na(piv)
+                int pOff = bar_index - piv
+                [zl0, zh0] = f_zone_bounds_from_pivot(pOff, 1, inpDemandZoneMode)
+                xlocZ = f_zone_x_time() ? xloc.bar_time : xloc.bar_index
+                bool passRange = inpDebugRelaxZoneFilters or (zh0 > zl0 and zh0 - zl0 <= SD_MAX_PIVOT_RANGE_ATR * atrPiv)
+                if allowDemand and passRange and f_count_zones_alive() < inpMaxAliveZones
+                    [zl, zh] = f_clamp_pivot_h(zl0, zh0, true, atrPiv)
+                    if zh > zl
+                        [bsL, bsR, bsLen] = f_base_width(piv, zl, zh)
+                        bool okQuality = inpDebugRelaxZoneFilters or (inpSdZoneMaxBaseBars <= 0 or bsLen <= inpSdZoneMaxBaseBars)
+                        bool okMinBase = inpDebugRelaxZoneFilters or (uMinBaseLen <= 0 or bsLen >= uMinBaseLen)
+                        bool okMinHeight = inpDebugRelaxZoneFilters or (uMinZoneHeightAtr <= 0 or (zh - zl) >= uMinZoneHeightAtr * atrPiv)
+                        int leftCh = f_compute_zone_leftmost_chop(piv, zl, zh)
+                        int chopN = f_count_bars_heavy_chop(leftCh, bar_index, zl, zh)
+                        bool chopReg = inpDebugRelaxZoneFilters or inpSdZoneMaxChopOverlapBars <= 0 or chopN <= inpSdZoneMaxChopOverlapBars
+                        int spanCh = bar_index - leftCh + 1
+                        float chopDensity = spanCh > 0 ? (float(chopN) / float(spanCh)) : 1.0
+                        bool chopDenseOk = inpDebugRelaxZoneFilters or (uMaxChopDensity <= 0 or chopDensity <= uMaxChopDensity)
+                        bool sweepReg = f_pivot_swept_demand(piv, low[pOff], atrPiv)
+                        float pivLowPx = low[pOff]
+                        float depMoveAtr = atrPiv > ATR_FLOOR ? (bestHPx - pivLowPx) / atrPiv : 0.0
+                        float bosBody = f_body_ratio_at_off(A)
+                        bool instOn = uInstEnabled and not inpDebugRelaxZoneFilters
+                        bool instDepOk = (not instOn) or ((uDepMinMoveAtr <= 0 or depMoveAtr >= uDepMinMoveAtr) and (uDepMinBodyRatio <= 0 or bosBody >= uDepMinBodyRatio))
+                        bool swingMajorOk = f_is_major_swing_past_only(piv, 1)
+                        bool isMajorZ = swingMajorOk and (bsLen >= inpMajorZoneExemptBase or (uMajorImpulseAtr > 0 and (bestHPx - pivLowPx) >= uMajorImpulseAtr * atrPiv))
+                        float scoreZ = instOn ? f_zone_score(depMoveAtr, bsLen, chopDensity, isMajorZ) : 1.0
+                        bool scoreOk = (not instOn) or (uMinZoneScoreCreate <= 0 or scoreZ >= uMinZoneScoreCreate)
+                        float midPd = f_market_mid_from_swings()
+                        float pdPad = uPDPadAtr * atrPiv
+                        bool pdOk = (not instOn) or (not uUsePremiumDiscount) or (na(midPd) ? true : (zh <= (midPd - pdPad)))
+                        int induceFlags = f_inducement_flags_now(atrPiv, uInduceSwingLookback, uInducePadAtr, zl, zh)
+                        bool metaOkCreate = f_meta_show_ok(false, bsLen, 0.0, depMoveAtr, induceFlags)
+                        if okQuality and okMinBase and okMinHeight and chopReg and chopDenseOk and sweepReg and instDepOk and scoreOk and pdOk and metaOkCreate
+                            int nk = array.size(zBox)
+                            // Drop young near dominant older zone (module parity approx)
+                            bool dropYoung = false
+                            if (not inpDebugRelaxZoneFilters) and inpDropYoungNearDominant and nk > 0
+                                for kx = 0 to nk - 1
+                                    if array.get(zAlive, kx) and array.get(zDir, kx) == 1
+                                        int opv = array.get(zPivot, kx)
+                                        float oLo = array.get(zLo, kx)
+                                        float oHi = array.get(zHi, kx)
+                                        int oBase = array.get(zBaseLen, kx)
+                                        if f_should_drop_young_near_dominant(piv, zl, zh, bsLen, opv, oLo, oHi, oBase, atrPiv)
+                                            dropYoung := true
+                                            break
+                            // Incremental lifecycle: start fresh, then update per-bar in the main zone loop.
+                            bool alv0 = true
+                            bool seen0 = false
+                            bool td0 = false
+                            int endR0 = bar_index
+                            int endReason0 = 0
+                            int far0 = 0
+                            bool insideSame = f_new_inside_existing_same_type(zl, zh, 1)
+                            bool nearDupSame = f_has_near_duplicate_alive(piv, 1, zl, zh, atrPiv)
+                            bool samePivDup = f_existing_same_pivot_dir(piv, 1)
+                            if not dropYoung and not insideSame and not nearDupSame and not samePivDup and not f_too_close_to_alive_same_dir(piv, 1)
+                                int xL = f_zone_x_at_bar(piv)
+                                int xR0 = f_zone_x_at_bar(bi)
+                                box bx = box.new(left=xL, top=zh, right=xR0, bottom=zl, xloc=xlocZ, bgcolor=f_vis_fill(inpShowZones, true), border_color=f_vis_border(inpShowZones), border_width=int(inpZoneBorderW), border_style=line.style_dashed)
+                                array.push(zBox, bx)
+                                array.push(zLo, zl)
+                                array.push(zHi, zh)
+                                array.push(zDir, 1)
+                                array.push(zPivot, piv)
+                                array.push(zSeenOut, seen0)
+                                array.push(zReady, false)
+                                array.push(zReadyBar, -1)
+                                array.push(zTouchDone, td0)
+                                array.push(zNtArm, false)
+                                array.push(zAlive, alv0)
+                                array.push(zBorn, bar_index)
+                                array.push(zFarStreak, far0)
+                                array.push(zEndReason, endReason0)
+                                array.push(zStart, bsL)
+                                array.push(zBaseLen, bsLen)
+                                array.push(zChopCnt, chopN)
+                                array.push(zLastChopBar, bar_index)
+                                array.push(zMajor, isMajorZ)
+                                array.push(zTouchEnd, -1)
+                                array.push(zEntryPlaced, false)
+                                array.push(zEntryFilled, false)
+                                array.push(zEntryReadyAt, -1)
+                                array.push(zScore, scoreZ)
+                                array.push(zDepMoveAtr, depMoveAtr)
+                                array.push(zBosBar, biBos)
+                                array.push(zMfePostReadyAtr, 0.0)
+                                array.push(zMfePreReadyAtr, 0.0)
+                                array.push(zInduceFlags, induceFlags)
+                                array.push(zCfOutSt, 0)
+                                array.push(zCfOvSt, 0)
+                                array.push(zCfDepartSealBar, -1)
+                                f_box_set_xright(bx, endR0)
+                                f_enforce_spatial_zones(24)
+                                f_dedupe_near_duplicate_newer_wins()
+                                if inpDebug and inpDebugPivot and dbgZoneScope
+                                    label.new(f_zone_x_at_bar(piv), (zl + zh) * 0.5, xloc=xlocZ, yloc=yloc.price, text="P", style=label.style_label_left, color=color.new(#0ea5e9, 70), textcolor=color.white, size=size.tiny, tooltip=f_dbg_tip("Demand pivot", piv, zl, zh))
+
+    int bestLBar = na
+    float bestLPx = na
+    bool foundL = false
+    array.clear(bosCandSix)
+    if nsBos > 0
+        for s = 0 to nsBos - 1
+            if array.get(bosTyp, s) == -1
+                int six = array.get(bosBar, s)
+                float px = array.get(bosPx, s)
+                if six < biBos and px > clsBos and not f_cons_has(consLow, six) and f_pivot_in_window(six, barsList, winLo)
+                    array.push(bosCandSix, six)
+                    if not foundL
+                        foundL := true
+                        bestLBar := six
+                        bestLPx := px
+                    else
+                        if inpBosPivotPick == "newest"
+                            if six > bestLBar
+                                bestLBar := six
+                                bestLPx := px
+                        else
+                            if px < bestLPx or (px == bestLPx and six > bestLBar)
+                                bestLBar := six
+                                bestLPx := px
+
+    if bosReady and foundL and not na(bestLBar) and accept_bear_ok(bestLPx)
+        int nCandL = array.size(bosCandSix)
+        if nCandL > 0
+            for ci = 0 to nCandL - 1
+                array.push(consLow, array.get(bosCandSix, ci))
+            f_trim_cons_tail(consLow, inpMaxConsEntries)
+
+        // Keep BOS lines scoped (avoid hitting max_lines_count on long history)
+        if inpShowBos and drawScope
+            int offLb = bar_index - bestLBar
+            line.new(time[offLb], bestLPx, time, bestLPx, xloc=xloc.bar_time, extend=extend.none, color=inpColBos, width=inpBosWidth, style=lineStyleFrom(inpBosStyle))
+
+        // Zone construction must NOT be scoped to right-edge window; otherwise scrolling looks "static"
+        int legStartH = na
+        if ns > 0
+            for s = 0 to ns - 1
+                if array.get(swingTyp, s) == 1
+                    int six = array.get(swingBar, s)
+                    if six < bestLBar
+                        legStartH := na(legStartH) ? six : math.max(legStartH, six)
+        int piv2 = na
+        if not na(legStartH)
+            int ss2 = math.min(legStartH, biBos - 1)
+            int ee2 = biBos
+            if ee2 >= ss2
+                int maxAt = ss2
+                float maxHv = high[bar_index - ss2]
+                for j = ss2 to ee2
+                    int o2 = bar_index - j
+                    float hj = high[o2]
+                    if hj > maxHv
+                        maxHv := hj
+                        maxAt := j
+                piv2 := maxAt
+
+            // Inline ATR for pivot reg filters (pivot-1 bar) to avoid CW10003 (UDF in conditional scope).
+            int piv2IdxForAtr = na(piv2) ? 0 : piv2
+            int piv2AtrBar = math.max(0, piv2IdxForAtr - 1)
+            int relP2 = bar_index - piv2AtrBar
+            float atrPiv2 = relP2 >= 0 ? atrVal[relP2] : atrVal[0]
+            atrPiv2 := na(atrPiv2) or atrPiv2 <= ATR_FLOOR ? ATR_FLOOR : atrPiv2
+            if not na(piv2)
+                int pOff2 = bar_index - piv2
+                [zl0s, zh0s] = f_zone_bounds_from_pivot(pOff2, -1, inpSupplyZoneMode)
+                xlocZ2 = f_zone_x_time() ? xloc.bar_time : xloc.bar_index
+                bool passRange2 = inpDebugRelaxZoneFilters or (zh0s > zl0s and zh0s - zl0s <= SD_MAX_PIVOT_RANGE_ATR * atrPiv2)
+                if allowSupply and passRange2 and f_count_zones_alive() < inpMaxAliveZones
+                    [zl2, zh2] = f_clamp_pivot_h(zl0s, zh0s, false, atrPiv2)
+                    if zh2 > zl2
+                        [bsL2, bsR2, bsLen2] = f_base_width(piv2, zl2, zh2)
+                        bool okQuality2 = inpDebugRelaxZoneFilters or (inpSdZoneMaxBaseBars <= 0 or bsLen2 <= inpSdZoneMaxBaseBars)
+                        bool okMinBase2 = inpDebugRelaxZoneFilters or (uMinBaseLen <= 0 or bsLen2 >= uMinBaseLen)
+                        bool okMinHeight2 = inpDebugRelaxZoneFilters or (uMinZoneHeightAtr <= 0 or (zh2 - zl2) >= uMinZoneHeightAtr * atrPiv2)
+                        int leftCh2 = f_compute_zone_leftmost_chop(piv2, zl2, zh2)
+                        int chopN2 = f_count_bars_heavy_chop(leftCh2, bar_index, zl2, zh2)
+                        bool chopReg2 = inpDebugRelaxZoneFilters or inpSdZoneMaxChopOverlapBars <= 0 or chopN2 <= inpSdZoneMaxChopOverlapBars
+                        int spanCh2 = bar_index - leftCh2 + 1
+                        float chopDensity2 = spanCh2 > 0 ? (float(chopN2) / float(spanCh2)) : 1.0
+                        bool chopDenseOk2 = inpDebugRelaxZoneFilters or (uMaxChopDensity <= 0 or chopDensity2 <= uMaxChopDensity)
+                        bool sweepReg2 = f_pivot_swept_supply(piv2, high[pOff2], atrPiv2)
+                        float pivHighPx = high[pOff2]
+                        float depMoveAtr2 = atrPiv2 > ATR_FLOOR ? (pivHighPx - bestLPx) / atrPiv2 : 0.0
+                        float bosBody2 = f_body_ratio_at_off(A)
+                        bool instOn2 = uInstEnabled and not inpDebugRelaxZoneFilters
+                        bool instDepOk2 = (not instOn2) or ((uDepMinMoveAtr <= 0 or depMoveAtr2 >= uDepMinMoveAtr) and (uDepMinBodyRatio <= 0 or bosBody2 >= uDepMinBodyRatio))
+                        bool swingMajorOk2 = f_is_major_swing_past_only(piv2, -1)
+                        bool isMajorZ2 = swingMajorOk2 and (bsLen2 >= inpMajorZoneExemptBase or (uMajorImpulseAtr > 0 and (pivHighPx - bestLPx) >= uMajorImpulseAtr * atrPiv2))
+                        float scoreZ2 = instOn2 ? f_zone_score(depMoveAtr2, bsLen2, chopDensity2, isMajorZ2) : 1.0
+                        bool scoreOk2 = (not instOn2) or (uMinZoneScoreCreate <= 0 or scoreZ2 >= uMinZoneScoreCreate)
+                        float midPd2 = f_market_mid_from_swings()
+                        float pdPad2 = uPDPadAtr * atrPiv2
+                        bool pdOk2 = (not instOn2) or (not uUsePremiumDiscount) or (na(midPd2) ? true : (zl2 >= (midPd2 + pdPad2)))
+                        int induceFlags2 = f_inducement_flags_now(atrPiv2, uInduceSwingLookback, uInducePadAtr, zl2, zh2)
+                        bool metaOkCreate2 = f_meta_show_ok(false, bsLen2, 0.0, depMoveAtr2, induceFlags2)
+                        if okQuality2 and okMinBase2 and okMinHeight2 and chopReg2 and chopDenseOk2 and sweepReg2 and instDepOk2 and scoreOk2 and pdOk2 and metaOkCreate2
+                            int nk2 = array.size(zBox)
+                            bool dropYoung2 = false
+                            if (not inpDebugRelaxZoneFilters) and inpDropYoungNearDominant and nk2 > 0
+                                for kx2 = 0 to nk2 - 1
+                                    if array.get(zAlive, kx2) and array.get(zDir, kx2) == -1
+                                        int opv2 = array.get(zPivot, kx2)
+                                        float oLo2 = array.get(zLo, kx2)
+                                        float oHi2 = array.get(zHi, kx2)
+                                        int oBase2 = array.get(zBaseLen, kx2)
+                                        if f_should_drop_young_near_dominant(piv2, zl2, zh2, bsLen2, opv2, oLo2, oHi2, oBase2, atrPiv2)
+                                            dropYoung2 := true
+                                            break
+                            // Incremental lifecycle: start fresh, then update per-bar in the main zone loop.
+                            bool alv02 = true
+                            bool seen02 = false
+                            bool td02 = false
+                            int endR02 = bar_index
+                            int endReason02 = 0
+                            int far02 = 0
+                            bool insideSame2 = f_new_inside_existing_same_type(zl2, zh2, -1)
+                            bool nearDupSame2 = f_has_near_duplicate_alive(piv2, -1, zl2, zh2, atrPiv2)
+                            bool samePivDup2 = f_existing_same_pivot_dir(piv2, -1)
+                            if not dropYoung2 and not insideSame2 and not nearDupSame2 and not samePivDup2 and not f_too_close_to_alive_same_dir(piv2, -1)
+                                int xL2 = f_zone_x_at_bar(piv2)
+                                int xR02 = f_zone_x_at_bar(bi)
+                                box bx2 = box.new(left=xL2, top=zh2, right=xR02, bottom=zl2, xloc=xlocZ2, bgcolor=f_vis_fill(inpShowZones, false), border_color=f_vis_border(inpShowZones), border_width=int(inpZoneBorderW), border_style=line.style_dashed)
+                                array.push(zBox, bx2)
+                                array.push(zLo, zl2)
+                                array.push(zHi, zh2)
+                                array.push(zDir, -1)
+                                array.push(zPivot, piv2)
+                                array.push(zSeenOut, seen02)
+                                array.push(zReady, false)
+                                array.push(zReadyBar, -1)
+                                array.push(zTouchDone, td02)
+                                array.push(zNtArm, false)
+                                array.push(zAlive, alv02)
+                                array.push(zBorn, bar_index)
+                                array.push(zFarStreak, far02)
+                                array.push(zEndReason, endReason02)
+                                array.push(zStart, bsL2)
+                                array.push(zBaseLen, bsLen2)
+                                array.push(zChopCnt, chopN2)
+                                array.push(zLastChopBar, bar_index)
+                                array.push(zMajor, isMajorZ2)
+                                array.push(zTouchEnd, -1)
+                                array.push(zEntryPlaced, false)
+                                array.push(zEntryFilled, false)
+                                array.push(zEntryReadyAt, -1)
+                                array.push(zScore, scoreZ2)
+                                array.push(zDepMoveAtr, depMoveAtr2)
+                                array.push(zBosBar, biBos)
+                                array.push(zMfePostReadyAtr, 0.0)
+                                array.push(zMfePreReadyAtr, 0.0)
+                                array.push(zInduceFlags, induceFlags2)
+                                array.push(zCfOutSt, 0)
+                                array.push(zCfOvSt, 0)
+                                array.push(zCfDepartSealBar, -1)
+                                f_box_set_xright(bx2, endR02)
+                                f_enforce_spatial_zones(24)
+                                f_dedupe_near_duplicate_newer_wins()
+                                if inpDebug and inpDebugPivot and dbgZoneScope
+                                    label.new(f_zone_x_at_bar(piv2), (zl2 + zh2) * 0.5, xloc=xlocZ2, yloc=yloc.price, text="P", style=label.style_label_left, color=color.new(#f97316, 70), textcolor=color.white, size=size.tiny, tooltip=f_dbg_tip("Supply pivot", piv2, zl2, zh2))
+
+// Defensive: keep zone arrays aligned before per-zone processing
+if barstate.isconfirmed
+    f_sync_zone_arrays()
+
+// Život zóny: D/S striktní překryv → obě pryč; stejný typ → major / mladší. Pak max. život, chop, far, close kdykoliv, první touch + 1 svíčka buffer.
+int nz = array.size(zBox)
+if barstate.isconfirmed and nz > 0
+    f_enforce_spatial_zones(32)
+    f_dedupe_near_duplicate_newer_wins()
+    // Safety: ukončit extrémně dlouhé obchody, aby neblokovaly vstupy mezi roky.
+    if inpStratMaxHoldBars > 0 and strategy.position_size != 0 and strategy.opentrades > 0
+        int eb = strategy.opentrades.entry_bar_index(0)
+        if eb >= 0 and (bar_index - eb) >= inpStratMaxHoldBars
+            strategy.close_all(comment="max_hold")
+            if inpDebug
+                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="close:max_hold", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny)
+    // Count fills (position transitions 0 -> nonzero)
+    if inpDebug
+        int ps = strategy.position_size > 0 ? 1 : strategy.position_size < 0 ? -1 : 0
+        if dbgLastPos == 0 and ps != 0
+            dbgFillCnt += 1
+        dbgLastPos := ps
+    // Entry gate: allow N concurrent trades (pyramiding enabled). Still keep "one new entry per bar".
+    bool canSubmitStratEntry = strategy.opentrades < inpStratMaxOpenTrades
+    for zi = 0 to nz - 1
+        if zi < array.size(zAlive) and zi < array.size(zLo) and zi < array.size(zHi) and zi < array.size(zDir) and zi < array.size(zPivot) and zi < array.size(zBorn) and zi < array.size(zSeenOut) and zi < array.size(zReady) and zi < array.size(zReadyBar) and zi < array.size(zTouchDone) and zi < array.size(zNtArm) and zi < array.size(zFarStreak) and zi < array.size(zChopCnt) and zi < array.size(zLastChopBar) and zi < array.size(zEndReason) and zi < array.size(zMajor) and zi < array.size(zTouchEnd) and zi < array.size(zEntryPlaced) and zi < array.size(zScore) and zi < array.size(zDepMoveAtr) and zi < array.size(zBosBar) and zi < array.size(zMfePostReadyAtr) and zi < array.size(zMfePreReadyAtr) and zi < array.size(zInduceFlags) and zi < array.size(zCfOutSt) and zi < array.size(zCfOvSt) and zi < array.size(zCfDepartSealBar)
+            if array.get(zAlive, zi)
+                box b = array.get(zBox, zi)
+                xlocT = f_zone_x_time() ? xloc.bar_time : xloc.bar_index
+                float zlv = array.get(zLo, zi)
+                float zhv = array.get(zHi, zi)
+                float zlN = math.min(zlv, zhv)
+                float zhN = math.max(zlv, zhv)
+                int zd = array.get(zDir, zi)
+                int zPiv = array.get(zPivot, zi)
+                int zBr = array.get(zBorn, zi)
+                bool isMajor0 = array.get(zMajor, zi)
+                bool majorProtect = isMajor0 and f_major_protection_ok(zi, zd, zlN, zhN)
+                // Max. životnost (major = delší base, osvobození)
+                if inpMaxZoneLifeBars > 0 and (not majorProtect) and (bar_index - zBr) >= inpMaxZoneLifeBars
+                    f_zone_set_dead(zi, bar_index - 1, 8)
+                    continue
+                // Chop
+                if inpSdZoneMaxChopOverlapBars > 0
+                    int lastCounted = array.get(zLastChopBar, zi)
+                    if bar_index > lastCounted
+                        float rCh = f_bar_overlap_ratio(high, low, zlN, zhN)
+                        int cc0 = array.get(zChopCnt, zi)
+                        if rCh >= inpSdZoneChopOverlapMin
+                            cc0 += 1
+                            array.set(zChopCnt, zi, cc0)
+                        array.set(zLastChopBar, zi, bar_index)
+                        if array.get(zChopCnt, zi) > inpSdZoneMaxChopOverlapBars
+                            // Nikdy `box.delete` a nechat handle v zBox – další průchod dělá set_bgcolor na mrtvém
+                            // boxu a rozbije Y autoscale (fantom dole u ~0, graf „zmáčknutý“ nahoře).
+                            int eChop = math.max(0, bar_index - 1)
+                            if f_zone_set_dead(zi, eChop, 4) > 0 and inpDebug and inpDebugEnd and dbgZoneScope
+                                label.new(f_zone_x_at_bar(bar_index), (zlN + zhN) * 0.5, xloc=xlocT, yloc=yloc.price, text="end:chop", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny)
+                            continue
+                // Far — cena až moc daleko (×ATR)
+                float atrZFar = atrVal
+                atrZFar := na(atrZFar) or atrZFar <= ATR_FLOOR ? ATR_FLOOR : atrZFar
+                int fs0 = array.get(zFarStreak, zi)
+                if inpZoneFarInvalidateEnabled and not majorProtect
+                    bool farCand = zd == 1 ? low > zhN + inpZoneFarInvAtr * atrZFar : high < zlN - inpZoneFarInvAtr * atrZFar
+                    bool farBar = farCand and (not inpFarProtectNearMajor or not f_zone_near_major(zlN, zhN, atrZFar, inpZoneMajorProtectAtr))
+                    if farBar
+                        array.set(zFarStreak, zi, fs0 + 1)
+                    else
+                        array.set(zFarStreak, zi, 0)
+                else
+                    array.set(zFarStreak, zi, 0)
+                if inpZoneFarInvalidateEnabled and not majorProtect and array.get(zFarStreak, zi) >= inpZoneFarInvBars
+                    int cut = math.max(zPiv, bar_index - inpZoneFarInvBars)
+                    int farDead = f_zone_set_dead(zi, cut, 3)
+                    if farDead > 0 and inpDebug and inpDebugEnd and dbgZoneScope
+                        label.new(f_zone_x_at_bar(cut), (zlN + zhN) * 0.5, xloc=xlocT, yloc=yloc.price, text="end:far", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny)
+                    continue
+                bool r0EarlyS = array.get(zReady, zi)
+                if zi < array.size(zMfePreReadyAtr) and (not r0EarlyS) and bar_index > zBr
+                    float depAtPkS = f_safe_atr(atrZFar)
+                    float extPkS = f_ext_pre_ready_atr(zd, high, low, zlN, zhN, depAtPkS)
+                    float prevPkS = array.get(zMfePreReadyAtr, zi)
+                    if extPkS > prevPkS
+                        array.set(zMfePreReadyAtr, zi, extPkS)
+                // Kontaminace pre-READY (parity indikátor v1.4.9)
+                if inpContaminationEnabled and (not r0EarlyS) and bar_index > zBr
+                    int sbCf = array.get(zCfDepartSealBar, zi)
+                    int ovCf = array.get(zCfOvSt, zi)
+                    int oxCf = array.get(zCfOutSt, zi)
+                    float depAtrCf = f_safe_atr(atrZFar)
+                    bool ntNeedCf = uNearTouchPadAtr > 0 and (uNearTouchPadAtr * depAtrCf) > 0
+                    float smaRngCf = ta.sma(high - low, uContamAvgRl)
+                    float rngCf = high - low
+                    float olRCf = f_bar_overlap_ratio(high, low, zlN, zhN)
+                    float dOutRCf = f_depart_outside_ratio(zd, low, high, zlN, zhN)
+                    float bratCf = rngCf > 0 ? math.abs(close - open) / rngCf : 0.0
+                    bool ovBarCf = low <= zhN and high >= zlN
+                    float ovTolCf = math.max(depAtrCf * 3e-4, syminfo.mintick * 16.0)
+                    bool ovLooseCf = math.min(high, zhN + ovTolCf) >= math.max(low, zlN - ovTolCf)
+                    bool ovAnyCf = ovBarCf or ovLooseCf
+                    float ntPadCf = uNearTouchPadAtr * depAtrCf
+                    bool ntProbeCf = ntNeedCf and (not ovBarCf) and (zd == 1 ? (low <= zhN + ntPadCf and low > zhN) : (high >= zlN - ntPadCf and high < zlN))
+                    bool fullOutCf = zd == 1 ? (low > zhN) : (high < zlN)
+                    int a2nCf = sbCf < 0 ? (fullOutCf ? oxCf + 1 : 0) : oxCf
+                    float minOutCf = math.max(0.0, 1.0 - uContamOverlapMaxFrac)
+                    bool a1ShapeCf = sbCf < 0 and rngCf >= uContamMomentumMinMult * depAtrCf and bratCf >= uContamBodyMinFrac
+                    bool a1OverlapOkCf = olRCf <= uContamOverlapMaxFrac or dOutRCf >= minOutCf
+                    bool a1DirD = close > open and (close > zhN or (allowWickReady and high > zhN))
+                    bool a1DirS = close < open and (close < zlN or (allowWickReady and low < zlN))
+                    bool a1Cf = a1ShapeCf and a1OverlapOkCf and (zd == 1 ? a1DirD : a1DirS)
+                    bool a2Cf = sbCf < 0 and fullOutCf and a2nCf >= uContamBarsOutsideMin
+                    bool foA3 = zd == 1 ? (low > zhN) : (high < zlN)
+                    bool a3Cf = sbCf < 0 and foA3 and rngCf >= smaRngCf * uContamFullBarAvgMult
+                    float peakDepartCf = zi < array.size(zMfePreReadyAtr) ? array.get(zMfePreReadyAtr, zi) : 0.0
+                    bool sealByPeakDepartCf = sbCf < 0 and peakDepartCf >= uContamMomentumMinMult
+                    bool sealNowCf = sbCf < 0 and (a1Cf or a2Cf or a3Cf or sealByPeakDepartCf)
+                    int sbNewCf = sbCf
+                    int ovNewCf = ovCf
+                    int oxNewCf = oxCf
+                    if sealNowCf
+                        sbNewCf := bar_index
+                        ovNewCf := 0
+                        oxNewCf := ntNeedCf ? 0 : 1
+                        if ntNeedCf and (ntProbeCf or ovAnyCf)
+                            oxNewCf := 1
+                    else if sbCf >= 0
+                        int nearCf = oxCf
+                        if ntNeedCf and nearCf == 0 and (ntProbeCf or ovAnyCf)
+                            nearCf := 1
+                        oxNewCf := nearCf
+                        if bar_index > sbCf
+                            ovNewCf := ovAnyCf ? ovCf + 1 : 0
+                    else
+                        ovNewCf := 0
+                        oxNewCf := a2nCf
+                    array.set(zCfDepartSealBar, zi, sbNewCf)
+                    array.set(zCfOvSt, zi, ovNewCf)
+                    array.set(zCfOutSt, zi, oxNewCf)
+                    bool streakOkCf = ovNewCf >= uContamReturnBarsMin
+                    bool touchRetCf = (not ntNeedCf) ? ovAnyCf : (oxNewCf >= 1 and (ovAnyCf or ntProbeCf))
+                    bool killCf = (not sealNowCf) and sbNewCf >= 0 and bar_index > sbNewCf and (streakOkCf or touchRetCf)
+                    if killCf
+                        f_kill_sametype_overlap_cluster(zi, 12, bar_index)
+                        if inpDebugContamination and dbgZoneScope
+                            label.new(bar_index, (zlN + zhN) * 0.5, xloc=xloc.bar_index, yloc=yloc.price, text="cf", style=label.style_label_left, color=color.new(#c026d3, 35), textcolor=color.white, size=size.tiny, tooltip="Kontaminace pre-READY (end 12)")
+                        continue
+                // READY (departure) + TOUCH (parity indikátor); vstup strategie při `touchOkInd` + meta (`stratTouchOk`)
+                bool depOkT = (bar_index - zPiv) >= inpSdDepartureMinBarsAfterPivot
+                bool ready0 = array.get(zReady, zi)
+                int readyBar0 = array.get(zReadyBar, zi)
+                float depAtr = f_safe_atr(atrVal)
+                float depNeed = uInstEnabled ? (uDepMinCloseAtr * depAtr) : 0.0
+                bool depByCloseOnly = zd == 1 ? (close > zhN + depNeed) : (close < zlN - depNeed)
+                bool depByWick = allowWickReady and (zd == 1 ? (high > zhN + depNeed) : (low < zlN - depNeed))
+                bool depDepartOk = depByCloseOnly or depByWick
+                if not ready0 and depOkT and bar_index > zBr and depDepartOk
+                    array.set(zReady, zi, true)
+                    array.set(zReadyBar, zi, bar_index)
+                    array.set(zSeenOut, zi, true)
+                    ready0 := true
+                    readyBar0 := bar_index
+                    array.set(zEntryReadyAt, zi, bar_index)
+                    if inpDebug
+                        dbgReadyCnt += 1
+                    if inpDebug and dbgZoneScope
+                        float yR = zd == 1 ? zhN : zlN
+                        string rTip = allowWickReady ? "READY (close nebo knot za hranou)" : "READY (departure close)"
+                        label.new(bar_index, yR, xloc=xloc.bar_index, yloc=yloc.price, text="R", style=zd == 1 ? label.style_label_down : label.style_label_up, color=color.new(#64748b, 55), textcolor=color.white, size=size.tiny, tooltip=rTip)
+
+                if array.get(zReady, zi)
+                    float mfePrev = array.get(zMfePostReadyAtr, zi)
+                    float extNow = zd == 1 ? (high - zhN) / depAtr : (zlN - low) / depAtr
+                    extNow := math.max(0.0, extNow)
+                    if extNow > mfePrev
+                        array.set(zMfePostReadyAtr, zi, extNow)
+
+                bool metaTradeOk = f_meta_show_ok(array.get(zReady, zi), array.get(zBaseLen, zi), array.get(zMfePostReadyAtr, zi), array.get(zDepMoveAtr, zi), array.get(zInduceFlags, zi))
+
+                bool overlap0 = low <= zhN and high >= zlN
+                bool edgeTouch = zd == 1 ? (overlap0 and (high >= zhN or low <= zlN)) : (overlap0 and (low <= zlN or high >= zhN))
+                bool touchGeom = uTouchRequireEdgeCross ? edgeTouch : overlap0
+                bool prevOverlap = bar_index > 0 ? (low[1] <= zhN and high[1] >= zlN) : false
+                bool prevOutsideDir = bar_index > 0 ? (zd == 1 ? (low[1] > zhN) : (high[1] < zlN)) : false
+                bool priorOk = (not uTouchRequirePriorOutside) or (not prevOverlap)
+                float arrAgg = uInstEnabled ? f_arrival_aggression_atr(zd, zlN, zhN, uArrivalLookback, depAtr) : 0.0
+                float lastRangeAtr = uInstEnabled and bar_index > 0 ? ((high[1] - low[1]) / depAtr) : 0.0
+                bool arrivalOk = (not uInstEnabled) or ((uArrivalMaxAtr <= 0 or arrAgg <= uArrivalMaxAtr) and (uArrivalMaxLastBarRangeAtr <= 0 or lastRangeAtr <= uArrivalMaxLastBarRangeAtr))
+                bool prevStrictOk = (not uTouchStrictOutsidePrevBar) or prevOutsideDir
+                float ntPad = uNearTouchPadAtr * depAtr
+                bool ntProbe = uNearTouchPadAtr > 0 and ntPad > 0 and not overlap0 and (zd == 1 ? (low <= zhN + ntPad and low > zhN) : (high >= zlN - ntPad and high < zlN))
+                bool ntGates = ready0 and bar_index > readyBar0 and prevStrictOk and priorOk and bar_index > zBr and arrivalOk
+                float ntStrNeed = uNearTouchStrongDepartAtr * depAtr
+                bool ntStrongDepartClose = zd == 1 ? (close > zhN + ntStrNeed) : (close < zlN - ntStrNeed)
+                bool ntStrongDepartWick = allowWickReady and (zd == 1 ? (high > zhN + ntStrNeed) : (low < zlN - ntStrNeed))
+                bool ntStrongDepart = ntStrongDepartClose or ntStrongDepartWick
+                bool ntArm0 = zi < array.size(zNtArm) and array.get(zNtArm, zi)
+                bool touchOkInd = ready0 and bar_index > readyBar0 and overlap0 and touchGeom and prevStrictOk and priorOk and bar_index > zBr and arrivalOk
+                bool stratTouchOk = touchOkInd and metaTradeOk
+                if touchOkInd
+                    array.set(zTouchEnd, zi, bar_index)
+                    f_sync_touch_sametype_cluster(zi, bar_index)
+                    if not array.get(zTouchDone, zi)
+                        array.set(zTouchDone, zi, true)
+                        if dbgZoneScope and inpShowTouch
+                            label.new(bar_index, zd == 1 ? zhN : zlN, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=zd == 1 ? label.style_label_down : label.style_label_up, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip="Touch after READY (viz preset doteku)")
+
+                    // Fill model: assume fill on touch (execute immediately when edge is touched).
+                    bool needConfirm = uInstEnabled and uEntryConfirm != "Off"
+                    float edgePx = zd == 1 ? zhN : zlN
+                    bool confOk = not needConfirm ? true : (uEntryConfirm == "Pinbar" ? f_pinbar_reject(zd == 1, edgePx) : f_engulf_reject(zd == 1, edgePx))
+                    bool didEntry = false
+
+                    if inpStratFillMode == "Assume fill on touch" and stratTouchOk and not array.get(zEntryPlaced, zi) and canSubmitStratEntry and confOk
+                        float wZ = math.max(syminfo.mintick, zhN - zlN)
+                        float extra = math.max(0.0, inpStratSlMult - 1.0) * wZ
+                        float sL0 = f_round_tick(zd == 1 ? (zlN - extra) : (zhN + extra))
+                        float ePx = f_round_tick(zd == 1 ? zhN : zlN)
+                        float risk0 = zd == 1 ? (ePx - sL0) : (sL0 - ePx)
+                        if risk0 > syminfo.mintick
+                            string oidE = (zd == 1 ? "D_" : "S_") + str.tostring(zPiv)
+                            float tPx = f_round_tick(zd == 1 ? (ePx + inpStratR * risk0) : (ePx - inpStratR * risk0))
+                            float qEnt = inpStratQty > 0 ? inpStratQty : 1.0
+                            strategy.entry(oidE, zd == 1 ? strategy.long : strategy.short, qty=qEnt, comment="touch-assumed " + (zd == 1 ? "D" : "S") + " " + str.tostring(zPiv))
+                            strategy.exit("X_" + oidE, from_entry=oidE, stop=sL0, limit=tPx)
+                            array.set(zEntryPlaced, zi, true)
+                            array.set(zEntryFilled, zi, true)
+                            canSubmitStratEntry := false
+                            didEntry := true
+                            if inpDebug
+                                dbgOrderCnt += 1
+                            if uDebugMarkOrders
+                                label.new(bar_index, ePx, xloc=xloc.bar_index, yloc=yloc.price, text="E", style=zd == 1 ? label.style_label_down : label.style_label_up, color=color.new(#0ea5e9, 55), textcolor=color.white, size=size.tiny, tooltip="Assumed fill on touch (edge)")
+                        else
+                            if inpDebug and dbgZoneScope
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:risk", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Touch happened, but risk too small / invalid SL")
+                    else
+                        // Diagnostics: touch happened, but entry not taken (common reason for 'many T but few trades')
+                        if inpDebug and dbgZoneScope and inpStratFillMode == "Assume fill on touch"
+                            if array.get(zEntryPlaced, zi)
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:placed", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Touch happened, but this zone already placed an entry")
+                            else if not canSubmitStratEntry
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:pos", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Touch happened, but blocked by open position (single-position gate)")
+                            else if not metaTradeOk
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:meta", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Filtry zóny (base/induce/MFE/…) — skupina Kvalita zóny")
+                            else if not confOk
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:conf", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Touch happened, but confirmation failed")
+
+                    // End immediately on touch bar
+                    f_kill_sametype_overlap_cluster(zi, 5, bar_index)
+                    continue
+
+                bool ntComplete = ntGates and ntStrongDepart and not overlap0 and (ntProbe or ntArm0)
+                if ntComplete
+                    f_kill_sametype_overlap_cluster(zi, 11, bar_index)
+                    if inpDebug and inpDebugEnd and dbgZoneScope
+                        label.new(bar_index, (zlN + zhN) * 0.5, xloc=xloc.bar_index, yloc=yloc.price, text="end:near", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny, tooltip="Near-touch → silný odchod")
+                    continue
+                if ntGates and ntProbe and not ntStrongDepart and zi < array.size(zNtArm)
+                    array.set(zNtArm, zi, true)
+                    f_sync_nt_arm_sametype_cluster(zi)
+
+                // Entry model (backtest): po READY položit limit na hranu zóny a čekat na vyplnění.
+                // Tím se vyhneme tomu, že limit zadáme až v touch baru (pak se často vyplní až na další svíčce / vůbec).
+                if inpStratFillMode == "Limit (resting)" and ready0 and not array.get(zEntryPlaced, zi)
+                    // Timeout: pokud limit visí příliš dlouho, zruš a ukonči zónu
+                    int rAt = array.get(zEntryReadyAt, zi)
+                    if uEntryTimeoutBars > 0 and rAt >= 0 and (bar_index - rAt) > uEntryTimeoutBars
+                        f_strat_cancel_pending(zi)
+                        f_zone_set_dead(zi, bar_index - 1, 10)
+                        if inpDebug
+                            label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="end:timeout", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny)
+                    else
+                        bool needConfirm2 = uInstEnabled and uEntryConfirm != "Off"
+                        float edgePx2 = zd == 1 ? zhN : zlN
+                        bool confOk2 = not needConfirm2 ? true : (uEntryConfirm == "Pinbar" ? f_pinbar_reject(zd == 1, edgePx2) : f_engulf_reject(zd == 1, edgePx2))
+                        if inpDebug
+                            dbgOrderAttemptCnt += 1
+                        if not canSubmitStratEntry
+                            if inpDebug
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:pos", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Blocked: position/pyramiding gate")
+                        else if confOk2 and metaTradeOk
+                            float wZ = math.max(syminfo.mintick, zhN - zlN)
+                            float extra = math.max(0.0, inpStratSlMult - 1.0) * wZ
+                            float sL0 = f_round_tick(zd == 1 ? (zlN - extra) : (zhN + extra))
+                            float ePx = f_round_tick(zd == 1 ? zhN : zlN)
+                            float risk0 = zd == 1 ? (ePx - sL0) : (sL0 - ePx)
+                            if risk0 > syminfo.mintick
+                                string oidE = (zd == 1 ? "D_" : "S_") + str.tostring(zPiv)
+                                float tPx = f_round_tick(zd == 1 ? (ePx + inpStratR * risk0) : (ePx - inpStratR * risk0))
+                                float qEnt = inpStratQty > 0 ? inpStratQty : 1.0
+                                strategy.entry(oidE, zd == 1 ? strategy.long : strategy.short, qty=qEnt, limit=ePx, comment="ready-limit " + (zd == 1 ? "D" : "S") + " " + str.tostring(zPiv))
+                                strategy.exit("X_" + oidE, from_entry=oidE, stop=sL0, limit=tPx)
+                                array.set(zEntryPlaced, zi, true)
+                                canSubmitStratEntry := false
+                                if inpDebug
+                                    dbgOrderCnt += 1
+                                if uDebugMarkOrders
+                                    label.new(bar_index, ePx, xloc=xloc.bar_index, yloc=yloc.price, text="E", style=zd == 1 ? label.style_label_down : label.style_label_up, color=color.new(#0ea5e9, 55), textcolor=color.white, size=size.tiny, tooltip="Placed limit at edge (ready-limit)")
+                            else
+                                if inpDebug
+                                    label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:risk", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Risk too small / invalid SL")
+                        else if confOk2 and not metaTradeOk
+                            if inpDebug
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:meta", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Filtry zóny — čekej na MFE / induce / base…")
+                        else
+                            if inpDebug
+                                label.new(bar_index, close, xloc=xloc.bar_index, yloc=yloc.price, text="no-entry:conf", style=label.style_label_left, color=color.new(#ef4444, 70), textcolor=color.white, size=size.tiny, tooltip="Blocked: confirmation")
+                // Uzavření mimo zónu — až po kontrole prvního retestu (stejný bar může protáhnout pásmo i zavřít „proti“ zóně)
+                if (zd == 1 and close < zlN) or (zd == -1 and close > zhN)
+                    int nkc = f_kill_sametype_overlap_cluster(zi, 1, -1)
+                    if nkc > 0 and dbgZoneScope and inpShowTouch
+                        if zd == 1
+                            label.new(bar_index, zlN, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_down, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip="Close inv. cluster")
+                        else
+                            label.new(bar_index, zhN, xloc=xloc.bar_index, yloc=yloc.price, text="T", style=label.style_label_up, color=color.new(inpTouchCol, 25), textcolor=inpTouchCol, size=size.tiny, tooltip="Close inv. cluster")
+                    if inpDebug and inpDebugEnd and dbgZoneScope and nkc > 0
+                        label.new(bar_index, (zlN + zhN) * 0.5, xloc=xloc.bar_index, yloc=yloc.price, text="end:inv", style=label.style_label_left, color=color.new(#64748b, 65), textcolor=color.white, size=size.tiny)
+                    continue
+                // Legacy seenOut update removed: READY is handled by range-outside departure above.
+                if array.get(zAlive, zi)
+                    box bb = array.get(zBox, zi)
+                    int teCap = array.get(zTouchEnd, zi)
+                    int capR = teCap >= 0 ? math.min(bar_index, teCap) : bar_index
+                    f_box_set_xright(bb, capR)
+
+// Synchronizace viditelnosti všech zone boxů (toggle + historické zóny)
+int nzVis = array.size(zBox)
+if nzVis > 0
+    for ziVis = 0 to nzVis - 1
+        if ziVis < array.size(zBox) and ziVis < array.size(zDir) and ziVis < array.size(zAlive) and ziVis < array.size(zReady)
+            box zb = array.get(zBox, ziVis)
+            bool isDemV = array.get(zDir, ziVis) == 1
+            bool alvV = array.get(zAlive, ziVis)
+            bool readyV = array.get(zReady, ziVis)
+            bool sideOk = isDemV ? (uZoneSide == "Obě" or uZoneSide == "Demand") : (uZoneSide == "Obě" or uZoneSide == "Supply")
+            bool showV = inpShowZones and sideOk
+            if not alvV or not showV
+                box.set_bgcolor(zb, color.new(color.gray, 100))
+                box.set_border_color(zb, color.new(inpZoneBorder, 100))
+            else if not readyV
+                box.set_bgcolor(zb, inpPendingFill)
+                box.set_border_color(zb, inpPendingBorder)
+            else
+                box.set_bgcolor(zb, f_vis_fill(true, isDemV))
+                box.set_border_color(zb, f_vis_border(true))
+
+int nSw = array.size(swingBar)
+int tipBar = nSw > 0 ? array.get(swingBar, nSw - 1) : na
+int lastTyp = na
+float lastPx = na
+int lastSb = na
+if nSw > 0
+    lastTyp := array.get(swingTyp, nSw - 1)
+    lastPx := array.get(swingPx, nSw - 1)
+    lastSb := array.get(swingBar, nSw - 1)
+
+bool newSwingMark = barstate.isconfirmed and nSw > 0 and (na(prevTipSwingBar) or tipBar != prevTipSwingBar)
+
+bool markH = newSwingMark and lastTyp == 1
+bool markL = newSwingMark and lastTyp == -1
+
+// Swing marks at exact pivot price: use labels (plotshape has no price `y` in v5/v6)
+if barstate.isconfirmed and inpShowSwings and markH and not na(lastPx) and not na(lastSb)
+    label lb = label.new(lastSb, lastPx, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, color=inpColSwingHigh, size=size.tiny, text="", tooltip=swingModeMajor ? "Swing high (Major pivot)" : "Swing high")
+    array.push(swingLbls, lb)
+if barstate.isconfirmed and inpShowSwings and markL and not na(lastPx) and not na(lastSb)
+    label lb = label.new(lastSb, lastPx, xloc=xloc.bar_index, yloc=yloc.price, style=label.style_circle, color=inpColSwingLow, size=size.tiny, text="", tooltip=swingModeMajor ? "Swing low (Major pivot)" : "Swing low")
+    array.push(swingLbls, lb)
+
+while array.size(swingLbls) > 450
+    label.delete(array.shift(swingLbls))
+
+if barstate.isconfirmed
+    if nSw > 0
+        prevTipSwingBar := tipBar
+    else
+        prevTipSwingBar := na
+
+// Runtime TF (cannot go into indicator() title in Pine v6)
+if barstate.islast
+    if inpShowChartTfLabel
+        string tfText = "TF: " + timeframe.period
+        if na(gChartTfLabel)
+            gChartTfLabel := label.new(bar_index, high, xloc=xloc.bar_index, yloc=yloc.price, text=tfText, style=label.style_label_left, color=color(na), textcolor=color.new(color.silver, 0), size=size.tiny, tooltip="Chart timeframe — trend může používat HTF přes request.security().")
+        else
+            label.set_x(gChartTfLabel, bar_index)
+            label.set_y(gChartTfLabel, high)
+            label.set_text(gChartTfLabel, tfText)
+    else
+        if not na(gChartTfLabel)
+            label.delete(gChartTfLabel)
+            gChartTfLabel := na
+
+// Debug summary at last bar
+if barstate.islast and inpDebug
+    label.new(bar_index, high, xloc=xloc.bar_index, yloc=yloc.price, text="dbg ready=" + str.tostring(dbgReadyCnt) + " orders=" + str.tostring(dbgOrderCnt) + " fills=" + str.tostring(dbgFillCnt), style=label.style_label_left, color=color.new(#64748b, 75), textcolor=color.white, size=size.tiny)
+

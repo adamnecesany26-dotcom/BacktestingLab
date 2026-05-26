@@ -1,4 +1,5 @@
 import type { OhlcBar } from "@shared/types";
+import { instrumentTimeframeToMinutes } from "@/lib/viewChartTimeframe";
 
 const TF_TO_MS: Record<string, number> = {
   "1m": 60_000,
@@ -10,6 +11,46 @@ const TF_TO_MS: Record<string, number> = {
   "1d": 24 * 60 * 60_000,
   "1w": 7 * 24 * 60 * 60_000,
 };
+
+/** Map manifest / run timeframe řetězce na klíč agregace v grafu (shodné s TF_TO_MS). */
+export function manifestTfToChartKey(tf: string | null | undefined): keyof typeof TF_TO_MS | null {
+  const t = (tf ?? "").trim().toLowerCase();
+  if (!t) return null;
+  if (t in TF_TO_MS) return t as keyof typeof TF_TO_MS;
+  if (t === "60m" || t === "60") return "1h";
+  if (t === "1h" || t === "1hr" || t === "h1") return "1h";
+  if (t === "4h" || t === "240m") return "4h";
+  if (t === "1d" || t === "d1" || t === "daily" || t === "day") return "1d";
+  if (t === "1w" || t === "w1" || t === "weekly") return "1w";
+  return null;
+}
+
+/**
+ * Výchozí výběr TF na záložce Graf detail: shodný s barami strategie (`workTimeframe`),
+ * pokud je ze souboru agregovaný; jinak nativní dataset (`source`).
+ */
+export function defaultDetailedChartTfFromManifest(
+  dataFileTf: string | null | undefined,
+  strategyWorkTf: string | null | undefined
+): string {
+  const dk = manifestTfToChartKey(dataFileTf);
+  const wk = manifestTfToChartKey(strategyWorkTf);
+  if (!wk || !dk) return "source";
+  if (wk === dk) return "source";
+  const dMin = instrumentTimeframeToMinutes(dataFileTf ?? "");
+  const wMin = instrumentTimeframeToMinutes(strategyWorkTf ?? "");
+  if (wMin > dMin && TF_TO_MS[wk] != null) return wk;
+  return "source";
+}
+
+/** Délka jedné svíčky (ms) pro osu X v Plotly — vždy podle **zobrazovaného** TF, ne medián mezer v datech. */
+export function barPeriodMsForChartSelection(chartTf: string, dataFileNativeTf: string | null | undefined): number | null {
+  if (chartTf !== "source") {
+    const ms = TF_TO_MS[chartTf];
+    return ms != null ? ms : null;
+  }
+  return nativeBarMsFromManifest(dataFileNativeTf);
+}
 
 /** Median spacing between consecutive bars (ms). */
 export function inferMedianBarMs(ohlc: OhlcBar[]): number {
@@ -39,19 +80,40 @@ function closestTfLabel(ms: number): string {
   return best;
 }
 
-/** Dropdown options: always "source", plus coarser standard TFs than inferred data. */
-export function getChartTfSelectOptions(ohlc: OhlcBar[]): { value: string; label: string }[] {
-  const src = inferMedianBarMs(ohlc);
-  const inferred = closestTfLabel(src);
+/** Native bar size (ms): manifest / run TF, not spacing of downsampled `ohlc` in API (MAX_OHLC_EXPORT_BARS). */
+function nativeBarMsFromManifest(nativeTf: string | undefined | null): number | null {
+  const t = (nativeTf ?? "").trim();
+  if (!t) return null;
+  const m = instrumentTimeframeToMinutes(t);
+  if (!Number.isFinite(m) || m <= 0) return null;
+  return m * 60 * 1000;
+}
+
+/** Dropdown options: always "source", plus coarser standard TFs than **native** data TF. */
+export function getChartTfSelectOptions(
+  ohlc: OhlcBar[],
+  nativeTf?: string | null,
+  strategyWorkTf?: string | null
+): { value: string; label: string }[] {
+  const inferredMs = inferMedianBarMs(ohlc);
+  const fromManifest = nativeBarMsFromManifest(nativeTf);
+  const src = fromManifest ?? inferredMs;
+  const nativeLabel = (nativeTf ?? "").trim();
+  const approxLabel = closestTfLabel(inferredMs);
+  const workKey = strategyWorkTf ? manifestTfToChartKey(strategyWorkTf) : null;
   const out: { value: string; label: string }[] = [
-    { value: "source", label: `Zdroj (~${inferred})` },
+    {
+      value: "source",
+      label: nativeLabel ? `Dataset (${nativeLabel})` : `Dataset (~${approxLabel})`,
+    },
   ];
   const order = ["5m", "15m", "30m", "1h", "4h", "1d", "1w"] as const;
   for (const tf of order) {
     const ms = TF_TO_MS[tf];
     if (ms == null) continue;
     if (ms > src * 1.35) {
-      out.push({ value: tf, label: tf });
+      const label = workKey === tf ? `${tf} (strategie)` : tf;
+      out.push({ value: tf, label });
     }
   }
   return out;
@@ -62,9 +124,9 @@ function bucketKey(t: number, barMs: number): number {
 }
 
 /** Aggregate OHLC to coarser bars (time-bucket OHLC). */
-export function resampleOhlcToBarMs(ohlc: OhlcBar[], barMs: number): OhlcBar[] {
+export function resampleOhlcToBarMs(ohlc: OhlcBar[], barMs: number, srcMsOverride?: number): OhlcBar[] {
   if (!ohlc.length || barMs <= 0) return ohlc;
-  const srcMs = inferMedianBarMs(ohlc);
+  const srcMs = srcMsOverride ?? inferMedianBarMs(ohlc);
   if (barMs <= srcMs * 1.05) return ohlc;
 
   const buckets = new Map<number, OhlcBar[]>();
@@ -94,11 +156,16 @@ export function resampleOhlcToBarMs(ohlc: OhlcBar[], barMs: number): OhlcBar[] {
   });
 }
 
-export function resampleOhlcForChartChoice(ohlc: OhlcBar[], choice: string): OhlcBar[] {
+export function resampleOhlcForChartChoice(
+  ohlc: OhlcBar[],
+  choice: string,
+  nativeTf?: string | null
+): OhlcBar[] {
   if (!ohlc.length || choice === "source") return ohlc;
   const ms = TF_TO_MS[choice];
   if (ms == null) return ohlc;
-  return resampleOhlcToBarMs(ohlc, ms);
+  const srcOverride = nativeBarMsFromManifest(nativeTf);
+  return resampleOhlcToBarMs(ohlc, ms, srcOverride ?? undefined);
 }
 
 const DEFAULT_INTRADAY_STEP_SEC = 1800;

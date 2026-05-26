@@ -69,6 +69,7 @@ export function buildBacktestSavePayload(data: RunResponse, request?: RunRequest
     qualityGate: data.qualityGate ?? null,
     experiment: data.experiment ?? null,
     batchSummary: data.batchSummary ?? null,
+    propFirmBacktest: data.propFirmBacktest ?? null,
     methodologyNotes: (data.manifest?.methodology as Record<string, string> | undefined) ?? null,
   };
 }

@@ -58,7 +58,7 @@ export function FieldHelpPopover({ help }: FieldHelpPopoverProps) {
         aria-expanded={open}
         aria-controls={panelId}
         onClick={() => setOpen((prev) => !prev)}
-        className="h-5 w-5 rounded-full border border-zinc-600 text-[11px] font-bold text-zinc-200 hover:bg-zinc-700"
+        className="h-4 w-4 shrink-0 rounded-full border border-zinc-500/80 bg-zinc-800/40 text-[10px] font-semibold leading-none text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100"
       >
         ?
       </button>

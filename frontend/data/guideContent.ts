@@ -204,17 +204,17 @@ export const guideSections: GuideSection[] = [
       },
       {
         id: "walk-forward-and-mc",
-        title: "Walk-forward + Monte Carlo",
+        title: "Walk-forward + Monte Carlo (kde co najdeš)",
         whatItIs:
-          "Walk-forward opakovaně testuje strategii na „budoucích“ segmentech. Monte Carlo simuluje rozdělení možných výsledků a tail-risk.",
+          "Walk-forward opakovaně testuje strategii na budoucích segmentech stejné historie. Monte Carlo v této aplikaci = samostatná záložka po uložení runu: náhodné pořadí obchodů nebo prop-firm simulace v prohlížeči.",
         whyItMatters:
-          "Společně dávají mnohem realistější obraz robustnosti než jeden equity curve.",
+          "WF ti ukáže stabilitu v čase. Monte Carlo zase rozptyl scénářů z už hotové série obchodů — ale nekonfiguruješ ho v pravém panelu při Run.",
         howToUse: [
           "Pro přísnější validaci použij walk-forward (3–6 foldů, test ratio 0.15–0.25).",
-          "Zapni Monte Carlo a použij minimálně 300 simulací.",
-          "Vyhodnocuj i pesimistické scénáře, ne jen medián.",
+          "Po dokončení a uložení runu otevři záložku Monte Carlo, vyber výsledek a nastav počet simulací.",
+          "Vyhodnocuj i horší scénáře (ocasy distribuce), ne jen průměr.",
         ],
-        recommendedDefaults: ["WF folds: 4", "WF test ratio: 0.20", "MC simulations: 300–500"],
+        recommendedDefaults: ["WF folds: 4", "WF test ratio: 0.20", "Monte Carlo: začni 300–500 iterací podle výkonu PC"],
       },
       {
         id: "quality-gates-and-execution",
@@ -248,7 +248,7 @@ export const guideSections: GuideSection[] = [
         howToUse: [
           "Equity (USD): tvar křivky, drawdown, náklady modelu. Druhý graf: součet R — potřebuje platné stopPrice v zoneMeta u obchodů.",
           "Highlight/Detailed: kontrola obchodů; v Detailed lze zapnout „vrstvy z cache“ (stejný formát jako View z .backtest_artifacts) pro shodu zón s USE_SD_ARTIFACTS.",
-          "Analytics: robustnost, Monte Carlo, validace, foldy, guardrails, cost attribution, heuristický readiness a overfitting varování.",
+          "Analytics: robustnost, validace, foldy, guardrails, případně starší blok monteCarlo v JSON, cost attribution, heuristický readiness.",
           "Run history: porovnáváš iterace, branch vývoj, N-way compare a lifecycle stavy.",
           "Repro bundle: manifest + souhrn + snapshot main.py z editoru pro pozdější audit (ulož kód před exportem).",
         ],
@@ -306,7 +306,7 @@ export const guideSections: GuideSection[] = [
         id: "multiple-testing-guide",
         title: "Multiple testing: trial count a Bonferroni",
         whatItIs:
-          "Kolikrát jsi testoval různé konfigurace. Engine počítá hlavní run + param test + sweep. Naive Bonferroni α = 0.05 / počet pokusů.",
+          "Engine počítá pokusy z hlavního běhu: sweep, param test a počet walk-forward foldů (případně batch jen u API). Bonferroni α = 0.05 / K je hrubý odhad.",
         whyItMatters:
           `20 testů na stejných datech = 20× vyšší šance na falešně pozitivní výsledek. Trial count je tvůj „metr poctivosti".`,
         howToUse: [
@@ -328,7 +328,8 @@ export const guideSections: GuideSection[] = [
         whyItMatters:
           "Cílem je edge, který přežije i méně příznivé podmínky.",
         howToUse: [
-          "Použij OOS/WF, quality gates a Monte Carlo.",
+          "Zapni OOS nebo walk-forward a rozumné quality gates.",
+          "Po WF nebo sweepu otevři záložku Monte Carlo pro tail-risk pohled na stejné obchody.",
           "Započítej realistické náklady exekuce.",
           "Porovnej výsledek s baseline runem ve stejné branchi.",
         ],
@@ -354,7 +355,7 @@ export const guideSections: GuideSection[] = [
         id: "prop-conservative-guide",
         title: "Prop conservative preset: nejpřísnější konfigurace",
         whatItIs:
-          "Přednastavení pro maximální důvěryhodnost: WF 5 foldů, min 50 obchodů, max DD 15%, PF ≥ 1.5, MC 1000 sim (block bootstrap), spread 1.5 bps, slippage ×vol 2, latency 1 bar, stress multiplier 1.5×, param test train-only.",
+          "Přednastavení: WF 5 foldů, min 50 obchodů, max DD 15 %, PF ≥ 1.5, sweep vypnutý, execution se spread 1.5 bps, slippage ×vol 2, latence 1 bar, stress 1.5×, param test train-only. Monte Carlo není součástí tohoto tlačítka — doplň ho v záložce Monte Carlo.",
         whyItMatters:
           "Odpovídá požadavkům prop firm reviewera: přísná validace, realistická exekuce, robustní statistika. Edge, který přežije tuhle konfiguraci, má mnohem větší šanci přežít i v reálném obchodování.",
         howToUse: [
@@ -469,55 +470,53 @@ export const guideSections: GuideSection[] = [
     id: "advanced-recent",
     title: "8) Pokročilé funkce a nedávná rozšíření",
     intro:
-      "Tato sekce doplňuje základní průvodce o to, co aplikace umí nad rámec „jeden single run“: reprodukovatelnost, druhy Monte Carla, dávkové běhy, export a heuristické hodnocení overfittingu. Detailní mapu celé aplikace máš v souboru READMEADAM.md v kořeni repozitáře.",
+      "Tato sekce doplňuje základní průvodce o reprodukovatelnost, Monte Carlo v samostatné záložce, export a heuristické hodnocení overfittingu. Detailní mapu celé aplikace máš v souboru READMEADAM.md v kořeni repozitáře.",
     topics: [
       {
         id: "fixed-seed",
         title: "Fixní run seed (reprodukovatelnost)",
         whatItIs:
-          "V Edge finding můžeš zapnout pevný seed. Hodnota se uloží do experimentu a v engine procesu nastaví RUN_SEED — stejné náhodné větve (Monte Carlo, sweep, block bootstrap) při stejném kódu a datech.",
+          "V Edge finding můžeš zapnout pevný seed. Hodnota se uloží do experimentu a v engine nastaví RUN_SEED — stejné větve náhody ve sweepu při stejném kódu a datech.",
         whyItMatters:
-          "Bez fixního seedu jsou MC a sweep mezi běhy mírně odlišné; pro debugging a porovnání dvou verzí kódu je pevný seed praktický.",
+          "Bez fixního seedu je sweep mezi běhy mírně odlišný; pro debugging a porovnání dvou verzí kódu je pevný seed praktický.",
         howToUse: [
           "Zapni „Použít pevný seed“ a zadej celé číslo (0–999999999).",
           "Pro běžný průzkum nech seed vypnutý — každý run dostane náhodný seed.",
-          "U batch dávky sdílí všechny dílčí runy stejný seed z rodičovského requestu (srovnatelné RNG napříč položkami).",
         ],
         recommendedDefaults: ["Pro regresní testy např. seed 42; pro research náhodný."],
       },
       {
         id: "mc-modes",
-        title: "Monte Carlo: IID trade vs block bootstrap",
+        title: "Monte Carlo (záložka v aplikaci)",
         whatItIs:
-          "IID náhodně vybírá uzavřené obchody; block bootstrap náhodně vybírá souvislé úseky PnL v čase, aby lépe zachytil serialitu.",
+          "Po uložení backtest runu otevři hlavní záložku Monte Carlo: shuffle (náhodné pořadí obchodů) nebo prop-firm challenge; běží v prohlížeči na uložených obchodech.",
         whyItMatters:
-          "U strategií s korelovanými výsledky po sobě může IID pod nebo přestřelit tail odhady.",
+          "Backtest menu MC už neobsahuje — simulace jsou oddělené od engine runu.",
         howToUse: [
-          "V Edge finding zapni Monte Carlo a zvol režim podle stylu strategie.",
-          "Ve výsledcích čti pole method / mode / note u monteCarlo.",
-          "Kombinuj s dostatečným počtem obchodů a OOS/WF.",
+          "Ulož run → Monte Carlo → vyber výsledek vlevo → nastav počet simulací.",
+          "Starší runy mohou mít pole monteCarlo ze serveru — nový workflow je v záložce.",
+          "Kombinuj s dostatečným počtem obchodů a OOS/WF při samotném backtestu.",
         ],
-        recommendedDefaults: ["300–500 simulací; block_bootstrap pro kratší holdy nebo intraday."],
+        recommendedDefaults: ["300–500 shuffle běhů jako start."],
       },
       {
         id: "sweep-and-batch",
-        title: "Parametrický sweep a batch (matrix) runy",
+        title: "Parametrický sweep",
         whatItIs:
-          "Sweep testuje více kombinací parametrů (random nebo grid). Batch spouští víkrát stejnou strategii s různými overrides (např. jiný instrument nebo data_file) v jednom requestu.",
+          "Sweep (random nebo grid) testuje více kombinací parametrů strategie v rámci jednoho instrumentu a jednoho běhu s rozšířeným výstupem.",
         whyItMatters:
-          "Oba přístupy zvyšují počet „pokusů“ — roste riziko náhodného výborného výsledku (multiple testing).",
+          "Víc vzorků zvyšuje riziko náhodného skvělého výsledku (multiple testing) — kombinuj s OOS nebo walk-forward.",
         howToUse: [
-          "Sweep nikdy nespoléhej na single run; používej s OOS nebo walk-forward.",
-          "Batch drž na malý počet položek na začátku (max runs cap v UI).",
-          "V Analytics a batchSummary čti varování k vícenásobnému testování.",
+          "Sweep nikdy nespoléhej jen na single run; používej s OOS nebo walk-forward.",
+          "V Analytics čti varování k vícenásobnému testování.",
         ],
-        commonMistakes: ["Společně zapnutý portfolio režim a batch (UI varuje).", "Interpretace jen „nejlepšího“ řádku bez kontextu."],
+        commonMistakes: ["Interpretace jen „nejlepšího“ řádku bez kontextu a bez validace mimo vzorek."],
       },
       {
         id: "analytics-overfitting",
         title: "Analytics: readiness, overfitting a náklady",
         whatItIs:
-          "Nahoře v Analytics je heuristický readiness signál a seznam varování (single run, málo obchodů, MC, degradace train→test, sweep na single, batch, guardrails, …). Severity score shrnuje závažnost — není to statistický test.",
+          "Nahoře v Analytics je heuristický readiness signál a seznam varování (single run, málo obchodů, MC, degradace train→test, sweep na single, guardrails, …). Severity score shrnuje závažnost — není to statistický test.",
         whyItMatters:
           "Dává konzistentní checklist, na co se dívat před tím, než začneš věřit výsledku.",
         howToUse: [

@@ -14,6 +14,6 @@ Tady jsou **hotové kousky kódu**, které zkopíruješ do aplikace (Moduly nebo
 
 **Precompute (S/D + Swing HL do Parquet):** CLI `python -m app.services.hl_precompute` a `python -m app.services.sd_precompute` z kořene s nastaveným `PYTHONPATH` (viz [README.md](../README.md)); nebo **Build features** v UI. Detaily: [docs/BACKTEST_PIPELINE_REFACTOR.md](../docs/BACKTEST_PIPELINE_REFACTOR.md).
 
-Strategie z `strategies/` mají README přímo ve své složce (např. `strategies/sd_zone_strategy/README.md`).
+Strategie z `strategies/` mají README přímo ve své složce (např. `strategies/orb_prop_firm_killer/`).
 
 Celá platforma: [README.md](../README.md) · průvodce uživatelem: [READMEADAM.md](../READMEADAM.md).

@@ -25,6 +25,10 @@ export interface StrategyParamMeta {
   booleanWidget?: boolean;
   /** Override default select-with-options: multiselect stores comma-separated values. */
   widget?: "select" | "multiselect";
+  /** Section title (Python: `group`, `tv_group`, `input_group`). */
+  group?: string;
+  /** Sort order within section (Python: `order`). Lower = earlier. */
+  order?: number;
   /** Show field only when current[dependsOnParam] is one of dependsOnValues. */
   dependsOnParam?: string;
   dependsOnValues?: string[];
@@ -99,14 +103,20 @@ function extractDictBlock(code: string, variableName: string): string | null {
 }
 
 function toJsonDict(dictStr: string): string {
-  return dictStr
+  let s = dictStr
     .replace(/\bTrue\b/g, "true")
     .replace(/\bFalse\b/g, "false")
     .replace(/\bNone\b/g, "null")
-    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, s) => `${JSON.stringify(s)}:`)
+    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_, inner) => `${JSON.stringify(inner)}:`)
     .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g, (_, before, key, after) => `${before}"${key}"${after}`)
-    .replace(/([:,])\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, punct, s) => `${punct} ${JSON.stringify(s)}`)
+    .replace(/([:,])\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, punct, inner) => `${punct} ${JSON.stringify(inner)}`)
     .replace(/,(\s*})/g, "$1");
+  /** Python PEP 515 underscores in numeric literals — invalid in JSON */
+  s = s.replace(
+    /(:\s*)(-?\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?)(?=\s*[,}])/g,
+    (_, prefix, num) => String(prefix) + String(num).replace(/_/g, "")
+  );
+  return s;
 }
 
 function parsePythonDict(code: string, variableName: string): Record<string, unknown> {
@@ -159,8 +169,19 @@ function normalizeMetaEntry(value: unknown): StrategyParamMeta | null {
   const widget: StrategyParamMeta["widget"] =
     w === "multiselect" ? "multiselect" : w === "select" ? "select" : undefined;
 
+  const readOrder = (v: unknown): number | undefined => {
+    if (typeof v === "number" && Number.isFinite(v)) return Math.trunc(v);
+    if (typeof v === "string" && v.trim()) {
+      const n = parseInt(v.trim(), 10);
+      return Number.isFinite(n) ? n : undefined;
+    }
+    return undefined;
+  };
+
   const help: StrategyParamMeta = {
     title: readString(source.title),
+    group: readString(source.group ?? source.tv_group ?? source.input_group),
+    order: readOrder(source.order ?? source.display_order),
     whatItMeans: readString(source.whatItMeans ?? source.what_it_means),
     whyItMatters: readString(source.whyItMatters ?? source.why_it_matters),
     howToUse: readStringArray(source.howToUse ?? source.how_to_use),
@@ -178,6 +199,7 @@ function normalizeMetaEntry(value: unknown): StrategyParamMeta | null {
   };
   const hasSomeContent =
     !!help.title ||
+    !!help.group ||
     !!help.whatItMeans ||
     !!help.whyItMatters ||
     (help.howToUse && help.howToUse.length > 0) ||
@@ -188,7 +210,8 @@ function normalizeMetaEntry(value: unknown): StrategyParamMeta | null {
     !!help.dependsOnParam2 ||
     (help.bestPractices && help.bestPractices.length > 0) ||
     !!help.recommendedDefault ||
-    !!help.withoutIt;
+    !!help.withoutIt ||
+    help.order != null;
   return hasSomeContent ? help : null;
 }
 
@@ -248,6 +271,71 @@ export function paramFieldVisible(meta: StrategyParamMeta | undefined, current: 
     if (!m.dependsOnValues2.includes(String(current[m.dependsOnParam2] ?? ""))) return false;
   }
   return true;
+}
+
+/**
+ * Put dependent fields directly under their parent in the same group (master toggle → sub-settings).
+ * Uses `dependsOnParam` when that key exists in the list; otherwise `dependsOnParam2`.
+ */
+export function orderParamEntriesForNestedDisplay(
+  entries: [string, StrategyParamValue][],
+  metaMap: StrategyParamsMeta,
+): [string, StrategyParamValue][] {
+  if (entries.length <= 1) return entries;
+
+  const entryMap = new Map<string, [string, StrategyParamValue]>();
+  for (const e of entries) {
+    entryMap.set(e[0], e);
+  }
+  const keys = entries.map(([k]) => k);
+  const keySet = new Set(keys);
+
+  const childrenByParent = new Map<string, string[]>();
+  for (const k of keys) {
+    const m = metaMap[k] ?? {};
+    const par = m.dependsOnParam?.trim();
+    const par2 = m.dependsOnParam2?.trim();
+    const parentKey = par && keySet.has(par) ? par : par2 && keySet.has(par2) ? par2 : null;
+    if (!parentKey) continue;
+    const arr = childrenByParent.get(parentKey);
+    if (arr) arr.push(k);
+    else childrenByParent.set(parentKey, [k]);
+  }
+
+  const isChild = new Set<string>();
+  for (const arr of Array.from(childrenByParent.values())) {
+    for (const c of arr) isChild.add(c);
+  }
+
+  const sortKeys = (a: string, b: string) => {
+    const oa = metaMap[a]?.order ?? 99999;
+    const ob = metaMap[b]?.order ?? 99999;
+    if (oa !== ob) return oa - ob;
+    return a.localeCompare(b);
+  };
+
+  const roots = keys.filter((k) => !isChild.has(k)).sort(sortKeys);
+
+  const outList: [string, StrategyParamValue][] = [];
+  const visited = new Set<string>();
+
+  function visit(k: string) {
+    if (visited.has(k)) return;
+    visited.add(k);
+    const row = entryMap.get(k);
+    if (row) outList.push(row);
+    const ch = childrenByParent.get(k);
+    if (ch?.length) {
+      for (const c of [...ch].sort(sortKeys)) visit(c);
+    }
+  }
+
+  for (const r of roots) visit(r);
+  for (const k of keys) {
+    if (!visited.has(k)) visit(k);
+  }
+
+  return outList;
 }
 
 /**
@@ -367,7 +455,7 @@ export function parseStrategyImportDependencies(code: string): StrategyImportDep
 }
 
 /**
- * Dynamic loads used by strategies (e.g. sd_zone_strategy): importlib.import_module("modules.Foo").
+ * Dynamic loads used by strategies: importlib.import_module("modules.Foo").
  * Only string literals — not f-strings or variables.
  */
 export function parseImportlibPackageLiterals(code: string): StrategyImportDependencies {
@@ -484,7 +572,14 @@ export function zoneTimeframesFromStrategyCode(code: string | null | undefined):
 
 export function parseViewParams(code: string): StrategyParams {
   if (!code || typeof code !== "string") return {};
-  const parsed = parsePythonDict(code, "VIEW_PARAMS");
+  const viewBlock = extractDictBlock(code, "VIEW_PARAMS");
+  let parsed = parsePythonDict(code, "VIEW_PARAMS");
+  if (Object.keys(parsed).length === 0 && viewBlock && /\bfor\b/.test(viewBlock)) {
+    const fromParams = parsePythonDict(code, "PARAMS");
+    parsed = Object.fromEntries(
+      Object.entries(fromParams).filter(([k]) => k !== "process_orders_on_close"),
+    ) as Record<string, unknown>;
+  }
   const result: StrategyParams = {};
   for (const [k, v] of Object.entries(parsed)) {
     if (typeof v === "number" || typeof v === "boolean" || typeof v === "string") {
@@ -496,7 +591,20 @@ export function parseViewParams(code: string): StrategyParams {
 
 export function parseViewParamMeta(code: string): StrategyParamsMeta {
   if (!code || typeof code !== "string") return {};
-  return parseParamsMeta(code, "VIEW_PARAMS_META");
+  const metaBlock = extractDictBlock(code, "VIEW_PARAMS_META");
+  let parsed = parsePythonDict(code, "VIEW_PARAMS_META");
+  if (Object.keys(parsed).length === 0 && metaBlock && /\bfor\b/.test(metaBlock)) {
+    const fromMeta = parsePythonDict(code, "PARAMS_META");
+    parsed = Object.fromEntries(
+      Object.entries(fromMeta).filter(([k]) => k !== "process_orders_on_close"),
+    ) as Record<string, unknown>;
+  }
+  const out: StrategyParamsMeta = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    const normalized = normalizeMetaEntry(v);
+    if (normalized) out[k] = normalized;
+  }
+  return out;
 }
 
 export function parseViewParamBundle(code: string): { params: StrategyParams; meta: StrategyParamsMeta } {

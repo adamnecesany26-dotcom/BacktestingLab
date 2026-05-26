@@ -9,6 +9,8 @@ import {
 } from "@/lib/viewChartLines";
 import type { OhlcBar, ModuleOutput, ModuleZone, Trade } from "@shared/types";
 import { zoneTimeBoundsForOhlc } from "@/lib/zoneChartAlign";
+import { inferMedianBarMs } from "@/lib/chartOhlcResample";
+import { plotlyRangeBreaksForOhlcGaps } from "@/lib/plotlySessionGapRangeBreaks";
 
 type VisibilityKey =
   | "entry_markers"
@@ -238,6 +240,8 @@ interface ModuleOutputChartProps {
    * Touch markery z touch_bar_index jsou indexy do aktuálního OHLC pole — po agregaci TF jsou nesmyslné.
    */
   showZoneTouchByIndex?: boolean;
+  /** Plotly `xperiod` v ms podle zobrazovaného TF — ne z mediánu mezer (řídká řada rozbije svíčky). */
+  candleBarPeriodMs?: number | null;
 }
 
 const MARKER_COLORS: Record<string, string> = {
@@ -285,6 +289,7 @@ export function ModuleOutputChart({
   rrrTradeStyle = false,
   orderLevelsMode = false,
   showZoneTouchByIndex = true,
+  candleBarPeriodMs = null,
 }: ModuleOutputChartProps) {
   const [Plot, setPlot] = useState<React.ComponentType<any> | null>(null);
   const [visibilityPanelOpen, setVisibilityPanelOpen] = useState(false);
@@ -331,6 +336,24 @@ export function ModuleOutputChart({
     xperiodalignment: "middle",
     name: "OHLC",
   };
+  const medianMs = ohlc.length >= 2 ? inferMedianBarMs(ohlc) : null;
+  let periodMs: number | null = null;
+  if (
+    typeof candleBarPeriodMs === "number" &&
+    Number.isFinite(candleBarPeriodMs) &&
+    candleBarPeriodMs > 0
+  ) {
+    if (medianMs == null || medianMs <= candleBarPeriodMs * 1.5) {
+      periodMs = candleBarPeriodMs;
+    } else {
+      periodMs = medianMs;
+    }
+  } else if (medianMs != null) {
+    periodMs = medianMs;
+  }
+  if (periodMs != null && periodMs >= 15_000 && periodMs <= 10 * 24 * 60 * 60 * 1000) {
+    candlestickTrace.xperiod = periodMs;
+  }
 
   const traces: any[] = [candlestickTrace];
 
@@ -476,6 +499,7 @@ export function ModuleOutputChart({
     if (orderLevelsMode) {
       const sl = zoneMetaPrice(t.zoneMeta, ["stopPrice", "stop_loss", "sl", "stop"]);
       const tp = zoneMetaPrice(t.zoneMeta, ["targetPrice", "takeProfit", "tp", "target"]);
+      const beSl = zoneMetaPrice(t.zoneMeta, ["breakEvenStopPrice", "be_stop", "beStop"]);
       if (sl != null) {
         tradeShapes.push({
           type: "line",
@@ -487,6 +511,17 @@ export function ModuleOutputChart({
           layer: "below",
         });
       }
+      if (beSl != null && (sl == null || Math.abs(beSl - sl) > EPS)) {
+        tradeShapes.push({
+          type: "line",
+          x0,
+          x1,
+          y0: beSl,
+          y1: beSl,
+          line: { color: "rgba(252, 211, 77, 0.9)", width: 2, dash: "2px,3px" },
+          layer: "below",
+        });
+      }
       if (tp != null) {
         tradeShapes.push({
           type: "line",
@@ -495,6 +530,19 @@ export function ModuleOutputChart({
           y0: tp,
           y1: tp,
           line: { color: "rgba(74, 222, 128, 0.95)", width: 2, dash: "6px,4px" },
+          layer: "below",
+        });
+      }
+      for (const pk of ["partialPrice1", "partialPrice2", "partialPrice3"] as const) {
+        const pp = zoneMetaPrice(t.zoneMeta, [pk]);
+        if (pp == null) continue;
+        tradeShapes.push({
+          type: "line",
+          x0,
+          x1,
+          y0: pp,
+          y1: pp,
+          line: { color: "rgba(251, 146, 60, 0.88)", width: 2, dash: "10px,4px" },
           layer: "below",
         });
       }
@@ -853,11 +901,7 @@ export function ModuleOutputChart({
       gridcolor: "#27272a",
       rangeslider: { visible: true, thickness: 0.05, bgcolor: "#27272a" },
       fixedrange: false,
-      ...((rrrTradeStyle || orderLevelsMode)
-        ? {
-            rangebreaks: [{ bounds: ["sat", "mon"] }],
-          }
-        : {}),
+      rangebreaks: plotlyRangeBreaksForOhlcGaps(ohlc),
     },
     yaxis: {
       gridcolor: "#27272a",

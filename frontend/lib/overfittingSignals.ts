@@ -52,10 +52,7 @@ export function assessOverfitting(ctx: OverfittingSignalContext): OverfittingAss
   }
 
   const ror = ctx.riskOfRuin;
-  if (!Number.isFinite(ror)) {
-    warnings.push("Chybí Monte Carlo risk-of-ruin — tail risk není kvantifikován.");
-    severity += 2;
-  } else {
+  if (Number.isFinite(ror)) {
     if (ror > 0.25) {
       warnings.push(`Vysoký odhad risk of ruin (${(ror * 100).toFixed(1)}%).`);
       severity += 2;

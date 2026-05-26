@@ -24,7 +24,8 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 > - API auth + rate limiting; `/api/view` v host subprocessu; append-only audit (`.audit/events.jsonl`).
 > - Manifest fingerprinting (`runSeed`, `datasetFingerprint`, `codeDigest`, `actorId`).
 > - Firestore owner/role + soft-delete; compare workspace + lifecycle v Run history.
-> - Edge finding: OOS/WF, **param_test** (citlivost numerických PARAMS na stejných datech), quality gates, sweep, Monte Carlo (**iid_trade** / **block_bootstrap**), regime, portfolio, execution model, forward bridge, **batch_config** (matrix runy).
+> - Edge finding: OOS/WF, **param_test** (citlivost numerických PARAMS na stejných datech), quality gates, sweep, execution model, forward bridge. Jeden Run v UI = **jedna strategie, jeden instrument** (žádné portfolio / matrix / regime z klienta).
+> - **Monte Carlo** (shuffle trade sequence, prop-firm simulace v prohlížeči): samostatná **hlavní záložka** po uložení runu — není v menu Edge finding.
 > - Volitelný **fixní seed** (`experiment.seed` → `RUN_SEED` v engine).
 > - **Cost attribution** v execution summary; **Analytics** s heuristikami readiness/overfitting (`overfittingSignals.ts`).
 > - **Bootstrap CI** (95% intervaly pro mean PnL, total return, trade Sharpe; Bonferroni α korekce); **Payoff decomposition** (edge rovnice, Kelly frakce); **Multiple testing awareness** (trial count K, Bonferroni strip).
@@ -32,11 +33,11 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 > - **Repro bundle (ZIP)** z výsledků (manifest + summary + snapshot `main.py`).
 > - Nápověda u polí: **FieldHelpPopover** + `backtestFieldMeta.ts`; **Guided mode** a **/guide** z `guideContent.ts`.
 > - **Prop-level red flags** (`_compute_prop_red_flags`): automatická kontrola výsledků na podezřelé vzory (vysoký Sharpe s málo obchody, nulové ztráty, příliš hladká equity, koncentrace PnL, …); výstup `propRedFlags` v `RunResponse` s `trustLevel` (not_trustworthy / low_trust / cautious / acceptable) + trust banner v ResultsView a barevná sekce v Analytics.
-> - **Prop conservative** preset v Edge finding (WF 5 folds, min 50 obchodů, MC 1000 block_bootstrap, execution se stress multiplierem 1.5×).
+> - **Prop conservative** preset v Edge finding (WF 5 foldů, min 50 obchodů, PF/drawdown brány, execution se stress 1.5×, param test train-only; bez Monte Carla v tomto presetu — MC je v záložce Monte Carlo).
 > - **„Not a broker" disclaimer** v execution summary sekci Analytics.
 > - **Performance optimalizace:** In-process engine jako výchozí (eliminace subprocess overhead), lightweight mode pro sub-runy (přeskočení bootstrap CI / drawdown / OHLC), in-memory result cache (256 slotů), fast data fingerprint (mtime+size místo SHA-256), vectorized OHLC/equity export, server-side OHLC cap (8000 barů).
 > - **Trader audit (2026-03):** "Reality check" varování v ResultsView (málo obchodů, execution off, single run, PnL koncentrace); **Underwater equity chart** (drawdown % timeline + "pod vodou" statistika); **Pessimist preset** (agresivní execution: spread 2 bps, slip 3×vol, latence 2 bary, stress 2×); **Run journal note** (poznámka k runu, export do repro bundle); color-coded StatBlocks (DD duration, recovery, PnL koncentrace, trade count — vizuální alarm při nebezpečných hodnotách).
-> - **UX audit (2026-03):** **Verdict row** nad StatBlocks (readiness label + severity + top 3 warnings + run kontext inline — validace/MC/exec/instrument); **klávesové zkratky** 1–5 pro záložky výsledků; **StatBlocks seskupeny** do 3 kategorií (PnL / Risk / Activity) s responsive gridem `auto-fill minmax(7rem,1fr)`; **ⓘ metodika toggle** (defaultně skryté, odkrytí přes "Metodika" tlačítko); **param test** zbalen do `<details>` když je přítomen; **zone slovník na klik** místo hover; **odstraněny duplicitní stat cards** z Analytics details (ponecháno jen Avg Win/Loss, Best/Worst, MFE/MAE); zkrácený manifest strip text.
+> - **UX audit (2026-03):** **Verdict row** nad StatBlocks (readiness label + severity + top 3 warnings + run kontext inline — validace / exekuce / instrument); **klávesové zkratky** 1–5 pro záložky výsledků; **StatBlocks seskupeny** do 3 kategorií (PnL / Risk / Activity) s responsive gridem `auto-fill minmax(7rem,1fr)`; **ⓘ metodika toggle** (defaultně skryté, odkrytí přes "Metodika" tlačítko); **param test** zbalen do `<details>` když je přítomen; **zone slovník na klik** místo hover; **odstraněny duplicitní stat cards** z Analytics details (ponecháno jen Avg Win/Loss, Best/Worst, MFE/MAE); zkrácený manifest strip text.
 
 ---
 
@@ -52,16 +53,16 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 6. **Výsledky (ResultsView)** – záložky **Equity** | **Highlight** | **Detailed** | **Analytics** | **Run history**; **StatBlocks** s metodickými ⓘ; **Export JSON** a **Repro bundle (ZIP)**.
 7. **Detailed** – svíčky + sloučené výstupy modulů (`ModuleOutputChart`) a obchody; není samostatná záložka „Moduly“.
 8. **Trade Highlight** – jeden obchod, okno entry–exit + kontext.
-9. **Analytics** – strip **konfigurace běhu** z `manifest.analysis`; záložka **S/D zóny** (`SdZoneAnalytics`, `zoneMeta`); při `param_test` grafy **`ParamTestAnalytics`**; validace, foldy, guardrails, robustnost/sweep heatmapa, Monte Carlo, regime, portfolio, execution + **cost attribution**, forward bridge, batch summary, quality gate, experiment diff; **readiness / overfitting** (heuristiky; část bloků je v rozbalené „Obecná analytika“).
+9. **Analytics** – strip **konfigurace běhu** z `manifest.analysis`; záložka **S/D zóny** (`SdZoneAnalytics`, `zoneMeta`); při `param_test` grafy **`ParamTestAnalytics`**; validace, foldy, guardrails, robustnost/sweep heatmapa, volitelně pole `monteCarlo` / `regimeAnalysis` / `portfolio` / `batchSummary` ze **starších nebo API** běhů, execution + **cost attribution**, forward bridge, quality gate, experiment diff; **readiness / overfitting** (heuristiky; část bloků je v rozbalené „Obecná analytika“).
 10. **Run history** – Firestore, tabulka, grafy metrik, **N-way compare**, lifecycle/governance, sloupec readiness (stejná logika jako Analytics).
 11. **Edge finding** (pravý panel) – validace (`single` / `oos_split` / `walk_forward` / **`param_test`**), gates, sweep, MC režimy, seed, regime, portfolio, batch, execution, forward bridge, experiment (hypotéza, tagy, branch, promote on pass). Presety: **Pessimist** (agresivní execution: spread 2 bps, slip 3×vol, latence 2 bary, stress 2× — nemění validaci) / Safe / Balanced / Explore / **Prop conservative** (WF 5 folds, min 50 obchodů, max DD 15 %, PF ≥ 1.5, MC 1000 block_bootstrap, execution se stress 1.5×, param test train-only).
-12. **Guided mode** – checklist + varování před riskantními kombinacemi (např. sweep bez OOS).
-13. **View mode** – graf bez backtestu; View params drawer pro `VIEW_PARAMS`.
-14. **Uložit / Uloženo** – stav tlačítka podle změn v editoru.
-15. **Guide** – plovoucí **?** → `/guide` (obsah `guideContent.ts`); u polí **?** → `backtestFieldMeta.ts`.
-16. **Precompute artefaktů (H/L + S/D)** – CLI `python -m app.services.hl_precompute` / `python -m app.services.sd_precompute` ukládá Parquet + manifesty pod **`.backtest_artifacts/{dataset_id}/`**. Složka je v **`.gitignore`**. Stejný `dataset_id` používá View, build v UI a runner při `use_sd_artifacts=1`.
-17. **View z cache** – v `StrategyViewChart` lze zapnout **H/L + S/D z cache** (`POST /api/view` s `use_artifacts: true`); bez přepočtu modulů na serveru. Řádek **Cache (dataset)** + **Build features** volá `POST /api/artifacts/build` a `POST /api/artifacts/status`.
-18. **Backtest se S/D Parquet** – parametr strategie `use_sd_artifacts`: runner ověří `sd/v1/zones.parquet`, nastaví `USE_SD_ARTIFACTS` + `SD_ARTIFACT_ZONES_PATH`. Při `0` sanitizuje env (legacy větev `get_zones`). Detaily: `docs/BACKTEST_PIPELINE_REFACTOR.md`.
+13. **Guided mode** – checklist + varování před riskantními kombinacemi (např. sweep bez OOS).
+14. **View mode** – graf bez backtestu; View params drawer pro `VIEW_PARAMS`.
+15. **Uložit / Uloženo** – stav tlačítka podle změn v editoru.
+16. **Guide** – plovoucí **?** → `/guide` (obsah `guideContent.ts`); u polí **?** → `backtestFieldMeta.ts`.
+17. **Precompute artefaktů (H/L + S/D)** – CLI `python -m app.services.hl_precompute` / `python -m app.services.sd_precompute` ukládá Parquet + manifesty pod **`.backtest_artifacts/{dataset_id}/`**. Složka je v **`.gitignore`**. Stejný `dataset_id` používá View, build v UI a runner při `use_sd_artifacts=1`.
+18. **View z cache** – v `StrategyViewChart` lze zapnout **H/L + S/D z cache** (`POST /api/view` s `use_artifacts: true`); bez přepočtu modulů na serveru. Řádek **Cache (dataset)** + **Build features** volá `POST /api/artifacts/build` a `POST /api/artifacts/status`.
+19. **Backtest se S/D Parquet** – parametr strategie `use_sd_artifacts`: runner ověří `sd/v1/zones.parquet`, nastaví `USE_SD_ARTIFACTS` + `SD_ARTIFACT_ZONES_PATH`. Při `0` sanitizuje env (legacy větev `get_zones`). Detaily: `docs/BACKTEST_PIPELINE_REFACTOR.md`.
 
 ### 1.2 Architektura (vysokoúrovňově)
 
@@ -70,6 +71,7 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 │  FRONTEND (Next.js, React)                                                   │
 │  - page.tsx: hlavní stav, orchestrace, handleRun, saveBacktestResult          │
 │  - BacktestSettings: + Edge finding, Guided mode; FieldHelp + backtestFieldMeta│
+│  - components/monteCarlo/MonteCarloWorkspace: záložka Monte Carlo (simulace z uložených runů) │
 │  - StrategyEditor: Monaco editor (kód)                                       │
 │  - ResultsView: Equity | Highlight | Detailed | Analytics | Run history; ZIP   │
 │  - StatBlocks, AnalyticsView (readiness/overfitting), TradeHighlight, RunHistory│
@@ -112,7 +114,7 @@ Při **jakémkoli auditu nebo systematické kontrole kódu** ukládej výsledné
 Engine běží jako **dětský proces** stejného Pythonu jako backend. Pro vlastní / důvěřovaný kód je to nejjednodušší; pro veřejný multi-tenant hosting by bylo potřeba znovu zavést silnější izolaci.
 
 - Timeout default 1 hodina (`RUN_TIMEOUT_SEC` / UI **Max. doba běhu** / `run_timeout_sec` v requestu)
-- Dávkové běhy: volitelná paralelizace `BATCH_PARALLEL_WORKERS` (1–8)
+- **Batch / matrix:** desktopové UI **neposílá** `batch_config`; hromadné běhy zůstávají jako možnost API/skriptů (`batch_config` + volitelná paralelizace `BATCH_PARALLEL_WORKERS`, 1–8).
 - **In-process engine** je nyní **výchozí** (bez druhého interpreteru; eliminuje cold-start overhead). Subprocess se použije jen při explicitním `RUN_INPROCESS_ENGINE=0`. Globální lock zajišťuje konzistenci stavu.
 - **Single-user:** strategie běží jako tvůj uživatel na hostu; pro veřejný multi-tenant by bylo potřeba znovu zavést silnější izolaci než čistý subprocess.
 
@@ -123,7 +125,7 @@ Systém obsahuje několik vrstev optimalizace pro minimalizaci doby backtestů:
 | Optimalizace | Popis | Dopad |
 |---|---|---|
 | **In-process engine (default)** | Eliminuje subprocess fork + Python import overhead na každý run. | ~2–5s úspora na run (kritické pro param test / sweep s desítkami sub-runů). |
-| **Lightweight mode** | Param test, sweep, WF fold a portfolio sub-runy přeskočí těžké analytiky (bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition, OHLC export). | ~30–60 % úspora CPU na sub-run; dramaticky menší JSON payload. |
+| **Lightweight mode** | Param test, sweep a WF fold sub-runy přeskočí těžké analytiky (bootstrap CI, drawdown analysis, PnL distribution, payoff decomposition, OHLC export). | ~30–60 % úspora CPU na sub-run; dramaticky menší JSON payload. |
 | **Result cache** | In-memory LRU (256 slotů) klíčovaný (code_digest, params, data_fingerprint, bars, lightweight). Cache hit = nulový CPU. | Okamžitý návrat pro opakované param test / sweep body. |
 | **Fast data fingerprint** | Rutinní `datasetFingerprint` používá `mtime_ns + size` hash místo plného SHA-256 celého souboru. | Eliminuje druhé plné čtení disku na GB CSV souborech. |
 | **Vectorized OHLC export** | Pandas vectorizace místo row-by-row `iloc` smyčky + server-side cap (default 8000 barů, `MAX_OHLC_EXPORT_BARS`). | ~10× rychlejší export + menší JSON pro frontend. |
@@ -307,14 +309,14 @@ Backtesting_app/
   "quality_gates": { "min_trades": 30, "max_dd": 25, "min_pf": 1.2 },
   "sweep_mode": "random",
   "sweep_config": { "max_samples": 24 },
-  "monte_carlo": { "simulations": 300, "ruin_dd_pct": 50 },
-  "regime_config": { "enabled": true },
   "execution_model": { "enabled": true, "spread_bps": 0.5, "slippage_vol_mult": 1.0, "latency_bars": 0, "stress_multiplier": 1.0 },
   "experiment": { "hypothesis": "sd-trend-breakout", "tags": ["manual-run"], "seed": 42 }
 }
 ```
 
-*Poznámka:* `experiment.seed` je volitelné; v UI lze zapnout fixní seed → hodnota se předá do env `RUN_SEED` subprocessu (reprodukovatelnost MC / sweep / bootstrap). Když seed v requestu chybí, backend doplní náhodný.
+*Desktopové UI (`page.tsx`)* typicky **neposílá** `monte_carlo`, `regime_config`, `portfolio_config` ani `batch_config` — Monte Carlo běží v samostatné záložce nad uloženými výsledky. **API** ale dál umí volitelně `monte_carlo`, `regime_config`, `portfolio_config`, `batch_config` (skripty, integrace, starší klienti).
+
+*Poznámka:* `experiment.seed` je volitelné; v UI lze zapnout fixní seed → hodnota se předá do env `RUN_SEED` subprocessu (reprodukovatelnost náhodného výběru ve sweepu / block-bootstrapu v engine, pokud je v requestu zapnuto). Když seed v requestu chybí, backend doplní náhodný.
 
 *`validation_mode`:* kromě příkladu výše je podporováno `single`, `walk_forward` a **`param_test`** (OAT citlivost vybraných číselných `PARAMS` na stejných datech; konfigurace v `validation_config.param_test`, engine vrací `validation.paramTest` a UI `ParamTestAnalytics`). Param test podporuje **train-only režim** (`train_only: true`): OAT sweep probíhá jen na trénovací části dat a nejlepší nalezený parametr se automaticky vyhodnotí na hold-out (out-of-sample) části — výsledek holdout evaluace je v `validation.paramTest.holdout`.
 
@@ -360,7 +362,7 @@ Backtesting_app/
    - `_compute_bootstrap_ci(trades)`: bootstrap 95% CI pro mean PnL, total return a trade-level Sharpe (1 000 resamplingů uzavřených obchodů); vrací `bootstrapCI` s `lo`/`hi`/`alpha`/`adjustedAlpha`/`trialCount`
    - `_compute_payoff_decomposition(trades, metrics)`: rozklad edge — win rate, loss rate, avg win, avg loss, payoff ratio (avg win / avg loss), edge per trade (WR×AvgWin − LR×AvgLoss), Kelly fraction; vrací `payoffDecomposition`
    - `_compute_prop_red_flags(metrics, trades, equity, manifest, bootstrapCI, tradePnlDistribution)`: automatická kontrola výsledků z pohledu prop-firm reviewer — vrací `propRedFlags` s `trustLevel` a seznamem `flags`. Kontrolované vzory: extrémně vysoký Sharpe s málo obchody, příliš málo obchodů (< 10 critical, < 30 warning), nulové ztráty / win rate > 95 %, nedefinovaný PF (sentinel), single run bez validace, vypnutý execution model, kombinace single + no execution = minimální věrohodnost, podezřele nízký DD, příliš hladká equity (> 92 % barů rostoucích), bootstrap CI protínající nulu, koncentrace PnL (top 5 > 80 %)
-   - `trialCount` v manifestu: počet nezávislých pokusů (sweep × batch × folds); `overfittingSignals.bonferroniAlpha` = 0.05 / K
+   - `trialCount` v manifestu: počet nezávislých pokusů (sweep vzorky × dílčí běhy batch × foldy; u běžného UI bez batch často sweep × foldy); `overfittingSignals.bonferroniAlpha` = 0.05 / K
 8. Vypíše JSON na stdout, `PROGRESS:100` na stderr
 
 **Response (`RunResponse`):**
@@ -802,7 +804,7 @@ Spustí backtest.
 
 **Query:** `?stream=1` – SSE stream (log, progress, result)
 
-**Body (RunRequest):** `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `commission_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules` (pro výstupy modulů), `run_id`, `validation_mode` (`single` \| `oos_split` \| `walk_forward` \| `param_test`), `validation_config`, `quality_gates`, `sweep_mode`, `sweep_config`, `monte_carlo`, `regime_config`, `portfolio_config`, `execution_model`, `experiment`, volitelně `batch_config`
+**Body (RunRequest):** jako výše; desktop klient posílá zjednodušenou podmnožinu (**bez** `monte_carlo`, `regime_config`, `portfolio_config`, `batch_config`). Plný tvar včetně volitelných polí: `files`, `instrument`, `timeframe`, `years`, `data_file`, `initial_capital`, `slippage_perc`, `commission_perc`, `instrument_type`, `tick_size`, `value_per_tick`, `share_size`, `lot_size`, `pip_size`, `pip_value`, `params` (strategy + module_params), `applied_modules`, `run_id`, `validation_mode` (`single` \| `oos_split` \| `walk_forward` \| `param_test`), `validation_config`, `quality_gates`, `sweep_mode`, `sweep_config`, volitelně `monte_carlo`, `regime_config`, `portfolio_config`, `execution_model`, `experiment`, `batch_config`
 
 **Response (non-stream):** RunResponse (equity, equityCurve, metrics incl. `maxEquity`/`maxDrawdownPct`/`maxDrawdownUsd` + `sortinoRatio`/`calmarRatio`/`marRatio`/`ulcerIndex`/`cagr` + `maxDrawdownDurationBars`/`maxDrawdownDurationDays`/`timeToRecoveryBars`/`timeToRecoveryDays`/`currentDrawdownPct` + `payoffRatio`/`edgePerTrade`/`kellyFraction`, trades incl. `mfe`/`mae`/`fees`/`slippageCost`, ohlc, moduleOutputs, `drawdownAnalysis` (full DD analysis: `underwaterPct`, `avgDurationBars`, `periodsCount`), `tradePnlDistribution` (histogram, percentiles, skewness, kurtosis, `tailRiskCVaR`, concentration), **`bootstrapCI`** (95% CI pro mean PnL, total return, trade Sharpe; trade-level resampling, 1000 bootstraps; `adjustedAlpha` = 0.05/trialCount Bonferroni), **`payoffDecomposition`** (win/loss rate, avg win/loss, payoff ratio, edge per trade, Kelly fraction), **`overfittingSignals`** (`trialCount`, `bonferroniAlpha`, `multipleTestingNote`), **`propRedFlags`** (`trustLevel`, `flags[]` s `key`/`severity`/`label`/`detail`, `criticalCount`, `warningCount`, `tip`), `validation`, `robustness`, `monteCarlo` (včetně `method`/`mode`/`note` u Monte Carla), `regimeAnalysis`, `portfolio`, `executionSummary` incl. `costAttribution`/`totalFees`/`totalSlippageCost`/`forwardBridge`, `qualityGate`, `experiment` incl. `runDiff`/`promoteEvidence`/`promoteDecision`=`review_candidate`|`hold`, volitelně `batchSummary`)
 
@@ -949,14 +951,14 @@ Vyžaduje Firebase CLI (`npm i -g firebase-tools`) a přihlášení (`firebase l
 - **Execution latency:** `slippage_latency_proxy_bars` (alias `latency_bars`) zvyšuje efektivní slippage %, **neodkládá** objednávky v čase.
 - **CSV bez volume:** při chybějícím sloupci engine/view doplní **syntetické volume=1000** a zaloguje varování — strategie závislé na reálném objemu nejsou validní.
 - **Walk-forward / OOS:** fold-level metriky a `guardrails` jsou **heuristiky** (varování před možným leakage nebo slabým foldem), ne důkaz absence leakage.
-- **Overfitting / readiness (UI):** záložka Analytics a sloupec v Run history používají sdílenou **heuristickou** sadu pravidel (single run, počet obchodů, MC risk of ruin, quality gate, sweep na single, degradace train→test, selhání fold gates, guardrails, stabilita sweepu, velikost batch dávky, extrémní PF). Jde o orientační signál, ne statistický test.
+- **Overfitting / readiness (UI):** záložka Analytics a sloupec v Run history používají sdílenou **heuristickou** sadu pravidel (single run, počet obchodů, riziko z Monte Carla pokud pole `monteCarlo` v odpovědi je, quality gate, sweep na single, degradace train→test, selhání fold gates, guardrails, stabilita sweepu, velké batch dávky z API, extrémní PF). Jde o orientační signál, ne statistický test.
 - **Drawdown duration (`drawdownAnalysis`):** `maxDrawdownDurationBars` / `Days` měří nejdelší nepřerušený pokles od vrcholu k dnu; `timeToRecoveryBars` / `Days` = bary/dny od dna zpět na nový vrchol equity (nebo null pokud nedošlo k recovery). `underwaterPct` = procento barů pod předchozím maximem; `periodsCount` = celkový počet drawdown epizod.
 - **Trade PnL distribution (`tradePnlDistribution`):** histogram uzavřených PnL, percentily (p5–p95), skewness, kurtosis, `tailRiskCVaR` (podmíněná hodnota v riziku na 5. percentilu), `concentration.top5PnlPct` = podíl celkového zisku z top 5 obchodů (vysoká koncentrace = závislost na málo obchodech).
 - **Stress multiplier (`execution_model.stress_multiplier`):** násobí slippage/spread penaltu v execution modelu; výchozí 1.0 (žádný stress), hodnota > 1 simuluje horší podmínky plnění (např. 1.5 = 50 % přirážka na tření). V UI jako vstupní pole **Stress multiplier** v sekci Execution Model (Edge finding).
 - **Portfolio model:** `portfolio.model` v odpovědi — např. `independent_isolated_capital_per_instrument`; UI zobrazuje banner s popisem modelu a disclaimerem (portfoliové metriky jsou vážené průměry, ne multi-asset equity).
 - **Bootstrap CI (`bootstrapCI`):** 95% intervaly spolehlivosti (mean PnL, total return, trade-level Sharpe) pomocí **trade-level resamplingU** (1 000 bootstrapů). `adjustedAlpha` = 0.05 / `trialCount` (naivní Bonferroni korekce na počet nezávislých pokusů K z manifestu). Předpokládá nezávislost obchodů (IID); při silné sériové korelaci PnL interpretuj opatrně.
 - **Payoff decomposition (`payoffDecomposition`):** rozklad edge na win rate × avg win − loss rate × avg loss; `payoffRatio` = avg win / avg loss; `kellyFraction` = Kelly kritérium pro position sizing. Kelly předpokládá přesné pravděpodobnosti a nezávislé sázky — v praxi se obvykle bere **half-Kelly nebo méně**.
-- **Multiple testing / trial count (`overfittingSignals`):** `trialCount` K = sweep samples × batch runs × folds; naivní **Bonferroni α = 0.05 / K**. Je to konzervativní horní odhad — při korelovaných pokusech (podobné parametry) je skutečná korekce slabší. UI zobrazuje strip s K a upravenou α.
+- **Multiple testing / trial count (`overfittingSignals`):** `trialCount` K zahrnuje sweep, případné dílčí běhy `batch_config` a foldy; naivní **Bonferroni α = 0.05 / K**. Je to konzervativní horní odhad — při korelovaných pokusech (podobné parametry) je skutečná korekce slabší. UI zviditelňuje K a upravenou α.
 - **Prop red flags (`propRedFlags`):** engine funkce `_compute_prop_red_flags()` automaticky skenuje výsledky z pohledu prop-firm reviewer. Vrací `trustLevel` (not_trustworthy / low_trust / cautious / acceptable) a seznam `flags` s `severity` (critical / warning). Kontrolované vzory: extrémně vysoký Sharpe s málo obchody, méně než 10 obchodů (critical) / méně než 30 (warning), nulové ztráty / win rate > 95 %, nedefinovaný PF (sentinel), single run bez validace, vypnutý execution model, kombinace single + no execution (minimální věrohodnost), podezřele nízký DD, příliš hladká equity (> 92 % barů rostoucích), bootstrap CI protínající nulu, koncentrace PnL (top 5 > 80 %). UI zobrazuje trust banner pod exportem a detailní sekci v Analytics.
 - **„Not a broker" disclaimer (`executionSummary`):** v Analytics u execution summary se zobrazuje upozornění, že execution model je **zjednodušená aproximace** (lineární slippage, bez market impact, bez modelování kapacity a book depth). Není to broker-level simulace a výsledky nelze přímo srovnávat s reálným plněním.
 - **Governance:** schvalování z UI zapisuje metadata do Firestore; **server-only** enforcement (Phase 6b) vyžaduje backend proxy nebo Cloud Functions – viz READMEAI.

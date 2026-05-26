@@ -2,8 +2,10 @@
 
 import { useEffect, useMemo, useState, type ComponentType } from "react";
 import { formatProfitFactorFromRow } from "@/lib/formatProfitFactor";
+import { paramTestAxisXHint, paramTestXTickFormat } from "@/lib/paramTestAxisHints";
 
 type MetricId =
+  | "totalReturn"
   | "totalReturnUsd"
   | "sharpeRatio"
   | "sortinoRatio"
@@ -14,6 +16,7 @@ type MetricId =
   | "finalEquity";
 
 const METRIC_OPTIONS: { id: MetricId; label: string }[] = [
+  { id: "totalReturn", label: "ROI / výnos % (celkem)" },
   { id: "totalReturnUsd", label: "Total return (USD)" },
   { id: "sharpeRatio", label: "Sharpe ratio" },
   { id: "sortinoRatio", label: "Sortino ratio" },
@@ -28,10 +31,30 @@ function yLabelFor(metric: MetricId): string {
   return METRIC_OPTIONS.find((o) => o.id === metric)?.label ?? metric;
 }
 
+function yAxisSubtitle(metric: MetricId): string {
+  switch (metric) {
+    case "totalReturn":
+      return "Hodnota z metrik backtestu (stejná jako horní karty) — u „ROI / výnos %“ jde o procenta výnosu nad kapitálem.";
+    case "totalReturnUsd":
+      return "Celkový výnos v USD (ze stejného běhu jako sweep).";
+    case "profitFactor":
+      return "Podíl hrubého zisku a ztráty (bez jednotky).";
+    case "tradeCount":
+      return "Počet uzavřených obchodů.";
+    case "maxDrawdownPct":
+      return "Maximum drawdown v % (nižší je obvykle lepší).";
+    default:
+      return "Hodnota z výstupu backtestu pro daný bod na ose X.";
+  }
+}
+
 function formatTooltip(metric: MetricId, row: Record<string, unknown>): string {
   const parts = [`param = ${String(row.paramValue)}`];
   if (metric === "profitFactor") {
     parts.push(`PF = ${formatProfitFactorFromRow(row)}`);
+  } else if (metric === "totalReturn") {
+    const v = row[metric];
+    parts.push(`ROI = ${v == null ? "N/A" : `${Number(v).toFixed(2)} %`}`);
   } else {
     const v = row[metric];
     parts.push(`${metric} = ${v == null ? "N/A" : Number(v).toFixed(4)}`);
@@ -41,7 +64,7 @@ function formatTooltip(metric: MetricId, row: Record<string, unknown>): string {
 
 export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, unknown> }) {
   const [Plot, setPlot] = useState<ComponentType<any> | null>(null);
-  const [metric, setMetric] = useState<MetricId>("totalReturnUsd");
+  const [metric, setMetric] = useState<MetricId>("totalReturn");
 
   useEffect(() => {
     let cancelled = false;
@@ -96,6 +119,11 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
             Baseline metriky v kartách výše = jeden run s aktuálními PARAMS. Níže OAT sweep: jeden parametr najednou v
             rozsahu min–max.
           </p>
+          <p className="text-xs text-zinc-500 mt-1 max-w-3xl">
+            <span className="text-zinc-400">Osy:</span> vodorovná = skutečná hodnota parametru odeslaná do strategie
+            (stejná jednotka jako v PARAMS; žádné „škálování“ na 0–1). Svislá = vybraná metrika z každého OAT běhu — výchozí
+            „ROI / výnos %“ odpovídá poli <span className="font-mono text-zinc-400">metrics.totalReturn</span> (v&nbsp;%).
+          </p>
           <p className="text-xs text-zinc-500 mt-1">
             {runsCount > 0 && (
               <>
@@ -112,7 +140,7 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
             )}
           </p>
         </div>
-        <label className="flex flex-col gap-1 text-xs text-zinc-400">
+        <label className="flex flex-col gap-1 text-xs text-zinc-400 min-w-[14rem]">
           <span>Metrika na ose Y</span>
           <select
             className="bg-zinc-800 border border-zinc-600 rounded px-2 py-1.5 text-zinc-200 text-sm min-w-[12rem]"
@@ -125,6 +153,7 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
               </option>
             ))}
           </select>
+          <span className="text-[10px] text-zinc-600 leading-snug">{yAxisSubtitle(metric)}</span>
         </label>
       </div>
 
@@ -195,9 +224,23 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
           const bestY = best != null ? Number(best.metricValue) : NaN;
           const hasBest = Number.isFinite(bestX) && Number.isFinite(bestY);
 
+          const xHint = paramTestAxisXHint(pk);
+          const tickFmt = paramTestXTickFormat(x);
+          const fewPoints = x.length > 0 && x.length < 6;
+          const plotMode = fewPoints ? "markers" : "lines+markers";
+
           return (
-            <div key={pk} className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-2">
-              <div className="text-xs font-mono text-emerald-400/90 mb-1 px-1">{pk}</div>
+            <div key={pk} className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-2 space-y-2">
+              <div className="text-xs font-mono text-emerald-400/90 px-1">{pk}</div>
+              {x.length > 0 && x.length <= 3 ? (
+                <p className="text-[10px] text-amber-200/90 px-1 leading-snug">
+                  Jen {x.length} bod(x) — čára mezi nimi je jen vizuální spojení bodů, ne interpolace mezi kroky. Pro plný
+                  grid zadej v OAT rozmezí + krok (např. atr_sl_pct 10–50, krok 5) a spusť nový run.
+                </p>
+              ) : null}
+              {xHint ? (
+                <p className="text-[10px] text-zinc-500 px-1 leading-snug">{xHint}</p>
+              ) : null}
               <Plot
                 data={[
                   {
@@ -205,9 +248,12 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
                     y,
                     text,
                     type: "scatter",
-                    mode: "lines+markers",
+                    mode: plotMode,
                     name: "sweep",
-                    line: { color: "rgba(52, 211, 153, 0.85)", width: 2 },
+                    line:
+                      plotMode === "lines+markers"
+                        ? { color: "rgba(52, 211, 153, 0.85)", width: 2 }
+                        : { width: 0 },
                     marker: { size: 8, color: "rgba(16, 185, 129, 0.9)" },
                     hoverinfo: "text",
                   },
@@ -236,7 +282,7 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
                   paper_bgcolor: "rgba(9, 9, 11, 0.5)",
                   plot_bgcolor: "rgba(24, 24, 27, 0.9)",
                   font: { color: "#d4d4d8", size: 11 },
-                  margin: { t: 28, r: 12, b: 44, l: 52 },
+                  margin: { t: 28, r: 12, b: 52, l: 56 },
                   showlegend: hasBest,
                   legend: {
                     orientation: "h",
@@ -246,7 +292,8 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
                     font: { size: 10 },
                   },
                   xaxis: {
-                    title: "Hodnota parametru",
+                    title: { text: pk, standoff: 8 },
+                    tickformat: tickFmt,
                     gridcolor: "rgba(63, 63, 70, 0.5)",
                     zerolinecolor: "rgba(82, 82, 91, 0.6)",
                   },
@@ -259,6 +306,38 @@ export function ParamTestAnalytics({ paramTest }: { paramTest: Record<string, un
                 config={{ displayModeBar: false, responsive: true }}
                 style={{ width: "100%" }}
               />
+              {x.length > 0 ? (
+                <div className="overflow-x-auto rounded border border-zinc-800/80 bg-zinc-950/50">
+                  <table className="min-w-full text-[10px] text-zinc-400">
+                    <thead>
+                      <tr className="text-left border-b border-zinc-800">
+                        <th className="py-1 px-2 font-medium text-zinc-500">{pk}</th>
+                        <th className="py-1 px-2 font-medium text-zinc-500">{yLabelFor(metric)}</th>
+                        <th className="py-1 px-2 font-medium text-zinc-500 hidden sm:table-cell">Obchodů</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {series.map((row, i) => {
+                        if (!row || typeof row !== "object") return null;
+                        const r = row as Record<string, unknown>;
+                        const pv = r.paramValue;
+                        const mv = r[metric];
+                        const tc = r.tradeCount;
+                        if (mv == null) return null;
+                        return (
+                          <tr key={i} className="border-b border-zinc-800/60">
+                            <td className="py-0.5 px-2 font-mono text-zinc-300">{String(pv)}</td>
+                            <td className="py-0.5 px-2 font-mono text-emerald-200/90">
+                              {metric === "totalReturn" ? `${Number(mv).toFixed(2)} %` : Number(mv).toFixed(4)}
+                            </td>
+                            <td className="py-0.5 px-2 font-mono hidden sm:table-cell">{String(tc ?? "—")}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
             </div>
           );
         })}

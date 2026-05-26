@@ -77,7 +77,7 @@ def test_sd_precompute_after_hl_smoke():
         assert list(zdf.columns)
         assert "range_start_at" in zdf.columns and "range_end_at" in zdf.columns
         assert len(zdf) > 0, (
-            "S/D precompute musí načíst Swing_HL (strategies/sd_zone_strategy na sys.path); "
+            "S/D precompute musí načíst Swing_HL (strategies/modules na sys.path); "
             "jinak get_zones vrací prázdný výsledek a Parquet má 0 řádků."
         )
         assert compute_sd_module_digest()

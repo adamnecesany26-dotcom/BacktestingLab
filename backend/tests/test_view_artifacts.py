@@ -1020,7 +1020,7 @@ def test_swing_hl_rolling_carry_roundtrip_index_translation() -> None:
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    path = root / "strategies" / "sd_zone_strategy" / "modules" / "Swing_HL.py"
+    path = root / "strategies" / "modules" / "Swing_HL.py"
     spec = importlib.util.spec_from_file_location("swing_hl_carry_test", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)

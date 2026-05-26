@@ -3,16 +3,8 @@
  * Used by both Next.js frontend and FastAPI backend (via OpenAPI).
  */
 
-/** Instrument type for backtest configuration */
-export type InstrumentType = "futures" | "stocks" | "forex";
-
-/** Filter instruments by type. Instruments without instrumentType default to "futures". */
-export function filterInstrumentsByType(
-  instruments: DataInstrument[],
-  type: InstrumentType
-): DataInstrument[] {
-  return instruments.filter((i) => (i.instrumentType ?? "futures") === type);
-}
+/** Backtests use futures contract logic only (CME-style PnL / commissions). */
+export type InstrumentType = "futures";
 
 /** Run request payload */
 export interface RunRequest {
@@ -28,17 +20,11 @@ export interface RunRequest {
   initial_capital?: number;
   slippage_perc?: number;
   commission_perc?: number;
-  /** Instrument type and type-specific params */
+  /** Always `futures` (only supported mode). */
   instrument_type?: InstrumentType;
   /** Futures: tick size, value per tick */
   tick_size?: number;
   value_per_tick?: number;
-  /** Stocks: position size (shares) */
-  share_size?: number;
-  /** Forex: lot size, pip size, pip value */
-  lot_size?: number;
-  pip_size?: number;
-  pip_value?: number;
   /** Strategy parameters (from PARAMS dict) - override values without editing code */
   params?: Record<string, number | boolean | string | Record<string, unknown>>;
   /** Applied modules for module outputs (markers, lines) after backtest */
@@ -46,7 +32,7 @@ export interface RunRequest {
   /** Optional client-provided run correlation id */
   run_id?: string;
   /** Validation mode for edge-finding workflow */
-  validation_mode?: "single" | "oos_split" | "walk_forward" | "param_test";
+  validation_mode?: "single" | "walk_forward" | "param_test" | "oos_split";
   validation_config?: Record<string, unknown>;
   quality_gates?: Record<string, unknown>;
   sweep_mode?: "grid" | "random";
@@ -62,6 +48,8 @@ export interface RunRequest {
   run_timeout_sec?: number;
   /** Max seconds without stream activity (stall detection). Omit = server default. 0 = disabled. */
   stream_idle_timeout_sec?: number;
+  /** Prop firm challenge simulation on closed trades after the standard engine run. */
+  prop_firm_backtest?: Record<string, unknown>;
 }
 
 /** Broker config for futures (tick, mult, margin) */
@@ -82,7 +70,7 @@ export interface DataInstrument {
   minDate: string;
   maxDate: string;
   yearsAvailable: number;
-  /** Instrument type - used to filter by Instrument Type in UI */
+  /** Always `futures` for catalog entries from this API */
   instrumentType?: InstrumentType;
   /** Futures broker params - used when present */
   brokerConfig?: BrokerConfig;
@@ -103,6 +91,9 @@ export interface Trade {
   exitPrice?: number;
   mfe?: number;
   mae?: number;
+  /** Když engine doplní — exkurze v měně účtu (upřednostni před price `mfe`). */
+  mfeUsd?: number;
+  maeUsd?: number;
   mfePct?: number;
   maePct?: number;
   fees?: number;
@@ -111,12 +102,14 @@ export interface Trade {
   holdingMinutes?: number;
   entryReason?: string;
   exitReason?: string;
-  /** Volitelná metadata ze strategie (např. S/D zóna) */
+  /** Volitelná metadata ze strategie (např. stop pro odhad R) */
   zoneMeta?: Record<string, unknown>;
   /** Počáteční riziko obchodu v měně účtu (pokud engine doplní). */
   initialRiskUsd?: number;
   /** Realizovaný PnL v násobcích počátečního rizika (pokud engine doplní). */
   tradeR?: number;
+  /** Režim trhu v okamžiku vstupu (`up` / `down` / `range`) — doplní engine při zapnuté regime analýze. */
+  marketRegime?: string;
 }
 
 /** Equity point with date */
@@ -278,6 +271,8 @@ export interface RunResponse {
   overfittingSignals?: Record<string, unknown>;
   /** Prop-level red flags and trust assessment */
   propRedFlags?: Record<string, unknown>;
+  /** Prop firm challenge / PA sequential simulation (when requested). */
+  propFirmBacktest?: Record<string, unknown>;
   /** Plné výsledky každého dílčího běhu dávky (jen pokud runů ≤ serverový limit, typicky 12) */
   batchRuns?: RunResponse[];
 }

@@ -1,0 +1,1184 @@
+//@version=6
+// =============================================================================
+//  ORB PROP FIRM KILLER  v2  (Studie-3-faithful build)
+// -----------------------------------------------------------------------------
+//  Primary reference :
+//    Zarattini, Barbon, Aziz (2024) - "A Profitable Day Trading Strategy For
+//    The U.S. Equity Market"  -> 7,000-stock dataset, 2016-2023.
+//    Sharpe 2.81, +1,637% net total return on top-20 RelVol portfolio.
+//
+//  Supporting refs   :
+//    Zarattini & Aziz (2023) - QQQ/TQQQ ORB
+//    Crabel (1990)            - original ORB concept
+//
+//  Philosophy
+//  ----------
+//  Studie 3 converged on an unusually SIMPLE rule-set:
+//    1) Universe filter : price > $5, avg vol > 1M, ATR > $0.50
+//    2) Relative Volume : OR-volume / 14d avg OR-volume >= 100%
+//    3) Direction       : first 5-min candle dictates direction (no counter-trades)
+//    4) Entry           : stop order at OR high (long) / OR low (short)
+//    5) Stop loss       : Studie 3 = 10% of 14-day daily ATR (script default 30%)
+//    6) Exit            : stop OR end-of-session  (no profit target)
+//    7) Risk            : 1% of equity per trade (OR fixed contract count)
+//
+//  This implementation IS that rule-set.  Everything else is operational
+//  hardening for prop-firm survival, not signal modification:
+//    - Daily-loss circuit-breaker (FTMO/MFF style DD cap)
+//    - Max trades per day
+//    - Optional 1R partial + breakeven runner
+//    - Optional HTF bias  (off by default; study betas were ~0)
+//    - Optional day-of-week filter (off by default; specific to SPY 0DTE)
+//
+//  No-repaint guarantee:
+//    - All request.security() calls use prior-bar values [1] + lookahead_off.
+//    - Intraday signals only rely on the just-closed bar(s) of the OR window
+//      and are evaluated once on the bar AFTER the OR window closes.
+//
+//  Run on chart TF <= ORB length.  1-minute is recommended.
+// =============================================================================
+
+//  NQ (full) ≈ 10× MNQ margin / notional; small initial_capital often yields
+//  zero fills in the Strategy Tester despite valid signals.
+strategy(
+     title                    = "ORB Prop Firm Killer v2 [Studie 3]",
+     shorttitle               = "ORB PFK v2",
+     overlay                  = true,
+     initial_capital          = 10000000,
+     default_qty_type         = strategy.fixed,
+     default_qty_value        = 1,
+     pyramiding               = 0,
+     calc_on_every_tick       = false,
+     process_orders_on_close  = true,
+     close_entries_rule       = "ANY",
+     commission_type          = strategy.commission.percent,
+     commission_value         = 0.005,
+     slippage                 = 1,
+     max_boxes_count          = 500,
+     max_lines_count          = 500,
+     max_labels_count         = 500)
+
+
+// =============================================================================
+//  1. INPUTS
+// =============================================================================
+
+// ---- Cross-instrument backtest (NQ vs MNQ, different margin / data) ---------
+G_BT         = "0) Cross-instrument backtest"
+i_relaxedBt  = input.bool(true, "Relaxed instrument test (recommended for futures)",
+     group = G_BT,
+     tooltip = "ON: entry gate skips universe + day-of-week + daily-loss halt.\n"
+             + "Sizing still floors at 1 contract in relaxed ladders.\n"
+             + "**Relative Volume** is independent: turn it OFF to ignore RelVol.\n"
+             + "Turn it ON to require RelVol in BOTH relaxed and strict modes.\n"
+             + "Also check Strategy Tester Properties: Initial capital must be large "
+             + "enough for NQ margin (MNQ micro ≠ NQ mini). Script default is $10M.")
+
+// ---- Opening Range ---------------------------------------------------------
+G_ORB        = "1) Opening Range"
+i_orbMinutes = input.int(5, "ORB Length (minutes)",
+     options = [5, 15, 30],
+     group   = G_ORB,
+     tooltip = "Studie 3 explicitly tested 5/15/30/60 - 5 min won.")
+i_session    = input.session("0930-1600", "Trading Session",
+     group   = G_ORB,
+     tooltip = "Default = US RTH. For futures use 0930-1600 ET equivalent.")
+i_tz         = input.string("America/New_York", "Session Timezone",
+     options = ["America/New_York", "Europe/London", "Europe/Berlin", "Asia/Tokyo", "Asia/Hong_Kong", "exchange"],
+     group   = G_ORB)
+
+i_closeBreakConfirm = input.bool(false, "Confirm breakout with CLOSE beyond OR boundary",
+     group = G_ORB,
+     tooltip = "OFF (default): classic stop-entry at orbHigh/orbLow — intra-bar "
+             + "wick/trade-through can trigger the fill.\n"
+             + "ON: no stop order pending; waits until CLOSE is strictly above orbHigh "
+             + "(long) or below orbLow (short), then submits a market-class entry "
+             + "on that closing bar.\nDiffers from the paper OHLC mechanic; sizing / "
+             + "stop / TP ladders still anchored to orb boundary.")
+
+// ---- Universe / Liquidity Filters ------------------------------------------
+//  Studie 3 hard rules: price > $5, 14d avg vol > 1M, 14d ATR > $0.50.
+//  These prevent the strategy from trading illiquid garbage when run on a
+//  scanner / multiple symbols.  Defaults match the paper.
+G_UNI        = "2) Universe Filters (Studie 3)"
+i_useUni     = input.bool(false, "Apply Universe Filters", group = G_UNI)
+i_minPrice   = input.float(5.0,    "Min Price ($)",            step = 1.0,    group = G_UNI)
+i_minAvgVol  = input.float(1000000, "Min 14d Avg Volume (sh)", step = 100000, group = G_UNI)
+i_minAtr     = input.float(0.50,   "Min 14d ATR ($)",          step = 0.10,   group = G_UNI)
+
+// ---- Relative Volume (KEY EDGE) --------------------------------------------
+//  This is THE filter that turns 3.2% -> 41.6% annualized in Studie 3.
+G_VOL        = "3) Relative Volume Filter (KEY EDGE)"
+i_useRelVol  = input.bool(false,  "Require Above-Average OR Volume", group = G_VOL,
+     tooltip = "When ON: OR volume today must be >= Min RelVol vs trailing session average "
+             + "(Studie 3 edge).\n"
+             + "Applied whenever this switch is ON — including Relaxed instrument mode.")
+i_relVolMin  = input.float(1.0, "Min Relative Volume (1.0 = 100%)",
+     minval  = 0.5, step = 0.1, group = G_VOL)
+i_relVolBack = input.int(14, "RelVol Lookback (sessions)",
+     minval  = 5, group = G_VOL)
+
+// ---- Stop Loss -------------------------------------------------------------
+//  TWO SL placement methods supported:
+//
+//   A) "ATR % (Daily)"   = SL distance is a % of the 14-day daily ATR.
+//                          SL = entry +/- (dailyATR * pct/100).
+//                          Source: Studie 3 (10% in paper). Script default =
+//                          30% unless you change input. Scales with volatility.
+//
+//   B) "OR Opposite Boundary" = SL at the OPPOSITE side of the opening range.
+//                          Long  entry at orbHigh  -> SL = orbLow
+//                          Short entry at orbLow   -> SL = orbHigh
+//                          Source: Studie 1 ("low of the first 5-minute candle").
+//                          SL distance = full OR width.  Wider stops, but
+//                          structurally meaningful (full OR re-entry = signal
+//                          invalidated).
+//
+//   C) "Opposite OR Price"  = SL anchored to orbLow (long) / orbHigh (short):
+//                             distance from entry to that price × i_slMult
+//   D) "First OR bar"       = SL anchored to first session bar's low (long) /
+//                             high (short) — breakout candle wick inside OR window
+//  Position size is then computed so that hitting SL = i_riskPct% of equity:
+//      qty = (equity * riskPct/100) / |entry - stop|
+G_SL         = "4) Stop Loss"
+i_slMode     = input.string("ATR % (Daily)", "SL Mode",
+     options = [
+         "ATR % (Daily)",
+         "OR Opposite Boundary",
+         "Opposite OR Price (orbHigh/orbLow)",
+         "First OR bar High/Low"
+         ],
+     group   = G_SL,
+     tooltip = "ATR % = Studie 3. OR Opposite = distance = full OR width. "
+             + "Opposite OR Price = stop at OR extreme (price level × mult). "
+             + "First OR bar = wicks of the opening bar of the OR window.")
+i_atrLen     = input.int(14, "ATR Length (Daily)", group = G_SL)
+i_atrSlPct   = input.float(30.0, "ATR % for SL", minval = 1.0, step = 1.0,
+     group   = G_SL,
+     tooltip = "Studie 3 paper rule = 10%. Default here is 30% (wider stop). "
+             + "Studie 1 noted 5% optimal on TQQQ but warned about slippage on tight stops.")
+i_slMult     = input.float(1.0, "SL Distance Multiplier",
+     minval = 0.25, maxval = 3.0, step = 0.05, group = G_SL,
+     tooltip = "Scales the calculated SL distance from the entry price.\n"
+             + " 1.00 = use raw value (paper default).\n"
+             + " 0.75 = 25% tighter stop (larger position, more stop-outs).\n"
+             + " 1.50 = 50% wider stop (smaller position, fewer stop-outs).\n"
+             + "Position size is recomputed accordingly so that hitting SL = "
+             + "i_riskPct% of equity in any case.")
+
+// ---- Exit Style ------------------------------------------------------------
+//  i_tradeMode: full position rides to TP/EoD  OR  optional ladder partials
+//  + a runner for the leftover contracts.
+//
+//  i_exitMode : where the RUNNER (or full position) ultimately exits
+//                if neither SL nor partial limits have flattened you.
+G_EX         = "5) Exit Style"
+i_tradeMode  = input.string("Ladder Partials + Runner", "Trade Style",
+     options = ["Full Position (TP / EoD only)", "Ladder Partials + Runner"],
+     group   = G_EX,
+     tooltip = "Full Position = no scaling; entire i_contracts quantity is "
+             + "managed by one Final exit (TP limit in Fixed RR mode, else "
+             + "session-end flat).\n"
+             + "Ladder = up to 3 fixed contract partials at chosen R-levels, "
+             + "then a runner for the remainder.")
+i_exitMode   = input.string("EoD", "Runner / Full Exit Mode",
+     options = ["EoD", "Fixed RR"],
+     group   = G_EX,
+     tooltip = "EoD      = remaining qty closes at session end.\n"
+             + "Fixed RR = limit at entry +/- R * fixedRR on the remaining qty.")
+i_fixedRR    = input.float(2.0, "Fixed Risk-Reward (R:R)  (runner/full)",
+     minval = 0.5, step = 0.5, group = G_EX,
+     tooltip = "Used when Runner / Full Exit Mode = Fixed RR.")
+
+// ---- Position sizing -------------------------------------------------------
+//  Default = fixed integer-friendly contract counts for realistic prop-firm
+//  simulation.  %Risk mode remains for reference backtests.
+G_POS        = "5b) Position Size"
+i_posMode    = input.string("Fixed Contracts", "Sizing Mode",
+     options = ["Fixed Contracts", "% Equity Risk"],
+     group   = G_POS,
+     tooltip = "Default = Fixed Contracts: same signal on MNQ/NQ; qty does not "
+             + "scale from equity (avoids 0 fills on full-size futures).\n"
+             + "% Equity Risk = size from stop distance (studies / research).")
+i_contracts  = input.float(2.0, "Contracts / Shares (Fixed mode)",
+     minval = 1.0, step = 1.0, group = G_POS,
+     tooltip = "Whole-number lots work best for futures. Example: 2 MNQ when "
+             + "you want one partial at 1R (1 lot) and one runner (1 lot).")
+i_riskPct    = input.float(0.5, "Risk per Trade (% equity)  [% mode only]",
+     minval  = 0.1, maxval = 2.0, step = 0.1, group = G_POS,
+     tooltip = "Only used when Sizing Mode = '% Equity Risk'.")
+
+// ---- Ladder partials (contracts @ R multiple) ------------------------------
+G_LAD        = "5c) Ladder Partials (optional)"
+i_p1_use     = input.bool(true,  "Partial #1  Enable", inline = "p1", group = G_LAD)
+i_p1_qty     = input.int(1, "# Contracts", inline = "p1", minval = 0, group = G_LAD)
+i_p1_R       = input.float(1.0, "@ R", inline = "p1", minval = 0.25, step = 0.25,
+     group = G_LAD)
+i_p2_use     = input.bool(false, "Partial #2  Enable", inline = "p2", group = G_LAD)
+i_p2_qty     = input.int(0, "# Contracts", inline = "p2", minval = 0, group = G_LAD)
+i_p2_R       = input.float(2.0, "@ R", inline = "p2", minval = 0.25, step = 0.25,
+     group = G_LAD)
+i_p3_use     = input.bool(false, "Partial #3  Enable", inline = "p3", group = G_LAD)
+i_p3_qty     = input.int(0, "# Contracts", inline = "p3", minval = 0, group = G_LAD)
+i_p3_R       = input.float(3.0, "@ R", inline = "p3", minval = 0.25, step = 0.25,
+     group = G_LAD)
+i_useBE      = input.bool(true, "Move Runner Stop to BE After FIRST Partial",
+     group   = G_LAD,
+     tooltip = "Once ANY partial fills, the remaining runner uses a stop at "
+             + "the entry price instead of the original SL (classic prop-firm "
+             + "hedge). Disable to keep the original stop under the runner.")
+
+// ---- Risk Management (prop-firm critical) ----------------------------------
+G_RISK       = "6) Risk Management"
+i_maxTrades  = input.int(1, "Max Trades per Day",
+     minval  = 1, maxval = 4, group = G_RISK,
+     tooltip = "Studie 3 takes 1 trade/day per symbol. The current entry "
+             + "signal (OR-boundary stop) fires once per session, so values "
+             + "above 1 have no effect unless extended.")
+i_useDayStop = input.bool(false, "Hard Daily Loss Circuit-Breaker", group = G_RISK,
+     tooltip = "Halts trading once daily P&L hits the limit. Critical for "
+             + "FTMO/MFF style daily-drawdown caps.")
+i_dayLossPct = input.float(2.0, "Daily Loss Limit (%)",
+     minval  = 0.5, step = 0.1, group = G_RISK,
+     tooltip = "Set safely below the prop firm's daily-loss rule.")
+
+// ---- Optional Filters (default OFF, not validated by Studie 3) -------------
+G_OPT        = "7) Optional Filters (NOT in Studie 3 - default OFF)"
+i_useHtf     = input.bool(false, "HTF Trend Filter (advanced)", group = G_OPT,
+     tooltip = "WARNING: Studie 3 found beta ~ 0 vs S&P. This filter "
+             + "destroys that uncorrelation. Use only if backtest justifies it.")
+i_htfTf      = input.timeframe("60", "HTF Timeframe",      group = G_OPT)
+i_htfEmaLen  = input.int(50, "HTF EMA Length", minval = 5, group = G_OPT)
+i_useDow     = input.bool(false, "Day-of-Week Filter",    group = G_OPT,
+     tooltip = "From Studie 2 (SPY 0DTE options). Effect may not transfer "
+             + "to stocks/futures. Off by default.")
+i_mon        = input.bool(true,  "Mon",  inline = "d", group = G_OPT)
+i_tue        = input.bool(false, "Tue",  inline = "d", group = G_OPT)
+i_wed        = input.bool(true,  "Wed",  inline = "d", group = G_OPT)
+i_thu        = input.bool(false, "Thu",  inline = "d", group = G_OPT)
+i_fri        = input.bool(true,  "Fri",  inline = "d", group = G_OPT)
+
+// ---- Visuals ---------------------------------------------------------------
+G_VIS        = "8) Visuals"
+i_showOrb    = input.bool(true, "Show ORB Box",        group = G_VIS)
+i_showLevels = input.bool(true, "Show SL/TP Lines",    group = G_VIS,
+     tooltip = "Thin lines for stop, runner TP, and ladder partials.")
+i_showPnl    = input.bool(true, "Show Position PnL Zones (R:R tool style)",
+     group = G_VIS,
+     tooltip = "Gray/mint boxes + entry/SL/TP line plots while a trade is open; "
+             + "closed trades keep frozen boxes on the chart. Native TV “Position” "
+             + "toolbar tool is only for manual trades — strategies use this overlay.")
+i_pnlRiskTr  = input.int(76, "PnL — Risk fill transparency",
+     minval = 60, maxval = 98, group = G_VIS,
+     tooltip = "Higher = more transparent (Pine color.new: 100 = invisible). "
+             + "Default 76 reads better than very faint 88+ on light/dark themes.")
+i_pnlRewTr   = input.int(76, "PnL — Reward fill transparency",
+     minval = 60, maxval = 98, group = G_VIS)
+i_showInfo   = input.bool(true, "Show Info Panel",     group = G_VIS)
+
+c_long       = color.new(color.green,  0)
+c_short      = color.new(color.red,    0)
+c_orb        = color.new(color.yellow, 80)
+c_orbBorder  = color.new(color.yellow, 30)
+c_pnlRiskBg  = color.new(#c4c4c4, 0)
+c_pnlRewBg   = color.new(#b8e8d0, 0)
+c_pnlEntryLn = color.new(color.black, 5)
+c_sl         = color.new(color.red,    20)
+c_tp         = color.new(color.lime,   20)
+
+
+// =============================================================================
+//  2. SESSION & ORB DETECTION
+// =============================================================================
+
+f_sessionTime() => time(timeframe.period, i_session, i_tz)
+
+inSession      = not na(f_sessionTime())
+inSessionPrev  = not na(f_sessionTime()[1])
+newSession     = inSession and not inSessionPrev
+sessionEnd     = not inSession and inSessionPrev
+
+var float orbHigh         = na
+var float orbLow          = na
+var int   orbStartTime    = na
+var bool  orbBuilding     = false
+var bool  orbBuildingPrev = false
+var bool  orbReady        = false
+var int   firstCandleDir  = 0      // +1 bullish, -1 bearish, 0 doji
+var float firstOpen       = na
+var float orFirstBarHi    = na     // wick high of first OR bar (session open)
+var float orFirstBarLo    = na     // wick low  of first OR bar
+
+if newSession
+    orbHigh        := high
+    orbLow         := low
+    orbStartTime   := time
+    orbReady       := false
+    firstCandleDir := 0
+    firstOpen      := open
+    orFirstBarHi := high
+    orFirstBarLo := low
+
+// Chart-TF sanity check (label, not error)
+chartTfMin = timeframe.in_seconds(timeframe.period) / 60.0
+tfTooLarge = chartTfMin > i_orbMinutes
+var label tfWarn = na
+if barstate.islast and tfTooLarge and na(tfWarn)
+    tfWarn := label.new(bar_index, high,
+         "Chart TF " + str.tostring(chartTfMin, "#.#") + "m > ORB "
+            + str.tostring(i_orbMinutes) + "m\nSwitch chart TF to <= "
+            + str.tostring(i_orbMinutes) + "m",
+         color     = color.new(color.red, 0),
+         textcolor = color.white,
+         style     = label.style_label_down,
+         size      = size.normal)
+
+orbBuilding := inSession and (time - orbStartTime < i_orbMinutes * 60000)
+
+if orbBuilding
+    orbHigh := math.max(orbHigh, high)
+    orbLow  := math.min(orbLow,  low)
+
+orbJustFinalized = orbBuildingPrev and not orbBuilding
+if orbJustFinalized
+    orbReady := true
+    float orCloseEnd = close[1]
+    firstCandleDir := orCloseEnd > firstOpen ?  1 : orCloseEnd < firstOpen ? -1 : 0
+
+orbBuildingPrev := orbBuilding
+
+
+// =============================================================================
+//  3. EXTERNAL DATA  (no-repaint: prior-bar values + lookahead_off)
+// =============================================================================
+
+dailyAtr   = request.security(syminfo.tickerid, "D",
+     ta.atr(i_atrLen)[1],
+     lookahead = barmerge.lookahead_off,
+     gaps      = barmerge.gaps_off)
+
+dailyAvgVol = request.security(syminfo.tickerid, "D",
+     ta.sma(volume, 14)[1],
+     lookahead = barmerge.lookahead_off,
+     gaps      = barmerge.gaps_off)
+
+dailyOpen   = request.security(syminfo.tickerid, "D",
+     open,
+     lookahead = barmerge.lookahead_off,
+     gaps      = barmerge.gaps_off)
+
+// request.security must live at top scope; gate its USE via i_useHtf below.
+htfEma = request.security(syminfo.tickerid, i_htfTf,
+     ta.ema(close, i_htfEmaLen)[1],
+     lookahead = barmerge.lookahead_off,
+     gaps      = barmerge.gaps_off)
+
+
+// =============================================================================
+//  4. RELATIVE VOLUME (no-repaint - cumulated intraday from confirmed bars)
+// =============================================================================
+
+var float        orVolToday = 0.0
+var array<float> orVolHist  = array.new<float>()
+var float        relVol     = na
+
+if newSession
+    orVolToday := 0.0
+
+if orbBuilding
+    orVolToday += volume
+
+if orbJustFinalized
+    if array.size(orVolHist) > 0
+        float avgOrVol = array.avg(orVolHist)
+        relVol := avgOrVol > 0 ? orVolToday / avgOrVol : 1.0
+    else
+        relVol := 1.0
+    array.push(orVolHist, orVolToday)
+    if array.size(orVolHist) > i_relVolBack
+        array.shift(orVolHist)
+
+
+// =============================================================================
+//  5. RISK GUARD-RAILS
+// =============================================================================
+
+var float dayStartEquity = strategy.equity
+
+if newSession
+    dayStartEquity := strategy.equity
+
+dailyPnLPct  = (strategy.equity - dayStartEquity) / dayStartEquity * 100.0
+dailyLossHit = i_useDayStop and dailyPnLPct <= -i_dayLossPct
+
+// Trade-count tracking: snapshot total closed trades at session start, then
+// session count = (closed since start) + (1 if currently in trade).
+var int sessionStartClosed = 0
+if newSession
+    sessionStartClosed := strategy.closedtrades
+
+tradesToday = strategy.closedtrades - sessionStartClosed
+                 + (strategy.position_size != 0 ? 1 : 0)
+
+
+// =============================================================================
+//  6. ELIGIBILITY GATE  (universe + RelVol + DoW + HTF + risk)
+// =============================================================================
+
+// Universe filter (Studie 3)
+priceOk  = not i_useUni or (not na(dailyOpen)   and dailyOpen   >= i_minPrice)
+volOk    = not i_useUni or (not na(dailyAvgVol) and dailyAvgVol >= i_minAvgVol)
+atrOk    = not i_useUni or (not na(dailyAtr)    and dailyAtr    >= i_minAtr)
+universeOk = priceOk and volOk and atrOk
+
+// Relative Volume
+relVolOk = not i_useRelVol or (not na(relVol) and relVol >= i_relVolMin)
+
+// Day-of-Week
+isMon = dayofweek == dayofweek.monday
+isTue = dayofweek == dayofweek.tuesday
+isWed = dayofweek == dayofweek.wednesday
+isThu = dayofweek == dayofweek.thursday
+isFri = dayofweek == dayofweek.friday
+dowOk = not i_useDow or (i_mon and isMon) or (i_tue and isTue) or (i_wed and isWed) or (i_thu and isThu) or (i_fri and isFri)
+
+// HTF directional gates (only if filter is enabled)
+htfBullOk = not i_useHtf or (not na(htfEma) and close > htfEma)
+htfBearOk = not i_useHtf or (not na(htfEma) and close < htfEma)
+
+tradeCountOk = tradesToday < i_maxTrades
+
+// Sum of all enabled ladder legs — must not exceed position qty in Fixed Contracts mode.
+sumLadderQty = i_tradeMode == "Ladder Partials + Runner" ? ((i_p1_use ? i_p1_qty : 0) + (i_p2_use ? i_p2_qty : 0) + (i_p3_use ? i_p3_qty : 0)) : 0
+
+gateStrict = orbReady and inSession and universeOk and relVolOk and dowOk
+     and (not dailyLossHit) and tradeCountOk
+gateLoose  = orbReady and inSession and tradeCountOk
+     and (not i_useRelVol or relVolOk)
+gate       = i_relaxedBt ? gateLoose : gateStrict
+
+
+// =============================================================================
+//  7. STOP-LOSS PRICE
+// =============================================================================
+
+// Compute the raw SL DISTANCE first, then apply i_slMult, then place it
+// relative to the entry price.  This way the multiplier behaves identically
+// for both SL modes.
+f_stopPrice(_isLong, _entry) =>
+    float minD = syminfo.mintick
+    float orW = math.abs(orbHigh - orbLow)
+    float sOut = na
+    if i_slMode == "ATR % (Daily)"
+        float atrD = na(dailyAtr) ? na : dailyAtr * i_atrSlPct / 100.0
+        float baseDist = na(atrD) ? orW : atrD
+        float adjDist = math.max(nz(baseDist, orW) * i_slMult, minD)
+        sOut := _isLong ? _entry - adjDist : _entry + adjDist
+    else if i_slMode == "OR Opposite Boundary"
+        float adjDist = math.max(orW * i_slMult, minD)
+        sOut := _isLong ? _entry - adjDist : _entry + adjDist
+    else if i_slMode == "Opposite OR Price (orbHigh/orbLow)"
+        float anc = _isLong ? orbLow : orbHigh
+        if not na(anc)
+            float adjA = math.max(math.abs(_entry - anc) * i_slMult, minD)
+            sOut := _isLong ? _entry - adjA : _entry + adjA
+        else
+            float adjF = math.max(orW * i_slMult, minD)
+            sOut := _isLong ? _entry - adjF : _entry + adjF
+    else if i_slMode == "First OR bar High/Low"
+        float anc = _isLong ? orFirstBarLo : orFirstBarHi
+        if not na(anc)
+            float adjA = math.max(math.abs(_entry - anc) * i_slMult, minD)
+            sOut := _isLong ? _entry - adjA : _entry + adjA
+        else
+            float adjF = math.max(orW * i_slMult, minD)
+            sOut := _isLong ? _entry - adjF : _entry + adjF
+    else
+        float adjDist = math.max(orW * i_slMult, minD)
+        sOut := _isLong ? _entry - adjDist : _entry + adjDist
+    sOut
+
+// Take-profit price for "Fixed RR" exit mode.
+//   Long  TP = entry + R * RR
+//   Short TP = entry - R * RR    (where R = |entry - stop|)
+f_tpPrice(_isLong, _entry, _stop) =>
+    rDist = math.abs(_entry - _stop)
+    _isLong ? _entry + rDist * i_fixedRR : _entry - rDist * i_fixedRR
+
+// Limit price for a partial / runner take-profit measured in integer / fractional R
+// multiples from the ENTRY fill price (1R = |entry - initial stop|).
+f_limAtR(_isLong, _entry, _stop, _rMult) =>
+    rDist = math.abs(_entry - _stop)
+    _isLong ? _entry + rDist * _rMult : _entry - rDist * _rMult
+
+f_qty(_entry, _stop) =>
+    perSh = math.abs(_entry - _stop)
+    float qOut = 0.0
+    if i_posMode == "Fixed Contracts"
+        qOut := i_contracts
+    else
+        riskAmt = strategy.equity * i_riskPct / 100.0
+        qOut := perSh > 0 ? math.max(riskAmt / perSh, 0.0) : 0.0
+    // Full-size futures (NQ vs MNQ): %risk often truncates below 1 → no orders.
+    i_relaxedBt ? math.max(qOut, 1.0) : qOut
+
+// Ladder needs sum(partial qty) <= position qty; bump size in relaxed mode only.
+f_entryQty(_entry, _stop) =>
+    qb = f_qty(_entry, _stop)
+    i_relaxedBt and i_tradeMode == "Ladder Partials + Runner"
+         ? math.max(math.max(qb, sumLadderQty), 1.0)
+         : qb
+
+
+// =============================================================================
+//  8. ENTRY  (Studie 3: stop order at OR boundary, in first-candle direction)
+// =============================================================================
+
+// Position state used for SL/TP/visuals.
+var float entryPx        = na
+var float stopPx         = na
+var float tpPx           = na      // used by "Fixed RR" exit mode
+var float entryQty       = na
+var float runnerQtyInit  = na      // contracts left for the runner after all ladder legs
+var bool  orderArmed = false   // true once stop order is queued for the day
+
+// Waiting for CLOSE beyond OR boundary (when i_closeBreakConfirm is enabled)
+var bool breakoutCloseWait = false
+var bool breakoutCloseLong = false
+
+// Place the stop entry exactly ONCE, on the bar after OR closes, when all
+// filters pass.  Default: strategy.entry(stop=) = trade-through the boundary.
+// With i_closeBreakConfirm: defer until close confirms beyond orbHigh/orbLow.
+if orbJustFinalized and gate and not orderArmed and strategy.position_size == 0
+    if firstCandleDir == 1 and htfBullOk
+        eP = orbHigh
+        sP = f_stopPrice(true, eP)
+        q  = f_entryQty(eP, sP)
+        ladOk = i_tradeMode != "Ladder Partials + Runner" or sumLadderQty <= q
+        if not na(sP) and sP < eP and q > 0 and ladOk
+            entryPx       := eP
+            stopPx        := sP
+            tpPx          := f_tpPrice(true, eP, sP)
+            entryQty      := q
+            runnerQtyInit := i_tradeMode == "Ladder Partials + Runner" ? (q - sumLadderQty) : q
+            orderArmed    := true
+            if i_closeBreakConfirm
+                breakoutCloseWait := true
+                breakoutCloseLong := true
+            else
+                strategy.entry("L", strategy.long, qty = q, stop = eP,
+                     comment = "OR-Long")
+    else if firstCandleDir == -1 and htfBearOk
+        eP = orbLow
+        sP = f_stopPrice(false, eP)
+        q  = f_entryQty(eP, sP)
+        ladOk = i_tradeMode != "Ladder Partials + Runner" or sumLadderQty <= q
+        if not na(sP) and sP > eP and q > 0 and ladOk
+            entryPx       := eP
+            stopPx        := sP
+            tpPx          := f_tpPrice(false, eP, sP)
+            entryQty      := q
+            runnerQtyInit := i_tradeMode == "Ladder Partials + Runner" ? (q - sumLadderQty) : q
+            orderArmed    := true
+            if i_closeBreakConfirm
+                breakoutCloseWait := true
+                breakoutCloseLong := false
+            else
+                strategy.entry("S", strategy.short, qty = q, stop = eP,
+                     comment = "OR-Short")
+
+// CLOSE-confirmed breakout: market-style entry once session close satisfies boundary
+sameSessionBreakoutHold = breakoutCloseWait and orderArmed
+     and not na(entryPx) and not na(entryQty)
+if sameSessionBreakoutHold and strategy.position_size == 0 and inSession
+     and not dailyLossHit
+    if breakoutCloseLong and close > entryPx and entryQty > 0
+        strategy.entry("L", strategy.long, qty = entryQty, comment = "OR-Long(close)")
+        tpPx := f_tpPrice(true, close, stopPx)
+        entryPx := close
+        breakoutCloseWait := false
+    else if not breakoutCloseLong and close < entryPx and entryQty > 0
+        strategy.entry("S", strategy.short, qty = entryQty, comment = "OR-Short(close)")
+        tpPx := f_tpPrice(false, close, stopPx)
+        entryPx := close
+        breakoutCloseWait := false
+
+
+
+// =============================================================================
+//  9. EXIT MANAGEMENT
+// =============================================================================
+
+// After ANY ladder leg fills, optional break-even for the runner.
+partialOccurred = strategy.position_size != 0 and not na(entryQty) and (math.abs(strategy.position_size) < entryQty - 0.0001)
+activeStop      = (i_useBE and i_tradeMode == "Ladder Partials + Runner" and partialOccurred) ? entryPx : stopPx
+
+// Stop price for SL plots + PnL price guides (defined here for use in visuals)
+plotStop = strategy.position_size != 0 and i_tradeMode == "Ladder Partials + Runner" ? activeStop : (strategy.position_size != 0 ? stopPx : na)
+
+// ---- LONG -----------------------------------------------------------------
+if strategy.position_size > 0
+    if i_tradeMode == "Ladder Partials + Runner"
+        if i_p1_use and i_p1_qty > 0
+            strategy.exit("L-P1",
+                 from_entry     = "L",
+                 qty            = i_p1_qty,
+                 limit          = f_limAtR(true, entryPx, stopPx, i_p1_R),
+                 stop           = stopPx,
+                 comment_profit = "P1",
+                 comment_loss   = "SL")
+        if i_p2_use and i_p2_qty > 0
+            strategy.exit("L-P2",
+                 from_entry     = "L",
+                 qty            = i_p2_qty,
+                 limit          = f_limAtR(true, entryPx, stopPx, i_p2_R),
+                 stop           = stopPx,
+                 comment_profit = "P2",
+                 comment_loss   = "SL")
+        if i_p3_use and i_p3_qty > 0
+            strategy.exit("L-P3",
+                 from_entry     = "L",
+                 qty            = i_p3_qty,
+                 limit          = f_limAtR(true, entryPx, stopPx, i_p3_R),
+                 stop           = stopPx,
+                 comment_profit = "P3",
+                 comment_loss   = "SL")
+        if runnerQtyInit > 0
+            if i_exitMode == "Fixed RR"
+                strategy.exit("L-Final",
+                     from_entry     = "L",
+                     stop           = activeStop,
+                     limit          = tpPx,
+                     comment_profit = "TP",
+                     comment_loss   = (i_useBE and partialOccurred) ? "BE" : "SL")
+            else
+                strategy.exit("L-Final",
+                     from_entry   = "L",
+                     stop         = activeStop,
+                     comment_loss = (i_useBE and partialOccurred) ? "BE" : "SL")
+    else
+        // Entire position managed by one bracket / stop.
+        if i_exitMode == "Fixed RR"
+            strategy.exit("L-Final",
+                 from_entry     = "L",
+                 stop           = stopPx,
+                 limit          = tpPx,
+                 comment_profit = "TP",
+                 comment_loss   = "SL")
+        else
+            strategy.exit("L-Final",
+                 from_entry   = "L",
+                 stop         = stopPx,
+                 comment_loss = "SL")
+
+// ---- SHORT ----------------------------------------------------------------
+if strategy.position_size < 0
+    if i_tradeMode == "Ladder Partials + Runner"
+        if i_p1_use and i_p1_qty > 0
+            strategy.exit("S-P1",
+                 from_entry     = "S",
+                 qty            = i_p1_qty,
+                 limit          = f_limAtR(false, entryPx, stopPx, i_p1_R),
+                 stop           = stopPx,
+                 comment_profit = "P1",
+                 comment_loss   = "SL")
+        if i_p2_use and i_p2_qty > 0
+            strategy.exit("S-P2",
+                 from_entry     = "S",
+                 qty            = i_p2_qty,
+                 limit          = f_limAtR(false, entryPx, stopPx, i_p2_R),
+                 stop           = stopPx,
+                 comment_profit = "P2",
+                 comment_loss   = "SL")
+        if i_p3_use and i_p3_qty > 0
+            strategy.exit("S-P3",
+                 from_entry     = "S",
+                 qty            = i_p3_qty,
+                 limit          = f_limAtR(false, entryPx, stopPx, i_p3_R),
+                 stop           = stopPx,
+                 comment_profit = "P3",
+                 comment_loss   = "SL")
+        if runnerQtyInit > 0
+            if i_exitMode == "Fixed RR"
+                strategy.exit("S-Final",
+                     from_entry     = "S",
+                     stop           = activeStop,
+                     limit          = tpPx,
+                     comment_profit = "TP",
+                     comment_loss   = (i_useBE and partialOccurred) ? "BE" : "SL")
+            else
+                strategy.exit("S-Final",
+                     from_entry   = "S",
+                     stop         = activeStop,
+                     comment_loss = (i_useBE and partialOccurred) ? "BE" : "SL")
+    else
+        if i_exitMode == "Fixed RR"
+            strategy.exit("S-Final",
+                 from_entry     = "S",
+                 stop           = stopPx,
+                 limit          = tpPx,
+                 comment_profit = "TP",
+                 comment_loss   = "SL")
+        else
+            strategy.exit("S-Final",
+                 from_entry   = "S",
+                 stop         = stopPx,
+                 comment_loss = "SL")
+
+// Kill every pending child order on circuit-breaker or session end.
+if dailyLossHit or sessionEnd
+    strategy.cancel_all()
+    breakoutCloseWait := false
+
+// Liquidate any still-open position on EoD or daily-loss stop.
+if (dailyLossHit or sessionEnd) and strategy.position_size != 0
+    strategy.close_all(comment = sessionEnd ? "EoD" : "DailyLossStop")
+
+// Reset trade state once flat (across session boundary or after EoD).
+if strategy.position_size == 0 and (sessionEnd or newSession)
+    entryPx       := na
+    stopPx        := na
+    tpPx          := na
+    entryQty      := na
+    runnerQtyInit := na
+    orderArmed    := false
+    breakoutCloseWait := false
+
+
+// =============================================================================
+// 10. VISUALS
+// =============================================================================
+
+var box orbBox = na
+
+if i_showOrb and orbJustFinalized
+    orbBox := box.new(orbStartTime, orbHigh, time, orbLow,
+         border_color = c_orbBorder,
+         bgcolor      = c_orb,
+         xloc         = xloc.bar_time,
+         extend       = extend.right)
+
+if i_showOrb and sessionEnd and not na(orbBox)
+    box.set_right(orbBox, time)
+    box.set_extend(orbBox, extend.none)
+
+// -----------------------------------------------------------------------------
+//  Position PnL zones — live while open; freeze to chart when trade closes
+// -----------------------------------------------------------------------------
+var int   pnlLeftTime = na
+var box   pnlRiskBox  = na
+var box   pnlRewBox   = na
+var line  pnlEntryLn  = na
+var line  pnlLp1      = na
+var line  pnlLp2      = na
+var line  pnlLp3      = na
+var float pnlSnapE    = na
+var float pnlSnapS    = na
+var float pnlSnapT    = na
+var float pnlSnapSl   = na
+var bool  pnlSnapLong = false
+
+// Snapshot last bar while position was open (used to freeze PnL on exit bar)
+if strategy.position_size != 0 and not na(entryPx)
+    pnlSnapE    := entryPx
+    pnlSnapS    := stopPx
+    pnlSnapT    := tpPx
+    pnlSnapLong := strategy.position_size > 0
+    pnlSnapSl   := i_tradeMode == "Ladder Partials + Runner" ? activeStop : stopPx
+
+pnlOpenEvt  = strategy.position_size != 0 and strategy.position_size[1] == 0
+pnlCloseEvt = strategy.position_size == 0 and math.abs(strategy.position_size[1]) > 0
+
+if pnlOpenEvt
+    pnlLeftTime := time
+
+colRfix = color.new(c_pnlRiskBg, i_pnlRiskTr)
+colWfix = color.new(c_pnlRewBg, i_pnlRewTr)
+brdRfix = color.new(color.red, 15)
+brdWfix = color.new(color.lime, 15)
+partCol = color.new(#2a8f6f, 45)
+
+// Freeze overlays (keep boxes/lines on chart — do not delete)
+if pnlCloseEvt and i_showPnl and not na(pnlSnapE) and not na(pnlLeftTime)
+    int   tL = pnlLeftTime
+    int   tR = time
+    float en = pnlSnapE
+    float slV = pnlSnapSl
+    float tpV = pnlSnapT
+    bool  isL = pnlSnapLong
+    float st0 = pnlSnapS
+    bool  hv = i_exitMode == "Fixed RR" and not na(tpV)
+    float rTp = na
+    float rBt = na
+    float wTp = na
+    float wBt = na
+    if isL
+        rTp := en
+        rBt := slV
+        if hv
+            wTp := tpV
+            wBt := en
+    else
+        rTp := slV
+        rBt := en
+        if hv
+            wTp := en
+            wBt := tpV
+    float rHz = na(rTp) or na(rBt) ? na : math.abs(rTp - rBt)
+    bool  okR = not na(rHz) and rHz >= syminfo.mintick
+    ladOn = i_tradeMode == "Ladder Partials + Runner"
+    y1f = ladOn and i_p1_use and i_p1_qty > 0 ? f_limAtR(isL, en, st0, i_p1_R) : na
+    y2f = ladOn and i_p2_use and i_p2_qty > 0 ? f_limAtR(isL, en, st0, i_p2_R) : na
+    y3f = ladOn and i_p3_use and i_p3_qty > 0 ? f_limAtR(isL, en, st0, i_p3_R) : na
+
+    if not na(pnlRiskBox)
+        if okR
+            box.set_lefttop(pnlRiskBox, tL, rTp)
+            box.set_rightbottom(pnlRiskBox, tR, rBt)
+            box.set_border_color(pnlRiskBox, brdRfix)
+            box.set_bgcolor(pnlRiskBox, colRfix)
+        else
+            box.delete(pnlRiskBox)
+    else if okR
+        // Live handle missing (BE band collapsed, etc.) — still persist history
+        box.new(tL, rTp, tR, rBt,
+             xloc = xloc.bar_time,
+             border_width = 2,
+             border_color = brdRfix,
+             bgcolor      = colRfix)
+    if not na(pnlRewBox)
+        if hv and not na(wTp) and not na(wBt) and math.abs(wTp - wBt) >= syminfo.mintick
+            box.set_lefttop(pnlRewBox, tL, wTp)
+            box.set_rightbottom(pnlRewBox, tR, wBt)
+            box.set_border_color(pnlRewBox, brdWfix)
+            box.set_bgcolor(pnlRewBox, colWfix)
+        else
+            box.delete(pnlRewBox)
+    else if hv and not na(wTp) and not na(wBt)
+         and math.abs(wTp - wBt) >= syminfo.mintick
+        box.new(tL, wTp, tR, wBt,
+             xloc = xloc.bar_time,
+             border_width = 2,
+             border_color = brdWfix,
+             bgcolor      = colWfix)
+    if not na(pnlEntryLn)
+        line.set_xy1(pnlEntryLn, tL, en)
+        line.set_xy2(pnlEntryLn, tR, en)
+    else
+        line.new(tL, en, tR, en,
+             xloc = xloc.bar_time,
+             color = c_pnlEntryLn,
+             width = 2,
+             style = line.style_solid)
+    if not na(y1f)
+        if not na(pnlLp1)
+            line.set_xy1(pnlLp1, tL, y1f)
+            line.set_xy2(pnlLp1, tR, y1f)
+        else
+            line.new(tL, y1f, tR, y1f,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+    else if not na(pnlLp1)
+        line.delete(pnlLp1)
+    if not na(y2f)
+        if not na(pnlLp2)
+            line.set_xy1(pnlLp2, tL, y2f)
+            line.set_xy2(pnlLp2, tR, y2f)
+        else
+            line.new(tL, y2f, tR, y2f,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+    else if not na(pnlLp2)
+        line.delete(pnlLp2)
+    if not na(y3f)
+        if not na(pnlLp3)
+            line.set_xy1(pnlLp3, tL, y3f)
+            line.set_xy2(pnlLp3, tR, y3f)
+        else
+            line.new(tL, y3f, tR, y3f,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+    else if not na(pnlLp3)
+        line.delete(pnlLp3)
+
+    pnlRiskBox := na
+    pnlRewBox := na
+    pnlEntryLn := na
+    pnlLp1 := na
+    pnlLp2 := na
+    pnlLp3 := na
+    pnlLeftTime := na
+
+// Turn overlay off → remove only *active* handles (completed trades stay drawn)
+if not i_showPnl
+    if not na(pnlRiskBox)
+        box.delete(pnlRiskBox)
+        pnlRiskBox := na
+    if not na(pnlRewBox)
+        box.delete(pnlRewBox)
+        pnlRewBox := na
+    if not na(pnlEntryLn)
+        line.delete(pnlEntryLn)
+        pnlEntryLn := na
+    if not na(pnlLp1)
+        line.delete(pnlLp1)
+        pnlLp1 := na
+    if not na(pnlLp2)
+        line.delete(pnlLp2)
+        pnlLp2 := na
+    if not na(pnlLp3)
+        line.delete(pnlLp3)
+        pnlLp3 := na
+
+pnlLive = strategy.position_size != 0 and not na(entryPx) and not na(stopPx) and i_showPnl
+if pnlLive
+    float slVis = i_tradeMode == "Ladder Partials + Runner" ? activeStop : stopPx
+    bool  isLongPos = strategy.position_size > 0
+    bool  haveTp = i_exitMode == "Fixed RR" and not na(tpPx)
+    float rTop = na
+    float rBot = na
+    float wTop = na
+    float wBot = na
+    if isLongPos
+        rTop := entryPx
+        rBot := slVis
+        if haveTp
+            wTop := tpPx
+            wBot := entryPx
+    else
+        rTop := slVis
+        rBot := entryPx
+        if haveTp
+            wTop := entryPx
+            wBot := tpPx
+    float rH = na(rTop) or na(rBot) ? na : math.abs(rTop - rBot)
+    bool  showRiskBand = not na(rH) and rH >= syminfo.mintick
+    colR = colRfix
+    colW = colWfix
+    brdR = brdRfix
+    brdW = brdWfix
+
+    if na(pnlLeftTime)
+        pnlLeftTime := time
+
+    if na(pnlRiskBox) and showRiskBand
+        pnlRiskBox := box.new(
+             pnlLeftTime, rTop, time, rBot,
+             xloc       = xloc.bar_time,
+             border_width = 2,
+             border_color = brdR,
+             bgcolor      = colR)
+    else if not na(pnlRiskBox)
+        if showRiskBand
+            box.set_lefttop(pnlRiskBox, pnlLeftTime, rTop)
+            box.set_rightbottom(pnlRiskBox, time, rBot)
+            box.set_border_color(pnlRiskBox, brdR)
+            box.set_bgcolor(pnlRiskBox, colR)
+        else
+            box.delete(pnlRiskBox)
+            pnlRiskBox := na
+
+    if na(pnlRewBox) and haveTp and not na(wTop) and not na(wBot)
+         and math.abs(wTop - wBot) >= syminfo.mintick
+        pnlRewBox := box.new(
+             pnlLeftTime, wTop, time, wBot,
+             xloc         = xloc.bar_time,
+             border_width = 2,
+             border_color = brdW,
+             bgcolor      = colW)
+    else if not na(pnlRewBox)
+        if haveTp and not na(wTop) and not na(wBot)
+             and math.abs(wTop - wBot) >= syminfo.mintick
+            box.set_lefttop(pnlRewBox, pnlLeftTime, wTop)
+            box.set_rightbottom(pnlRewBox, time, wBot)
+            box.set_border_color(pnlRewBox, brdW)
+            box.set_bgcolor(pnlRewBox, colW)
+        else
+            box.delete(pnlRewBox)
+            pnlRewBox := na
+
+    if na(pnlEntryLn)
+        pnlEntryLn := line.new(
+             pnlLeftTime, entryPx, time, entryPx,
+             xloc = xloc.bar_time,
+             color = c_pnlEntryLn,
+             width = 2,
+             style = line.style_solid)
+    else
+        line.set_xy1(pnlEntryLn, pnlLeftTime, entryPx)
+        line.set_xy2(pnlEntryLn, time, entryPx)
+
+    ladOn2 = i_tradeMode == "Ladder Partials + Runner"
+    z1 = ladOn2 and i_p1_use and i_p1_qty > 0 and not na(entryPx)
+         ? f_limAtR(isLongPos, entryPx, stopPx, i_p1_R) : na
+    z2 = ladOn2 and i_p2_use and i_p2_qty > 0 and not na(entryPx)
+         ? f_limAtR(isLongPos, entryPx, stopPx, i_p2_R) : na
+    z3 = ladOn2 and i_p3_use and i_p3_qty > 0 and not na(entryPx)
+         ? f_limAtR(isLongPos, entryPx, stopPx, i_p3_R) : na
+
+    if not na(z1)
+        if na(pnlLp1)
+            pnlLp1 := line.new(
+                 pnlLeftTime, z1, time, z1,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+        else
+            line.set_xy1(pnlLp1, pnlLeftTime, z1)
+            line.set_xy2(pnlLp1, time, z1)
+    else if not na(pnlLp1)
+        line.delete(pnlLp1)
+        pnlLp1 := na
+
+    if not na(z2)
+        if na(pnlLp2)
+            pnlLp2 := line.new(
+                 pnlLeftTime, z2, time, z2,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+        else
+            line.set_xy1(pnlLp2, pnlLeftTime, z2)
+            line.set_xy2(pnlLp2, time, z2)
+    else if not na(pnlLp2)
+        line.delete(pnlLp2)
+        pnlLp2 := na
+
+    if not na(z3)
+        if na(pnlLp3)
+            pnlLp3 := line.new(
+                 pnlLeftTime, z3, time, z3,
+                 xloc = xloc.bar_time,
+                 color = partCol,
+                 width = 1,
+                 style = line.style_dashed)
+        else
+            line.set_xy1(pnlLp3, pnlLeftTime, z3)
+            line.set_xy2(pnlLp3, time, z3)
+    else if not na(pnlLp3)
+        line.delete(pnlLp3)
+        pnlLp3 := na
+
+// While PnL zones are ON, draw entry/SL/TP as plots too (boxes alone were easy to miss).
+plot(i_showPnl and strategy.position_size != 0 and not na(entryPx) ? entryPx : na,
+     "PnL — Entry", color = c_pnlEntryLn, style = plot.style_linebr, linewidth = 2)
+plot(i_showPnl and strategy.position_size != 0 and not na(plotStop) ? plotStop : na,
+     "PnL — SL", color = c_sl, style = plot.style_linebr, linewidth = 2)
+plot(i_showPnl and strategy.position_size != 0 and i_exitMode == "Fixed RR" and not na(tpPx)
+     ? tpPx : na,
+     "PnL — TP", color = c_tp, style = plot.style_linebr, linewidth = 2)
+
+// Compact line plots (optional) — when PnL zones OFF, thin SL/TP/partials only
+plot(i_showLevels and not i_showPnl and not na(plotStop) and strategy.position_size != 0 ? plotStop : na,
+     "SL", color = c_sl, style = plot.style_linebr, linewidth = 2)
+
+plot(i_showLevels and not i_showPnl and not na(tpPx) and strategy.position_size != 0 and i_exitMode == "Fixed RR"
+     ? tpPx : na,
+     "TP (Fixed RR)", color = c_tp, style = plot.style_linebr, linewidth = 2)
+
+pDirLong = strategy.position_size > 0
+lim1 = i_showLevels and not i_showPnl and strategy.position_size != 0
+     and i_tradeMode == "Ladder Partials + Runner" and i_p1_use and i_p1_qty > 0
+     ? f_limAtR(pDirLong, entryPx, stopPx, i_p1_R) : na
+lim2 = i_showLevels and not i_showPnl and strategy.position_size != 0
+     and i_tradeMode == "Ladder Partials + Runner" and i_p2_use and i_p2_qty > 0
+     ? f_limAtR(pDirLong, entryPx, stopPx, i_p2_R) : na
+lim3 = i_showLevels and not i_showPnl and strategy.position_size != 0
+     and i_tradeMode == "Ladder Partials + Runner" and i_p3_use and i_p3_qty > 0
+     ? f_limAtR(pDirLong, entryPx, stopPx, i_p3_R) : na
+
+plot(lim1, "Ladder P1", color = color.new(color.aqua, 20), style = plot.style_linebr, linewidth = 1)
+plot(lim2, "Ladder P2", color = color.new(color.teal, 20),  style = plot.style_linebr, linewidth = 1)
+plot(lim3, "Ladder P3", color = color.new(color.blue, 40),   style = plot.style_linebr, linewidth = 1)
+
+plot(i_useHtf ? htfEma : na, "HTF EMA",
+     color = color.new(color.orange, 30), linewidth = 1)
+
+plotshape(strategy.position_size[1] == 0 and strategy.position_size > 0,
+     title    = "Long Entry",
+     style    = shape.triangleup,
+     location = location.belowbar,
+     color    = c_long,
+     size     = size.small)
+
+plotshape(strategy.position_size[1] == 0 and strategy.position_size < 0,
+     title    = "Short Entry",
+     style    = shape.triangledown,
+     location = location.abovebar,
+     color    = c_short,
+     size     = size.small)
+
+
+// =============================================================================
+// 11. INFO TABLE
+// =============================================================================
+
+var table info = table.new(position.top_right, 2, 16,
+     bgcolor      = color.new(color.black, 80),
+     border_width = 1,
+     border_color = color.new(color.gray, 70))
+
+f_row(_r, _k, _v, _col) =>
+    table.cell(info, 0, _r, _k, text_color = color.silver, text_size = size.tiny)
+    table.cell(info, 1, _r, _v, text_color = _col,         text_size = size.tiny)
+
+if i_showInfo and barstate.islast
+    table.clear(info, 0, 0, 1, 15)
+    table.cell(info, 0, 0, "ORB PFK v2 (Studie 3)",
+         text_color = color.yellow, text_size = size.small)
+    table.cell(info, 1, 0, str.format("ORB {0}m", i_orbMinutes),
+         text_color = color.yellow, text_size = size.small)
+
+    f_row(1, "Instrument test",
+         i_relaxedBt ? "RELAXED (no uni/RelVol/DoW/dd gate)" : "Strict (paper rules)",
+         i_relaxedBt ? color.orange : color.silver)
+    f_row(2, "ORB High",
+         na(orbHigh) ? "n/a" : str.tostring(orbHigh, format.mintick), color.white)
+    f_row(3, "ORB Low",
+         na(orbLow)  ? "n/a" : str.tostring(orbLow,  format.mintick), color.white)
+    f_row(4, "First Cdl",
+         firstCandleDir == 1 ? "Bullish (long-only)"
+            : firstCandleDir == -1 ? "Bearish (short-only)" : "Doji / -",
+         firstCandleDir == 1 ? c_long
+            : firstCandleDir == -1 ? c_short : color.gray)
+    f_row(5, "Trade Style", i_tradeMode, color.white)
+    szTxt = i_posMode == "Fixed Contracts"
+         ? str.format("{0} contract(s) fixed", str.tostring(i_contracts))
+         : str.format("{0}% equity risk", str.tostring(i_riskPct))
+    f_row(6, "Position", szTxt, color.white)
+    ladTxt = i_tradeMode == "Ladder Partials + Runner"
+         ? str.format("Legs={0}  runner={1}", str.tostring(sumLadderQty),
+              na(runnerQtyInit) ? "—" : str.tostring(runnerQtyInit))
+         : "Full bracket"
+    f_row(7, "Ladder / Runner", ladTxt, color.white)
+    f_row(8, "Universe OK",
+         i_relaxedBt ? "—" : (universeOk ? "PASS" : "BLOCK"),
+         i_relaxedBt ? color.gray : (universeOk ? c_long : c_short))
+    f_row(9, "Rel Volume",
+         na(relVol) ? "n/a" : str.tostring(relVol * 100, "#.#") + " %",
+         not i_useRelVol ? color.gray
+              : na(relVol) ? color.gray
+              : (relVolOk ? c_long : c_short))
+    f_row(10, "Daily ATR",
+         na(dailyAtr) ? "n/a" : str.tostring(dailyAtr, format.mintick),
+         color.white)
+    f_row(11, "14d Avg Vol",
+         na(dailyAvgVol) ? "n/a" : str.tostring(dailyAvgVol / 1e6, "#.##") + "M",
+         color.white)
+    f_row(12, "Trades Today",
+         str.tostring(tradesToday) + "/" + str.tostring(i_maxTrades),
+         tradesToday >= i_maxTrades ? c_short : color.white)
+    f_row(13, "Daily PnL %",
+         str.tostring(dailyPnLPct, "#.##") + " %",
+         dailyPnLPct >= 0 ? c_long : c_short)
+    f_row(14, "DayLoss Stop",
+         i_relaxedBt ? "—" : (dailyLossHit ? "ACTIVE - HALT" : "ok"),
+         i_relaxedBt ? color.gray : (dailyLossHit ? c_short : c_long))

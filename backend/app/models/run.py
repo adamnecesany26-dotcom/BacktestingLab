@@ -26,24 +26,16 @@ class RunRequest(BaseModel):
     initial_capital: float = Field(default=100000.0, gt=0)
     slippage_perc: float = Field(default=0.001, ge=0, le=1)  # 0.1%
     commission_perc: float = Field(default=0.0, ge=0, le=1)  # 0.0% default
-    # Instrument type: futures | stocks | forex
-    instrument_type: Literal["futures", "stocks", "forex"] = "futures"
-    # Futures
+    instrument_type: Literal["futures"] = "futures"
     tick_size: Optional[float] = None
     value_per_tick: Optional[float] = None
-    # Stocks
-    share_size: Optional[int] = None
-    # Forex
-    lot_size: Optional[float] = None
-    pip_size: Optional[float] = None
-    pip_value: Optional[float] = None
     # Strategy parameters (from PARAMS dict)
     params: Optional[dict] = None
     # Applied modules for module outputs (markers, lines) after backtest
     applied_modules: Optional[List[AppliedModule]] = None
     run_id: Optional[str] = None
     # Edge-finding / validation modes
-    validation_mode: Literal["single", "oos_split", "walk_forward", "param_test"] = "single"
+    validation_mode: Literal["single", "walk_forward", "param_test", "oos_split"] = "single"
     validation_config: Optional[dict[str, Any]] = None
     quality_gates: Optional[dict[str, Any]] = None
     sweep_mode: Optional[Literal["grid", "random"]] = None
@@ -59,8 +51,7 @@ class RunRequest(BaseModel):
     run_timeout_sec: Optional[int] = Field(default=None, ge=0, le=86400)
     # Max seconds without SSE/stream activity before treating run as stalled. None = server default. 0 = disabled.
     stream_idle_timeout_sec: Optional[int] = Field(default=None, ge=0, le=86400)
-
-    @model_validator(mode="after")
+    prop_firm_backtest: Optional[dict[str, Any]] = None
     def validate_source(self):
         if not self.code and not self.files:
             raise ValueError("Either code or files must be provided")
@@ -115,6 +106,7 @@ class Trade(BaseModel):
     entryReason: Optional[str] = None
     exitReason: Optional[str] = None
     zoneMeta: Optional[dict[str, Any]] = None
+    marketRegime: Optional[str] = None
 
 
 class EquityPoint(BaseModel):
@@ -203,5 +195,6 @@ class RunResponse(BaseModel):
     payoffDecomposition: Optional[dict[str, Any]] = None
     overfittingSignals: Optional[dict[str, Any]] = None
     propRedFlags: Optional[dict[str, Any]] = None
+    propFirmBacktest: Optional[dict[str, Any]] = None
     # Full payload per sub-run when batch size ≤ cap (see run.py); each item same shape as a normal RunResponse dict
     batchRuns: Optional[list[dict[str, Any]]] = None

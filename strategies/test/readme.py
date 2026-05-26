@@ -102,8 +102,8 @@
 #
 # Přístup: self.params.ema_period, self.params.risk_pct
 #
-# Pro STOCKS: přidej share_size do params a používej self.buy(size=self.params.share_size).
-# Hodnota share_size se předává z UI (Position Size) automaticky.
+# U futures určuje velikost pozice obvykle počet kontraktů v self.buy/sell (size=…).
+# Backtest engine škáluje PnL přes tick mult / broker_config jako u reálného kontraktu.
 #
 # =============================================================================
 # 7. INDIKÁTORY

@@ -11,7 +11,7 @@ Použití:
 3. Ulož
 4. Ve View: vyber modul S/D Zones - zóny se zobrazí (View automaticky načte Swing HL)
 5. Modul můžeš pojmenovat S_D_Zones nebo SD_identificator — kód je stejný (zkopíruj celý tento soubor).
-6. Ve strategii: přidej HL identificator nebo Swing HL + S/D modul (např. sd_zone_strategy zkouší stejné pořadí jako tento soubor: HL_identificator před Swing_HL).
+6. Ve vlastní strategii v aplikaci: přidej HL identificator nebo Swing HL + S/D modul (stejné pořadí importu jako tento soubor: HL_identificator před Swing_HL).
 
 Interface pro View:
   detect(ohlc, params=None) -> [{"date","type":"high"|"low"|"internal_high"|"internal_low","value"}, ...]
@@ -46,7 +46,18 @@ Pravidla S/D v-1.0 (viz SD_def.md):
   uplatní jen když je strop vypnutý.
 - pivot_zone_height_cap_atr (+ volitelně pivot_zone_height_cap_atr_supply): úzká široká svíčka se zúží; Supply u extrémů často přísnější strop.
 - pivot_volume_spike_*: extrémní objem + široký bar → zóna se nevytvoří.
+
+Parita s TradingView ``tradingview/sd_zones_hl_indicator.pine`` (v1.2.6+):
+- **STALE (pre-READY):** na grafu se volitelně mažou zóny, u kterých před prvním READY proběhne
+  sekvence slabý odchod (knot přes hranu) → návrat + dotek hrany → impuls ×ATR v okně od narození.
+  Tento Python modul zatím STALE neportuje (viz skupina „STALE (pre-READY)“ v Pine).
+- **READY:** Pine má režimy Close a Close_nebo_knot. Zde řídí odchod ``sd_departure_use_close`` a
+  ``zone_departure_min_atr`` (viz touch výše).
+- **Metadata:** Pine ukládá MFE po READY a inducement proxy; rozšíření výstupu zón v Pythonu je volitelné.
 """
+
+# Dokumentační kotva: plná logika STALE je v Pine indikátoru v1.2.6+.
+_SD_TV_INDICATOR_STALE_DOC = "sd_zones_hl_indicator.pine v1.2.6+ STALE group"
 
 import importlib
 import math
@@ -69,9 +80,9 @@ _INDUCEMENT_MAX_DISTANCE_ATR = 2.0
 _INDUCEMENT_MAX_BARS = 40
 
 
-def _try_prepend_sd_zone_strategy_root_for_modules() -> None:
+def _try_prepend_strategy_modules_path() -> None:
     """
-    Balíček ``modules`` (Swing_HL, HL_identificator) žije pod ``strategies/sd_zone_strategy/``.
+    Balíček ``modules`` (Swing_HL, …) žije pod ``strategies/modules/``.
 
     S/D precompute v API procesu má na ``sys.path`` typicky jen kořen repozitáře; bez této složky
     ``import modules.Swing_HL`` selže, ``get_zones`` vrátí prázdný seznam a do Parquet se nezapíše
@@ -83,7 +94,7 @@ def _try_prepend_sd_zone_strategy_root_for_modules() -> None:
     """
     try:
         repo_root = Path(__file__).resolve().parent.parent
-        strat = repo_root / "strategies" / "sd_zone_strategy"
+        strat = repo_root / "strategies" / "modules"
         s = str(strat)
         if strat.is_dir() and s not in sys.path:
             sys.path.insert(0, s)
@@ -112,7 +123,7 @@ def _load_swing_hl_module() -> tuple[Any, Any, Any]:
             get_major_swings = getattr(mod, "get_major_swings", None)
             return get_bos, get_swings, get_major_swings
         if pass_i == 0:
-            _try_prepend_sd_zone_strategy_root_for_modules()
+            _try_prepend_strategy_modules_path()
     return None, None, None
 
 
@@ -128,7 +139,7 @@ def _load_swing_hl_get_line() -> Any:
             if callable(fn):
                 return fn
         if pass_i == 0:
-            _try_prepend_sd_zone_strategy_root_for_modules()
+            _try_prepend_strategy_modules_path()
     return None
 
 
@@ -144,7 +155,7 @@ def _load_swing_hl_get_trend() -> Any:
             if callable(fn):
                 return fn
         if pass_i == 0:
-            _try_prepend_sd_zone_strategy_root_for_modules()
+            _try_prepend_strategy_modules_path()
     try:
         ex = importlib.import_module("examples.swing_hl_detector")
         return getattr(ex, "get_trend", None)
@@ -671,7 +682,7 @@ def _params_for_hl_calls(params: dict | None) -> dict:
 
 
 # Jen parametry, které má smysl ladit v UI (View + záložka modulu v backtestu).
-# max_base_length a require_inducement jsou v panelu strategie sd_zone_strategy (PARAMS), strategie je předává do get_zones.
+# max_base_length a require_inducement lze předávat z panelu strategie (PARAMS) do get_zones.
 # EMA / vyhlazení trendu pro get_trend jsou výchozí v HL_identificator / Swing_HL (nebo swing_hl_detector).
 VIEW_PARAMS = {
     "timeframe": "1d",

@@ -66,3 +66,10 @@ def test_sweep_heatmap_cells_and_ranking_sample(eng, monkeypatch):
     assert "totalReturnUsd" in row0["metrics"]
     assert "heatmapBin" in row0
     assert "xBin" in row0["heatmapBin"] and "yBin" in row0["heatmapBin"]
+    hists = out.get("histograms")
+    assert isinstance(hists, dict)
+    assert isinstance(hists.get("score"), dict) and hists["score"].get("counts")
+    assert isinstance(hists.get("totalReturnUsd"), dict) and hists["totalReturnUsd"].get("counts")
+    ss = out.get("sweepSummary")
+    assert isinstance(ss, dict) and "profitableFraction" in ss
+    assert isinstance(out.get("paramSensitivity"), dict)
